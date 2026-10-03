@@ -720,10 +720,11 @@ async fn spawn_task_fully_configured_spawns_three_tasks() {
     // task (both on by default; either/or, so one handle) adds one.
     // Issue #10492: the captain-gated nightly backtest-folds task (on by
     // default, independent of the refit/refresh either/or) adds one.
+    // Issue #10023: the `daemon.heartbeat` loop adds one.
     assert_eq!(
         handles.len(),
-        6,
-        "collector + daemon_event collector + eta + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
+        7,
+        "collector + daemon_event collector + eta + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + daemon.heartbeat loop (#10023)"
     );
     for handle in handles {
         handle.abort();
@@ -762,10 +763,11 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     // Issue #10492: the nightly backtest-folds task (on by default).
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
+    // Issue #10023: the `daemon.heartbeat` loop adds one.
     assert_eq!(
         handles.len(),
-        10,
-        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
+        11,
+        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765) + daemon.heartbeat loop (#10023)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -803,10 +805,11 @@ async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
             .expect("the https exporter is fully configured and must still run");
     // Issue #8760: `daemon_event::spawn_task` adds one more handle.
     // Issue #10492: the nightly backtest-folds task (on by default) adds one.
+    // Issue #10023: the `daemon.heartbeat` loop adds one.
     assert_eq!(
         handles.len(),
-        6,
-        "collector + daemon_event + eta (#9289) + only the https sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
+        7,
+        "collector + daemon_event + eta (#9289) + only the https sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + daemon.heartbeat loop (#10023)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -922,8 +925,9 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     // Issue #10765: the OTLP ops sink also adds the IPC latency exporter.
     assert_eq!(
         handles.len(),
-        9,
-        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765)"
+    // Issue #10023: the `daemon.heartbeat` loop adds one.
+        10,
+        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414) + IPC latency exporter (#10765) + daemon.heartbeat loop (#10023)"
     );
     for handle in handles {
         handle.abort();
