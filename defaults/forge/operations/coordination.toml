@@ -90,6 +90,9 @@ path = "loom-daemon/src/forge_listing.rs"
 kind = "rust"
 path = "loom-daemon/src/eta/fleet_fetch.rs"
 [[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/closed_watch.rs"
+[[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/guide.md"
 
