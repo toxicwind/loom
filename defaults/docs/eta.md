@@ -2699,7 +2699,7 @@ build) still emits, so no data is lost, but with `complete: false`
 the accuracy queries keep only rows where both are true. An outcome carries both the estimating build and its own.
 Estimate ids are derived (`derived_hex(["loom.eta.estimate", repo key, issue,
 kind, heuristic, as_of])`), never random, and both kinds sit inside the
-issue's D32 story trace.
+issue's story trace.
 
 ## The live list (`eta.snapshot`)
 

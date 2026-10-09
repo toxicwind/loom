@@ -2173,7 +2173,7 @@ Each record is one log record whose **body is the record's JSON**. For an
 estimate that is the whole explanation, so ClickHouse can `JSONExtract` any
 field; the scalars ride as `loom.eta.*` attributes (`ETA_LOG_ATTRIBUTE_KEYS`,
 allowlisted in the collector's `transform/privacy`). Both kinds set the
-envelope's `trace_context` to the issue's D32 story
+envelope's `trace_context` to the issue's story
 (`story_context(repo_id, issue)`), so they land in the issue's story trace;
 a repo with no resolvable `repo_id` gets none.
 
