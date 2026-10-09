@@ -142,6 +142,8 @@ pub struct RepoCap {
     hot: Vec<bool>,
     /// The tick's per-repo RAM budget (#11094); `None` ⇒ no RAM gate here.
     ram: Option<crate::ram_headroom::RamBudget>,
+    /// The same-tick affected-files overlap gate (#9781).
+    overlap: super::affected_files::OverlapGate,
 }
 
 impl RepoCap {
@@ -163,6 +165,7 @@ impl RepoCap {
             hot: occupancy.iter().map(|&o| o > 0).collect(),
             occupancy,
             ram: limits.ram,
+            overlap: super::affected_files::OverlapGate::default(),
         }
     }
 
@@ -232,7 +235,30 @@ impl RepoCap {
             ready_queue::resolve(&mut report.queue, cand, Qd::DeferredCapacity, Some(detail));
             return true;
         }
-        !over && self.defer(cand, report)
+        if !over && self.defer(cand, report) {
+            return true;
+        }
+        let shared = self.overlap.overlapping(cand);
+        if shared.is_empty() {
+            return false;
+        }
+        // #9781: scheduling signal only — no label, hold, or stacking edge.
+        let detail = ready_queue::short_detail(&format!("file overlap: {}", shared.join(", ")));
+        ready_queue::resolve(&mut report.queue, cand, Qd::DeferredFileOverlap, Some(detail));
+        true
+    }
+
+    /// Record a listed item's `## Affected Files` surface (#9781); `occupying`
+    /// marks an already-in-flight item. Reads only the listing's own body.
+    pub fn note_surface(&mut self, idx: usize, item: &super::WorkItem, occupying: bool) {
+        self.overlap
+            .note(idx, item.number, item.body.as_deref(), occupying);
+    }
+
+    /// [`Self::admit`] for a whole candidate: also occupies its surface.
+    pub fn admit_candidate(&mut self, cand: &PriorityCandidate) {
+        self.overlap.occupy(cand);
+        self.admit(cand.workspace_idx);
     }
 
     /// The cap and the per-workspace occupancy as they stand now — at the
