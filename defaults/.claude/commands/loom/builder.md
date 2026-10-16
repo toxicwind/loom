@@ -400,7 +400,7 @@ workflow) that require maintainer approval before being worked on.
 
 **User commands override the label-based state machine.**
 
-When the user explicitly instructs you to work on a specific issue or PR by number:
+When the architect explicitly instructs you to work on a specific issue or PR by number:
 
 ```bash
 # Examples of explicit user instructions
@@ -727,7 +727,7 @@ gh issue view 100
 Curator comments carry implementation guidance and technical options, root-cause
 analysis, detailed acceptance criteria, test plans and debugging tips, code
 examples, and architecture tradeoffs. Curators sometimes amend the issue
-description itself instead — the user's original request preserved under
+description itself instead — the architect's original request preserved under
 **"## Original Issue"**, the full spec under **"## Curator Enhancement"**. Read
 both places.
 

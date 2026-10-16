@@ -24,7 +24,7 @@ claude mcp add --scope user loom -- node ~/.local/share/loom/mcp-loom/dist/index
 `scripts/install-loom.sh` does this at install time (idempotently), and
 `loom update` refreshes the served bundle for every repo at once (the #3803
 stale-dist drift fix). You normally do **not** hand-edit a per-repo `.mcp.json`
-for `loom` anymore — a project-scope `loom` entry would *shadow* the user-scope
+for `loom` anymore — a project-scope `loom` entry would *shadow* the architect-scope
 server (Claude Code precedence is local > project > user), so `setup-mcp.sh`
 strips any legacy project entry it finds. See
 [`../defaults/docs/machine-dispatcher.md`](../defaults/docs/machine-dispatcher.md)

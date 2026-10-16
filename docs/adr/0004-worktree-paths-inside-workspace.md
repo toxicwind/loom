@@ -12,7 +12,7 @@ The decision was **where to create worktrees**:
 - Inside the workspace at `.loom/worktrees/`
 - Outside the workspace at `../loom-worktrees/`
 - In a system temp directory `/tmp/loom-worktrees/`
-- Anywhere the user chooses
+- Anywhere the architect chooses
 
 macOS app sandboxing was a key constraint - apps have limited filesystem access outside their designated containers.
 

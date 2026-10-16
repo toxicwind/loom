@@ -322,7 +322,7 @@ signoz README — and is not a prerequisite for this policy.
 A `loom-daemon ci-telemetry` poller. Each cycle it:
 
 1. Lists each owner's repositories (`GET /orgs/{o}/repos?type=all` for an
-   organization, `GET /users/{u}/repos?type=owner` for a user; paginated).
+   organization, `GET /users/{u}/repos?type=owner` for an architect; paginated).
    Each page is ETag-cached on disk, so an unchanged owner costs `304 Not
    Modified` responses, which do not count against the rate limit. Archived
    repos and `excludedRepos` are skipped.
@@ -418,7 +418,7 @@ case-insensitively.
   **declared organization** and is not probed, so an `org`-only config makes
   exactly the requests it made before #9188.
 - **Discovery.** Organizations use `orgs/{o}/repos?type=all`, users use
-  `users/{u}/repos?type=owner`. That endpoint lists a user's **public**
+  `users/{u}/repos?type=owner`. That endpoint lists an architect's **public**
   repos only. Each owner's pages share the one ETag cache, keyed by request
   path.
 - **Failure.** A rate limit or a rejected credential still aborts the whole

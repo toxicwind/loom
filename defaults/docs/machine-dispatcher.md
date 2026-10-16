@@ -17,7 +17,7 @@ loom <command> [options]
 | `restart` | Restart the machine-level `loom-daemon` (supervised in-place relaunch, **not** a drain; falls back to stop+start) |
 | `status`| Show machine-level + current-repo status (read-only) |
 | `sweep <issue>` | Dispatch `/loom:sweep <issue>` for the current repo |
-| `update`| Refresh the user-scoped mcp-loom bundle (#4230), then thin-delegate the daemon update to `loom-daemon-update.sh` |
+| `update`| Refresh the architect-scoped mcp-loom bundle (#4230), then thin-delegate the daemon update to `loom-daemon-update.sh` |
 
 Environment: `LOOM_HOME` overrides the machine-level checkout location (default
 `~/.local/share/loom`).
@@ -118,7 +118,7 @@ says so explicitly — it does **not** present a `jq`-less host as "no config".
 
 `loom update` does two things, in order:
 
-1. **Refreshes the user-scoped mcp-loom bundle** (#4230, epic #3835 Phase 3c).
+1. **Refreshes the architect-scoped mcp-loom bundle** (#4230, epic #3835 Phase 3c).
    It rebuilds `~/.local/share/loom/mcp-loom/dist/index.js` when the bundle is
    missing or stale (older than any file under `mcp-loom/src/`), so the one
    user-scope `loom` MCP server that serves **every** repo picks up new tools —
@@ -168,7 +168,7 @@ user-scope server and would silently pin a stale per-repo bundle forever — the
   persona are inherently per-repo/session; the per-worker persona is still
   injected at spawn time by `spawn-claude.sh --mcp-config`, unchanged).
 - The `.mcp.json` symlink step in `worktree.sh` / `pr-worktree.sh` becomes
-  **vestigial** under user scope (a user-scope server applies from any CWD) but
+  **vestigial** under user scope (an architect-scope server applies from any CWD) but
   is left intact — it is harmless and still serves un-migrated / safehouse repos.
 
 ### `claude-wrapper.sh` behavior with no `.mcp.json`
@@ -393,7 +393,7 @@ until migration; this provisioning only changes what **fresh installs and
 post-migration repos** resolve. The coexistence is expected and does not error —
 provisioning does not try to force user scope to win.
 
-> **Scope boundary (Phase 4 vs Phase 6).** This phase adds the user-scope
+> **Scope boundary (Phase 4 vs Phase 6).** This phase adds the architect-scope
 > resolution *mechanism* (the replacement Phase 6 depends on). Ceasing the
 > per-repo copy on a fresh install is coupled to `loom-daemon init` (Rust),
 > which materializes `.claude/commands/loom/` + `.claude/agents/` and whose own
@@ -516,7 +516,7 @@ boundary no matter where it is invoked. What one pass does:
    pre-flight (a fleet-wide spawn outage with no surfaced error). Migration strips
    any repo-scoped `loom` entry from `.mcp.json` (deleting the file if `loom` was
    its only server; other servers such as `safehouse` are kept — matching
-   `setup-mcp.sh`'s #4230 migration), then **verifies the user-scope `loom`
+   `setup-mcp.sh`'s #4230 migration), then **verifies the architect-scope `loom`
    registration** exists and points at the machine checkout's
    `mcp-loom/dist/index.js`, `claude mcp add --scope user`-ing it if absent or
    mis-pointed (skipped with a clear note when the `claude` CLI is not on PATH).

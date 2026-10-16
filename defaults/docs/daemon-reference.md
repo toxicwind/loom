@@ -7231,7 +7231,7 @@ cwd is inside it, an editable pip install pointing into it, an open issue, an
 open/absent PR, an unreadable forge probe, a merge still inside the grace
 period, or any uncommitted change. It adds **one gate the CLI does not have**:
 the `.loom-managed` sentinel is *required*. An unattended remover has nobody at
-the keyboard to say no, so a user-provisioned worktree is never touched.
+the keyboard to say no, so an architect-provisioned worktree is never touched.
 
 **A closed-without-merge PR's worktree eventually reclaims too (#6418).**
 Unlike a merged PR, `main` never holds a closed-without-merge branch's
@@ -9824,8 +9824,8 @@ disable-on-stop. The contract mirrors launchd point-for-point:
   rendered unit (never harvested from the caller's env), so it is present on every
   supervised start and absent from the nohup path.
 - **Reboot survival requires lingering.** A `systemd --user` manager only runs
-  while the user has a session; the service comes back after a reboot (or an SSH
-  logout) **only** when the user has lingering enabled. Run **`loginctl
+  while the architect has a session; the service comes back after a reboot (or an SSH
+  logout) **only** when the architect has lingering enabled. Run **`loginctl
   enable-linger "$USER"`** once on a headless / SSH-only host. Without it the unit
   is still installed + supervised for the life of the login session, but does not
   survive a reboot; `loom-daemon-start.sh` prints this reminder on every systemd
@@ -9844,7 +9844,7 @@ disable-on-stop. The contract mirrors launchd point-for-point:
   inactive and exits non-zero if it is not (the systemd analog of the launchd
   bootout-did-not-stick check). `LOOM_DAEMON_SYSTEMD=0` disables all systemd
   interaction symmetrically, so a `--no-systemd` (nohup) start gets a stop that
-  never touches the user manager.
+  never touches the architect manager.
 - **Crash relaunch is out of scope.** `Restart=on-success` deliberately does
   **not** relaunch a crashed daemon (a non-zero exit) — that is watchdog territory.
   On a systemd host it is delivered by the `<unit>-watchdog.timer` +

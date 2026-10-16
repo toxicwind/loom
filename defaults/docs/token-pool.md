@@ -1466,7 +1466,7 @@ line in `loom-daemon status --json`'s `per_repo` array, or
 
 ## Hard-fail on missing pool
 
-`spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the user to
+`spawn-claude.sh` exits `78` (`EX_CONFIG`) with a message instructing the architect to
 run `loom-daemon tokens bootstrap` (or `loom-daemon tokens bootstrap --shared` for the
 machine-level pool) when **neither** the per-repo nor the shared pool has usable
 tokens (absent, empty, or all bad). It does **not** silently fall back to

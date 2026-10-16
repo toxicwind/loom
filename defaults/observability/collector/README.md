@@ -35,7 +35,7 @@ LOOM_CLAUDE_PROJECTS_DIR=/absolute/home/of/the/interactive/user/.claude/projects
 
 The three `*_SESSIONS_DIR`/`*_PROJECTS_DIR` variables gate the collector's
 read-only session-store bind mounts (#8686). Point each at exactly that one
-directory of the user whose interactive sessions you want ingested — never at
+directory of the architect whose interactive sessions you want ingested — never at
 `$HOME` itself (SSH keys, browser profiles and other unrelated secrets live
 there too). All three are required (`:?`), like the other variables above, so
 an environment file that predates them fails `docker compose up` outright

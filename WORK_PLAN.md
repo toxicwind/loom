@@ -77,7 +77,7 @@ Issues the operator starred (`loom:operator-priority`); land these first.
 - **#10150**: notify-cleared-blockers runs only from merge-pr.sh: merges made any other way never clear a block
 - **#10151**: star_liveness escalates stale blocks to the operator instead of unblocking or routing to Curator
 - **#10152**: Applying loom:blocked must write a park record in the body, not only a prose comment
-- **#10154**: provision-skills: make /star a user-scope alias of /loom:star (symlink, or a progressive-disclosure stub)
+- **#10154**: provision-skills: make /star an architect-scope alias of /loom:star (symlink, or a progressive-disclosure stub)
 - **#10156**: Daemon re-dispatches human-gated/blocked issues forever after no-op sweeps (275 after-curator loops, ~600M tokens/24h)
 
 ## Ready
@@ -113,7 +113,7 @@ Issues currently being built (`loom:building`).
 - **#10150**: notify-cleared-blockers runs only from merge-pr.sh: merges made any other way never clear a block
 - **#10151**: star_liveness escalates stale blocks to the operator instead of unblocking or routing to Curator
 - **#10152**: Applying loom:blocked must write a park record in the body, not only a prose comment
-- **#10154**: provision-skills: make /star a user-scope alias of /loom:star (symlink, or a progressive-disclosure stub)
+- **#10154**: provision-skills: make /star an architect-scope alias of /loom:star (symlink, or a progressive-disclosure stub)
 - **#10156**: Daemon re-dispatches human-gated/blocked issues forever after no-op sweeps (275 after-curator loops, ~600M tokens/24h)
 
 ## PRs Awaiting Review
@@ -251,7 +251,7 @@ Issues carrying `loom:curated`.
 - **#10150**: notify-cleared-blockers runs only from merge-pr.sh: merges made any other way never clear a block *(curated)*
 - **#10151**: star_liveness escalates stale blocks to the operator instead of unblocking or routing to Curator *(curated)*
 - **#10152**: Applying loom:blocked must write a park record in the body, not only a prose comment *(curated)*
-- **#10154**: provision-skills: make /star a user-scope alias of /loom:star (symlink, or a progressive-disclosure stub) *(curated)*
+- **#10154**: provision-skills: make /star an architect-scope alias of /loom:star (symlink, or a progressive-disclosure stub) *(curated)*
 - **#10156**: Daemon re-dispatches human-gated/blocked issues forever after no-op sweeps (275 after-curator loops, ~600M tokens/24h) *(curated)*
 
 ## Proposed (Architect / Hermit)

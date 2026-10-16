@@ -88,7 +88,7 @@ per-repo `.mcp.json` is needed or generated.
 
 **Verify Installation**:
 ```bash
-# Check the user-scope registration
+# Check the architect-scope registration
 claude mcp list --scope user
 
 # Verify unified package exists
@@ -108,7 +108,7 @@ A single user-scoped instance serves every repo: mcp-loom resolves the
 walk up from `process.cwd()` to a `.loom/`/`.git` root). See
 [`defaults/docs/machine-dispatcher.md`](../../defaults/docs/machine-dispatcher.md)
 for the full registration model and why per-repo `.mcp.json` generation was
-demoted (project-scope entries outrank and silently shadow the user-scope
+demoted (project-scope entries outrank and silently shadow the architect-scope
 server). `scripts/setup-mcp.sh` is now only a bundle-rebuild/legacy-migration
 tool, with a safehouse-only residual role emitting a per-repo `.mcp.json`
 containing just the `safehouse` server.

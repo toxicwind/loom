@@ -22,8 +22,8 @@ A comment or review is trusted when its author is:
 | Author | Why |
 |---|---|
 | A repo insider by `author_association`: `OWNER`, `MEMBER`, `COLLABORATOR` | They can change labels anyway. `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER` and `NONE` never count: one merged fork PR makes anyone a contributor. |
-| One of **this** fleet's GitHub Apps, matched exactly | The fleet's Apps appear as `NONE`/`CONTRIBUTOR`, so without this rule Loom could not read its own markers. The roster is [`forge_identity::FleetLogins`](github-authentication.md): the writer, every reader, `legacyLogins`, and the `loom-fleet-dispatch(-<digits>)` default family. The author must be *spelled* as an App (`x[bot]` from REST, `app/x` from GraphQL, or a `Bot` type): a user may register the bare slug, never `x[bot]`. |
-| This daemon's own identity | Compared with the same account kind: the user `x` is never the App `x[bot]`. |
+| One of **this** fleet's GitHub Apps, matched exactly | The fleet's Apps appear as `NONE`/`CONTRIBUTOR`, so without this rule Loom could not read its own markers. The roster is [`forge_identity::FleetLogins`](github-authentication.md): the writer, every reader, `legacyLogins`, and the `loom-fleet-dispatch(-<digits>)` default family. The author must be *spelled* as an App (`x[bot]` from REST, `app/x` from GraphQL, or a `Bot` type): an architect may register the bare slug, never `x[bot]`. |
+| This daemon's own identity | Compared with the same account kind: the architect `x` is never the App `x[bot]`. |
 | A login in `forge.trustedCommenters` | An explicit allowlist, same account-kind rule (list `helper[bot]` to allow an App). |
 
 **Another Loom installation's markers are not ours.** A foreign fleet emits
@@ -103,8 +103,8 @@ authenticated" as a reason not to merge.
 ## `gh --json comments` cannot name an App
 
 `gh issue view --json comments` (and `gh pr view`) reports an App author as the
-bare slug, `{"login":"loom-fleet-dispatch"}`, indistinguishable from a user of
-that name. A bare login is therefore treated as a user, and in that shape the
+bare slug, `{"login":"loom-fleet-dispatch"}`, indistinguishable from an architect of
+that name. A bare login is therefore treated as an architect, and in that shape the
 fleet's own comments pass only by association or allowlist. A reader that must
 believe fleet-authored markers fetches the REST listing instead:
 

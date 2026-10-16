@@ -109,7 +109,7 @@ Both quirks above were hit and confirmed on a real host (2026-07-28):
 `openssl pkcs12 -export` without `-legacy` fails `security import` with "MAC
 verification failed", and `-T /usr/bin/codesign` at import time is what lets
 `codesign` sign later without prompting — provided the login keychain is
-unlocked in the user session (true for any interactive login; a headless/CI
+unlocked in the architect session (true for any interactive login; a headless/CI
 context should keep using the ad-hoc default instead).
 
 ## Importing a Developer ID / CA-issued identity instead

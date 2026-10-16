@@ -42,7 +42,7 @@ A minimal shell script that polls `loom:issue`, atomically claims ready issues u
 
 GitHub Actions workflows that run the periodic support roles (Judge, Curator, Champion, Auditor, Guide) on cron schedules as fresh `claude -p "/<role>"` invocations. No Loom-side state file. No long-running process. Each tick is independent and idempotent.
 
-The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved as a user-facing convenience wrapper that launches the spawn loop + GitHub Actions cron + token-rotated tmux panes. The Python `loom-daemon` CLI entry point is removed.
+The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved as an architect-facing convenience wrapper that launches the spawn loop + GitHub Actions cron + token-rotated tmux panes. The Python `loom-daemon` CLI entry point is removed.
 
 ### Phase sequencing (PRs 3.1.1–3.7)
 

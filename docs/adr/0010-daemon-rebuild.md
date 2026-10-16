@@ -45,7 +45,7 @@ to be an overcorrection. Three operational realities pushed back:
 
 3. **The shell-level "preserved daemon mode" promised by ADR-0009 was
    never built.** ADR-0009's "Decision" section said:
-   `./.loom/scripts/daemon.sh` "is preserved as a user-facing convenience
+   `./.loom/scripts/daemon.sh` "is preserved as an architect-facing convenience
    wrapper that launches the spawn loop + GitHub Actions cron +
    token-rotated tmux panes." That `daemon.sh` wrapper does not exist
    on `main`. The documentation referenced it through v0.9.x, but

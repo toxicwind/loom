@@ -446,7 +446,7 @@ You apply exactly two labels, both on the `create-issue.sh` call itself:
 
 **User commands override the label-based state machine.**
 
-When the user explicitly instructs you to analyze a specific area for simplification:
+When the architect explicitly instructs you to analyze a specific area for simplification:
 
 ```bash
 # Examples of explicit user instructions

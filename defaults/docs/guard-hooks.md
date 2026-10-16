@@ -51,12 +51,12 @@ user-scope hook fires in *every* repo the operator opens:
 
 Existing per-repo `.loom/hooks/` copies on an already-installed repo are left in
 place by this phase; removing them is Phase 6 (#4254) migration territory. Daemon-
-spawned workers inherit the user-scope wiring because `loom-daemon` copies
+spawned workers inherit the architect-scope wiring because `loom-daemon` copies
 `~/.claude/settings.json` into each worker's isolated `CLAUDE_CONFIG_DIR`.
 
 ### Quick Install and the project-level fallback (#4401)
 
-Step 2 above (transition precedence) means the user-scope wiring is **only half** an
+Step 2 above (transition precedence) means the architect-scope wiring is **only half** an
 execution path: while a repo still carries `.loom/hooks/` copies, the wrapper defers
 to a **project-level** `.claude/settings.json` entry — so that entry has to exist.
 `install.sh --quick` still writes those copies (`install_hooks_and_cli`), but the
@@ -68,7 +68,7 @@ deferred) and no project entry to defer to.
 
 Both Quick Install call sites now run `wire_quick_install_guard_hooks`, which calls:
 
-- **`provision_loom_hooks`** — the user-scope wiring (previously reached only via the
+- **`provision_loom_hooks`** — the architect-scope wiring (previously reached only via the
   Full Install path). Note the quick path does not establish the machine checkout
   (`provision_loom_dispatcher` is Full-Install-only), so on a quick-only machine these
   entries stay a silent no-op until a Full Install / `loom update` creates
@@ -222,7 +222,7 @@ closed at the installer level.**
   worker's isolated `CLAUDE_CONFIG_DIR`. This is strictly stronger than the old
   per-repo wiring and needs no additional protection.
 - **The transition layout's wiring gap is fixed (#4806).** While a repo still
-  carries per-repo `.loom/hooks/<name>` copies, the user-scope wrapper's
+  carries per-repo `.loom/hooks/<name>` copies, the architect-scope wrapper's
   transition-dedup step used to be an unconditional `[ -x "$ROOT/.loom/hooks/
   <name>" ] && exit 0` — it deferred **without checking that a project-level
   entry exists to defer to.** So the state "copies present, `hooks` block absent
@@ -302,7 +302,7 @@ wins:
 | 1 | `.loom/hooks/<name>` is executable | exec it (unchanged fast path) |
 | 2 | Not a Loom workspace | exit 0, **silently** (unchanged) |
 | 3 | Present but **not executable** | run it via `bash <path>` (which needs only read permission) and report — **zero lost coverage** |
-| 4 | No per-repo copy, machine-level copy available | run the machine copy, or stand down quietly if the user-scope entry already wires it (never both — no double-reporting) |
+| 4 | No per-repo copy, machine-level copy available | run the machine copy, or stand down quietly if the architect-scope entry already wires it (never both — no double-reporting) |
 | 5 | Nothing anywhere | `PreToolUse` → **DENY**; other events → report loudly and allow (they have no deny channel) |
 
 **Rung 5 is fail-closed, and that was a deliberate choice.** Three reasons:
@@ -1169,7 +1169,7 @@ If it finds any of the three, it blocks the stop with a reason describing the ha
 
 **Why there is no liveness corroboration (#5976, considered and rejected)**: #5976 also asked whether the transcript accounting should be confirmed against a live signal (a task registry, or `pgrep` for the spawned process) before blocking. It is not, because no sound signal exists at this seam. There is no task registry — the harness owns the background shells and exports no id→pid mapping, and the only handle the transcript carries is an opaque `<task-id>` / tool-use id that no OS-level query can resolve. Without that mapping, `pgrep` can only pattern-match the dispatched command text, which is wrong in **both** directions: it matches a different session's identical command (a false "still live", so a real orphan is missed as soon as the fleet runs two sweeps of the same shape) and it misses a task whose shell has forked or exec'd past the matched text (a false "finished" — the #4257 death this guard exists to prevent). A liveness check also answers a different question than the one being asked: a completion notification means *the background task exited*, not *the work that task was watching finished*. #5976 reported the mirror-image failure too — a `gh run watch` that died on a transient TLS error and notified normally while its CI run was still in flight — and neither transcript accounting nor `pgrep` can close that gap; only the agent re-checking the watched resource can, which is prompt-level discipline (see the Builder/Judge "never end your turn on a background build or CI monitor" rules), not a Stop-hook concern. So the accounting stays transcript-only, and diagnosability is addressed instead: the block reason now **names the tool-use ids** each detector believes are outstanding (capped at 8, with a `+N more` suffix so a session with many outstanding dispatches cannot emit an unbounded reason string), turning "is this a false positive?" into one grep of the transcript.
 
-**Session-mode detection: the block is headless-only (#6645)**. Until #6645 the hook blocked in *both* modes, because it had no way to tell them apart — and its own block message told the reader that in an interactive session the correct recipe is to "just end the turn and let the completion notification arrive on a later turn". So in an interactive session the guard blocked precisely the action it prescribed. The only way through was to emit a no-op message and stop a second time (the once-per-*stop-sequence* loop guard), which cost a forced double-stop, a wasted turn, and a user-visible `STOP BLOCKED` banner that reads as an error — recurring on the order of half a dozen times in one ordinary session, since a session contains many stop sequences. Interactive mode is not merely a friction case, it is a *false positive*: ending an interactive turn kills nothing, the children keep running, and their notifications arrive on a later turn.
+**Session-mode detection: the block is headless-only (#6645)**. Until #6645 the hook blocked in *both* modes, because it had no way to tell them apart — and its own block message told the reader that in an interactive session the correct recipe is to "just end the turn and let the completion notification arrive on a later turn". So in an interactive session the guard blocked precisely the action it prescribed. The only way through was to emit a no-op message and stop a second time (the once-per-*stop-sequence* loop guard), which cost a forced double-stop, a wasted turn, and an architect-visible `STOP BLOCKED` banner that reads as an error — recurring on the order of half a dozen times in one ordinary session, since a session contains many stop sequences. Interactive mode is not merely a friction case, it is a *false positive*: ending an interactive turn kills nothing, the children keep running, and their notifications arrive on a later turn.
 
 A TTY probe cannot make this call: a `Stop` hook's stdin is the pipe carrying its JSON payload, so `[ -t 0 ]` reads non-interactive in **both** modes regardless of the session. The hook therefore resolves the mode in this order (highest precedence first):
 
@@ -1181,7 +1181,7 @@ A TTY probe cannot make this call: a `Stop` hook's stdin is the pipe carrying it
 
 In interactive mode the hook emits `{"continue": true, "systemMessage": "…"}` — the stop proceeds, and the advisory carries the *same* accounting the block would have (counts plus the outstanding tool-use ids), stating that the stop was allowed and naming `LOOM_SESSION_MODE=headless` as the way to restore the hard block. It never says `STOP BLOCKED`, and it is emitted only when something is actually outstanding — a clean stop stays silent in both modes. The `stop_hook_active` loop guard is unaffected and still short-circuits *ahead* of mode detection, so a second stop in the same sequence is silent in both modes.
 
-**Wiring note**: this hook only fires if a `Stop` hook entry is actually wired for the repo. Fresh consumer installs get this from the user-scope `provision-hooks.sh` wiring; a repo that also carries a per-repo `.loom/hooks/` copy (this repo included) must additionally wire `Stop` in its own project-scope `.claude/settings.json` — the user-scope entry defers to a project copy when one exists, so it silently no-ops otherwise (the #4389 wiring gap).
+**Wiring note**: this hook only fires if a `Stop` hook entry is actually wired for the repo. Fresh consumer installs get this from the architect-scope `provision-hooks.sh` wiring; a repo that also carries a per-repo `.loom/hooks/` copy (this repo included) must additionally wire `Stop` in its own project-scope `.claude/settings.json` — the architect-scope entry defers to a project copy when one exists, so it silently no-ops otherwise (the #4389 wiring gap).
 
 The guard is **on by default**. It is resolved in this order (highest precedence first):
 
@@ -1316,7 +1316,7 @@ needs the same `|| exit 0`.
 
 **Where it is wired (deliberately narrow for now).** The `Stop` /`SubagentStop`
 entries live in this repository's project-level `.claude/settings.json` only.
-Consumer repos get their guard hooks from the user-scope wiring
+Consumer repos get their guard hooks from the architect-scope wiring
 `scripts/install/provision-hooks.sh` installs, whose set is the six
 `defaults/hooks/*.sh` scripts — this guard is a `loom-daemon` subcommand, not one
 of them, so it does **not** fire in consumer repos yet. That is a choice, not an
@@ -1350,7 +1350,7 @@ The config read is best-effort: a missing, empty, or malformed `.loom/config.jso
 
 ### Repo-Scoped rm Guard (`guards.rmScope` / `LOOM_RM_SCOPE`)
 
-By default (as of #3628), `guard-destructive.sh` runs in **`repo` mode**: it blocks the **catastrophic** `rm -rf` targets — root (`/`), the user's `$HOME`, and any bare top-level directory (`/tmp`, `/var`, `/etc`, …) — **and** additionally denies any `rm -rf` target that is neither inside the repo/worktree areas nor on a built-in **ephemeral allowlist**. So an outside-repo deep path like `rm -rf /Users/someone/important` is **denied** out of the box. This is the safe-by-default behaviour (ADR Option B); it is a **behaviour change** from the pre-#3628 permissive default.
+By default (as of #3628), `guard-destructive.sh` runs in **`repo` mode**: it blocks the **catastrophic** `rm -rf` targets — root (`/`), the architect's `$HOME`, and any bare top-level directory (`/tmp`, `/var`, `/etc`, …) — **and** additionally denies any `rm -rf` target that is neither inside the repo/worktree areas nor on a built-in **ephemeral allowlist**. So an outside-repo deep path like `rm -rf /Users/someone/important` is **denied** out of the box. This is the safe-by-default behaviour (ADR Option B); it is a **behaviour change** from the pre-#3628 permissive default.
 
 Repos that need the old permissive behaviour — block only catastrophic targets and **allow** every deeper subpath, including subpaths outside the repository — can **opt out** to `off` (a.k.a. `permissive`) mode. The catastrophic top-level deny stays active in both modes, so bare `/tmp` and `/` are always blocked regardless.
 

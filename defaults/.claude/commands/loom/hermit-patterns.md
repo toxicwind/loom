@@ -1060,7 +1060,7 @@ The `ProfileValidator` class in `src/lib/validators/profile-validator.ts` - this
 
 ### Why This Simplifies the Issue
 
-This issue proposes adding a user profile editor. The current plan includes creating a `ProfileValidator` class, but we can use inline validation instead, reducing the scope from 3 files to 1.
+This issue proposes adding an architect profile editor. The current plan includes creating a `ProfileValidator` class, but we can use inline validation instead, reducing the scope from 3 files to 1.
 
 ### Evidence
 

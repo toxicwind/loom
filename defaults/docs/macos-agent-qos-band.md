@@ -39,8 +39,8 @@ renderer. `safehoused-service.sh` does the same for the safehouse service.
 Per `launchd.plist(5)`, `ProcessType` "describes the intended purpose of the
 job" and the system "applies resource limits based on what kind of job it is";
 `Background` is documented as being for "processes that do work that was not
-directly requested by the user", with limits "intended to prevent background
-jobs from disrupting the user experience". On Darwin that is implemented as a
+directly requested by the architect", with limits "intended to prevent background
+jobs from disrupting the architect experience". On Darwin that is implemented as a
 **task role / task policy** on the job's task, and task policy is inherited
 across `fork`/`posix_spawn` — which is what makes it a property of the tree, not
 of the one process.
@@ -102,7 +102,7 @@ stated so the next person does not have to re-derive it:
 - **`Background` is correct for the daemon process itself.** It is a polling
   supervisor doing work nobody asked for interactively. That is the literal
   definition in `launchd.plist(5)`, and it is why the value was chosen.
-- **It is wrong for the *sweep* subtree**, which is a user-requested build doing
+- **It is wrong for the *sweep* subtree**, which is an architect-requested build doing
   latency-sensitive work. The bug is not the value, it is that one plist key
   governs two populations with opposite needs.
 - **Flipping the daemon job to `Standard` would change every Loom host's

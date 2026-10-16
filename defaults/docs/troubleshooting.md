@@ -2585,7 +2585,7 @@ design, so stopping the dispatcher never destroys work in flight. On a Linux
 `systemd --user` host they can also be **architecturally detached** from the
 daemon's own process tree: `spawn-claude.sh`'s CPU-quota mechanism (#5111,
 default-on) wraps each spawn in `systemd-run --user --scope`, a transient
-scope parented to the user manager, not to `loom-daemon` — so it keeps running
+scope parented to the architect manager, not to `loom-daemon` — so it keeps running
 and drawing on the token pool with no forge-visible owner even after the
 daemon reports a clean stop (the 2026-08-13 `loom-worker-2` incident: role
 agents kept running after `systemctl --user stop loom-daemon` reported

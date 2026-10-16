@@ -140,7 +140,7 @@ metrics collection, the work finder, …) all shell out to `gh`, which resolves
 credentials the same way an interactive shell does: `GH_TOKEN` env var →
 `GITHUB_TOKEN` env var → `gh`'s own credential store (the macOS login
 **keychain**, or `~/.config/gh/hosts.yml` on Linux). The keychain only unlocks
-for processes running in the user's **GUI login session** — a daemon started
+for processes running in the architect's **GUI login session** — a daemon started
 over SSH with a clean environment, or from a headless server with no
 interactive login, cannot unlock it. Without an env-var token, every `gh` call
 the daemon makes will `401`.
@@ -203,7 +203,7 @@ per-GUI-login domain that does not exist in an SSH session — so a not-yet-runn
 daemon could not be *started* remotely on macOS. That gap is now closed: the
 shared resolver `resolve_launchd_domain()` prefers `gui/<uid>` when a GUI login
 is active and otherwise falls back to the background per-user `user/<uid>` domain
-that `sshd` instantiates (running as the user, not root). So a headless / SSH-only
+that `sshd` instantiates (running as the architect, not root). So a headless / SSH-only
 `loom-daemon-start.sh` now completes, and stop/update find the resulting job. Pin
 the domain with `LOOM_LAUNCHD_DOMAIN` if needed; the rejected alternatives
 (a root system `LaunchDaemon`, `launchctl asuser`) and the login-keychain / TCC

@@ -1743,7 +1743,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #7852** (closed): Split role_shard.rs/roster.rs and shrink 6 frozen files to satisfy File Size Ratchet (blocks PR #7796)
 - **Issue #7691** (closed): [Phase B of #6704] Rank the role-runner ring from the live roster, generation-fenced, with bounded reassignment
 - **PR #7796**: feat(role-runner): rank the role-runner ring from the live roster, generation-fenced (#7691)
-- **Issue #7829** (closed): Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on a user-owned repo)
+- **Issue #7829** (closed): Activate version-bump-on-merge: push via the loom-fleet-dispatch App token (GITHUB_TOKEN cannot bypass the main ruleset on an architect-owned repo)
 - **Issue #7777** (closed): ADR-0018 (draft): Rust owns behavior; shell exists only to reach it
 - **PR #7892**: docs(adr): add ADR-0018 — Rust owns behavior; shell exists only to reach it
 - **Issue #7793** (closed): RCA: agent errors in this session cluster into 4 classes, 2 of which are the repo's own tracked defect classes
@@ -4026,7 +4026,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #4930** (closed): docs(watch): mode-A ScheduleWakeup loop silently stalls on session suspension — document the gap and preflight
 - **PR #4938**: docs(watch): document mode-A ScheduleWakeup session-suspension stall
 - **Issue #4806** (closed): Guard wiring: user-scope wrapper defers to a project entry it never verifies exists (zero-guard state)
-- **PR #4937**: fix(hooks): gate the user-scope wrapper's transition-dedup deferral on a real project entry
+- **PR #4937**: fix(hooks): gate the architect-scope wrapper's transition-dedup deferral on a real project entry
 - **Issue #4535** (closed): loom-daemon accounts: registry read-modify-write lacks MkdirLock (concurrent write race)
 - **Issue #4921** (closed): Bash-tool write-confinement: unresolvable $VAR write target silently allows when cwd is a linked worktree
 - **PR #4927**: fix(hooks): fail closed on unresolvable $VAR write targets from a linked-worktree cwd
@@ -5051,7 +5051,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #3908**: Autonomous guard hooks: decision logging + protected force-scope + doc-text false-positive fix (#3898)
 - **Issue #3885** (closed): main-health gate: fetch/checkout origin/main (or verify clean main) before running buildGate
 - **PR #3906**: fix(daemon): sync main-health gate to origin/main + halt-gate epic supervisor (#3885)
-- **Issue #3902** (closed): daemon capacity backpressure: slow down on token limits, alert the user to add capacity, recover gracefully when restored
+- **Issue #3902** (closed): daemon capacity backpressure: slow down on token limits, alert the architect to add capacity, recover gracefully when restored
 - **PR #3907**: feat(daemon): token-capacity backpressure — slow down on token limits, alert to add capacity, recover gracefully (#3902)
 - **Issue #3893** (closed): daemon: reaper doesn't promptly prune completed/merged sweeps — registry over-reports Running
 - **PR #3905**: fix(daemon): reap-on-read so ListSweeps no longer over-reports Running (#3893)
@@ -5294,7 +5294,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **Issue #3666** (closed): check-main-clean.sh false-positives on a pre-existing dirty tree
 - **Issue #3664** (closed): merge-pr.sh --auto hard-fails when PR merge state is UNSTABLE (checks still running)
 - **PR #3669**: fix(merge): poll UNSTABLE PRs whose required checks are still running (#3664)
-- **Issue #3663** (closed): install.sh --quick: auto-stash can't restore staged/unstaged split when the update edits a file the user has uncommitted (e.g. CLAUDE.md)
+- **Issue #3663** (closed): install.sh --quick: auto-stash can't restore staged/unstaged split when the update edits a file the architect has uncommitted (e.g. CLAUDE.md)
 - **PR #3670**: fix(install): generalize --quick auto-stash restore beyond .gitignore (#3663)
 - **Issue #3665** (closed): builder: partial-increment PRs against family/epic issues hardcode 'Closes #N' and wrongly close the parent
 

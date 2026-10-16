@@ -51,7 +51,7 @@ Gitea API tokens need the following scopes (if your Gitea version supports scope
 | `issue` | Builder, Curator, Champion, Shepherd | Issue creation, editing, label management |
 | `package` | (optional) | Not required by Loom |
 
-For Gitea instances without scoped tokens, a standard API token grants full access to repositories the user can reach.
+For Gitea instances without scoped tokens, a standard API token grants full access to repositories the architect can reach.
 
 ### Creating an API Token
 
@@ -142,7 +142,7 @@ export LOOM_ALLOW_INSECURE_BASIC_AUTH=1
 This is **not** recommended outside isolated networks. Anyone with access to the network segment can read the password.
 
 **Restrictions**:
-- The username cannot contain a colon (`:`). RFC 7617 disallows it because the colon is the user/password separator.
+- The username cannot contain a colon (`:`). RFC 7617 disallows it because the colon is the architect/password separator.
 - The password (taken from `token`) may contain any characters -- it is properly handled by `curl -u` and by the Python `requests` library.
 
 ### Gitea Instance URL
@@ -181,7 +181,7 @@ If auto-detection fails (e.g., non-standard ports or paths), you can configure t
 
 - Verify the token has not expired
 - Check that the token has sufficient scopes for the operation
-- Ensure the token belongs to a user with access to the target repository
+- Ensure the token belongs to an architect with access to the target repository
 
 ## Security Notes
 

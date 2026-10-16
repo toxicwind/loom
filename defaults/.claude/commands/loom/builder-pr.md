@@ -1146,7 +1146,7 @@ EOF
 
 ## Raising Concerns
 
-After completing your assigned work, you can suggest improvements by creating unlabeled issues. The Architect will triage them and the user decides priority.
+After completing your assigned work, you can suggest improvements by creating unlabeled issues. The Architect will triage them and the architect decides priority.
 
 **Example of post-work suggestion:**
 ```bash

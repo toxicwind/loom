@@ -7,7 +7,7 @@ harness configuration, logs, screenshots, fixtures and temporary artifacts.
 Do not place secrets in `.env`, `.loom/config.json` or `.loom-local/local.json`.
 Do not add a symlink inside a checkout that exposes an external secret file.
 
-Use an operating-system credential store or owner-only files under the user's
+Use an operating-system credential store or owner-only files under the architect's
 home directory outside all checkouts. On Unix, secret directories must have
 mode `0700` and secret files `0600`. Confirm the resolved path is outside
 repositories; a symlink or an unusual home-directory checkout can defeat a

@@ -685,7 +685,7 @@ them into the one you are curating. Never absorb a sibling that has:
 
 > **Verify enumerations.** If the issue body lists specific callers, files, sites, or line numbers, treat the enumeration as a *starting point*, not authoritative. Run a comprehensive `git ls-files <pattern> | xargs grep -nE '<pattern>'` to verify completeness. Report any additions in your curator comment so the builder gets the correct scope.
 
-> **Verify against build base (origin/main).** You run in the user's working tree (uncommitted files visible); the builder runs in a fresh worktree off `origin/main`. If your "Affected Files" enumeration silently includes uncommitted paths, the builder will block on a broken setup. Before applying `loom:curated`, verify every path you enumerated under `## Affected Files` exists on the build base:
+> **Verify against build base (origin/main).** You run in the architect's working tree (uncommitted files visible); the builder runs in a fresh worktree off `origin/main`. If your "Affected Files" enumeration silently includes uncommitted paths, the builder will block on a broken setup. Before applying `loom:curated`, verify every path you enumerated under `## Affected Files` exists on the build base:
 >
 > ```bash
 > # Curator pre-flight: verify Affected Files exist on origin/main
@@ -720,7 +720,7 @@ them into the one you are curating. Never absorb a sibling that has:
 > - Use `grep -qFx` (exact match) — not `grep -qF` — so `src/foo.ts` doesn't match `src/foo.ts.bak`.
 > - Run `git fetch origin --quiet` once at the top of the verification pass; do not refetch per file.
 > - If the issue has no `## Affected Files` section yet, this check is a no-op for this tick — add the section in the same pass and let the next curator tick run the verification.
-> - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the user (not by Loom) once the underlying files are committed and pushed. No numbered blocker exists; the `COMMENT` above is the recorded reason ("Adding Dependencies").
+> - The `loom:blocked` label is the right escape hatch: it's already in the workflow, and is removed by the architect (not by Loom) once the underlying files are committed and pushed. No numbered blocker exists; the `COMMENT` above is the recorded reason ("Adding Dependencies").
 > - If this instead names a resolvable dependency on another issue/PR, record it as a park record — see `.loom/docs/park-record.md`.
 
 ### Date-stamp volatile facts

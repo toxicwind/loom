@@ -66,7 +66,7 @@ incident citation, and fixes**:
 
 **User commands override the label-based state machine.**
 
-When the user explicitly instructs you to work on a specific issue by number:
+When the architect explicitly instructs you to work on a specific issue by number:
 
 ```bash
 # Examples of explicit user instructions

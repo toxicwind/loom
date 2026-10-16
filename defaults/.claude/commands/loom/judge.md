@@ -344,7 +344,7 @@ section for the full carve-out list).
 
 **User commands override the label-based state machine.**
 
-When the user explicitly instructs you to evaluate a specific PR by number:
+When the architect explicitly instructs you to evaluate a specific PR by number:
 
 ```bash
 # Examples of explicit user instructions
@@ -2723,7 +2723,7 @@ During code evaluation, you may discover bugs or issues that aren't related to t
 1. Complete your current evaluation first
 2. Create an **unlabeled issue** describing what you found
 3. Document: What the problem is, how to reproduce it, potential impact
-4. The Architect will triage it and the user will decide if it should be prioritized
+4. The Architect will triage it and the architect will decide if it should be prioritized
 
 **Keep observed and inferred visually separate (see "Observed vs. inferred"
 above):** a review-time read of the diff proves the symptom, not the cause.

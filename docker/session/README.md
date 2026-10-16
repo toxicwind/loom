@@ -178,7 +178,7 @@ process allowed to touch the volume from then on.
 
 Codex runs with its own sandbox off inside a session container
 (`spawn-codex.sh` emits `-s danger-full-access`). Codex's bubblewrap sandbox
-can't create a user namespace under Docker's default seccomp profile, nor
+can't create an architect namespace under Docker's default seccomp profile, nor
 under Ubuntu's AppArmor userns restriction. The operator ruled on 2026-10-03
 that the container is the boundary. `loom-daemon accounts session start`
 therefore creates the container with:

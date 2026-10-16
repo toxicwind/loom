@@ -283,7 +283,7 @@ them for correctness.
    - **Any shared or persisted cache is keyed or partitioned by credential
      identity**, so one identity's cached answer is never served to
      another. Since #5401 a daemon may hold several per-owner credentials,
-     and agents on a user `gh` credential share the same on-disk store, so
+     and agents on an architect `gh` credential share the same on-disk store, so
      "one gh credential per process" can no longer be assumed.
    - Route `pipeline_snapshot` through the cached listing path and bound its
      fan-out.

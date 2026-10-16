@@ -236,7 +236,7 @@ export const myMiddleware: MiddlewareHandler<{ Bindings: Env }> = async (c, next
 
 ## Authentication
 
-### Register a user
+### Register an architect
 
 ```bash
 curl -X POST http://localhost:8787/api/auth/register \
