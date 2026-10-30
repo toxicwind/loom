@@ -206,47 +206,18 @@ tail -50 "$LOG"; cat "$LOG.rc" 2>/dev/null
 **There are exactly two safe paths:**
 
 1. **Batch mode (you have more work to pick up, or the PR is already handed off): do not wait at all — hand off and continue.** Once the PR exists with `loom:review-requested`, verifying CI is **Judge's** gate, not yours. Push, create the PR, state in your final message that CI was still running at hand-off, and move to the next issue. This is the correct default, not a fallback: a later Judge pass re-evaluates once CI settles.
-2. **Single-invocation and a green-CI confirmation is expected before your turn ends: block-poll in the foreground.** Loop **inside this same turn** — `gh pr checks`, `sleep`, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that returns control to you before you write your final message; nothing about it depends on a future turn.
+2. **Single-invocation and a green-CI confirmation is expected before your turn ends: block-poll in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** in the foreground (bounded by `--timeout`). It returns control to you before you write your final message; nothing about it depends on a future turn.
 
-**Empty `gh pr checks` output is NOT proof CI has settled.** `gh pr checks` is
-GraphQL-backed and can return completely empty output (zero rows) during a
-transient forge failure (e.g. an intermittent TLS handshake error) — a state
-indistinguishable from "nothing pending" if your loop condition only greps the
-output for the word "pending" (#6169: a Judge poller on kicad-tools PR #4792
-declared CI "settled" 6 minutes into a ~40-minute run this way). Guard against
-it by asserting a minimum row count before trusting an absence of "pending":
+**Use `loom-daemon forge wait-checks`, not a `gh pr checks` loop.** It reads check-runs through the ETag store (an unchanged poll is a free 304), backs off 30s to 120s, and settles the empty-rollup trap (#6169) itself. Branch on the first **stdout** line (never the exit code; keep stderr separate, it carries the RED detail). `--timeout 0` is one snapshot poll. 
 
 ```bash
-# Foreground block-poll on your own PR's CI — bounded, in-turn.
-# ci_still_pending: true (pending) if any row shows pending/queued/in_progress.
-# A ZERO-ROW read is retried once before being trusted — on a real forge blip
-# the retry almost always returns real rows; only a read that is STILL empty
-# after the retry is treated as "genuinely no checks reported" (not pending).
-ci_still_pending() {
-  local pr="$1" out rows
-  out="$(gh pr checks "$pr" 2>/dev/null)"
-  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-  if [[ "$rows" -eq 0 ]]; then
-    sleep 3
-    out="$(gh pr checks "$pr" 2>/dev/null)"
-    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
-  fi
-  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
-}
-
-MAX_WAIT=1800   # 30 min cap
-INTERVAL=60
-ELAPSED=0
-while ci_still_pending <PR_NUMBER>; do
-  if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-    echo "CI still pending after ${MAX_WAIT}s — reporting as unsettled and handing off to Judge."
-    break
-  fi
-  sleep "$INTERVAL"
-  ELAPSED=$((ELAPSED + INTERVAL))
-done
-gh pr checks <PR_NUMBER>
+err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 2>"$err")"; first="${out%%$'\n'*}"
+case "$first" in
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green
+  LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id> per failure; gh run view <run_id> --log-failed
+  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) echo "CI unsettled after the bounded wait" ;;
+  *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
+esac
 ```
 
 **If the cap is reached, do not extend the wait and do not reach for a background watcher instead.** Say plainly in your final message that the run had not settled after the bounded wait, leave the PR labeled `loom:review-requested` so Judge re-evaluates, and finish. **If you have not personally read the result** — a build exit status or a `gh pr checks` output in *this* turn — you have not verified it, and you MUST NOT write a final message implying the build passed or that a result is "in progress elsewhere."
@@ -408,7 +379,7 @@ workflow) that require maintainer approval before being worked on.
 - **Check dependencies**: all task-list items checked before claiming
 - **Guard, then claim**: `loom-daemon forge check-claim <number>` must not exit 0 (exit 0 = blocked — open PR, claim label, fresh lease, or remote branch; take another issue), then `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`, then lease it: `loom-daemon lease ensure <number> --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`. `worktree.sh` (below) runs this itself; a lane NOT using it MUST call `lease ensure` directly — a leaseless claim is invisible to other lanes and reclaimable (#9453)
 - **Do the work**: Implement, test, commit, create PR
-- **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` — never a bare `gh pr create` (#6074); the structured body template is canonical in builder-pr.md § "Creating the PR"
+- **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` (copies the star, #10518) — never a bare `gh pr create` (#6074); body template: builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
 ## Exception: Explicit User Instructions
@@ -835,17 +806,17 @@ Run the appropriate build check after every meaningful code change:
 | Language | Build Check Command | What It Catches |
 |----------|-------------------|-----------------|
 | Rust | `cargo check` | Type errors, borrow checker violations, async Send issues |
-| Rust | `cargo clippy` | Common mistakes, anti-patterns, correctness issues |
+| Rust | CI's clippy lines | Anti-patterns, unused imports |
 | TypeScript | `pnpm tsc --noEmit` | Type errors, missing imports |
 
 For Rust changes specifically, run these **before committing**:
 ```bash
-cargo check          # Fast compilation check (no codegen)
-cargo clippy         # Lint for common mistakes
-cargo fmt            # Format code
+cargo check          # Fast (no codegen)
+grep -rn 'cargo clippy' .github/workflows  # run each hit verbatim
+cargo fmt
 ```
 
-`cargo check` is fast (seconds) and catches the most common errors. Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
+Scoped tests are not lint; report it apart (no CI hit: bare `cargo clippy`; no clippy: "unvalidated"). Don't rely solely on the project's check command (`buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`) at PR time — by then, a failed build wastes the entire implementation cycle.
 
 ### Build-time performance
 
@@ -883,17 +854,17 @@ Full background: `.loom/docs/guard-hooks.md` → "Known consequence".
 
 | File | Load when |
 |---|---|
-| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Before a local cargo result counts as "tests pass": a shared target dir may hold another worktree's binary (#8457). |
+| [`cargo-target-isolation.md`](../loom-cargo-target-isolation/SKILL.md) | Any cargo build: use exported `CARGO_TARGET_DIR` or `<worktree>/target`; never `/tmp`, `~`, `.loom/target-*` (#8370). |
 
 ## Guidelines
 
 - **Pick the right work**: Choose issues labeled `loom:issue` (human-approved) that match your capabilities
 - **Update labels**: Always mark issues as `loom:building` when starting
-- **Read before writing**: Examine existing code to understand patterns and conventions
-- **Verify builds**: Run language-appropriate build checks after writing code (see Build Verification above)
-- **Test your changes**: Run relevant tests after making modifications
-- **Follow conventions**: Match the existing code style and architecture
-- **Be thorough**: Complete the full task, don't leave TODOs
+- **Read before writing**: Read existing code for patterns and conventions
+- **Verify builds**: Run language-appropriate build checks (see Build Verification above)
+- **Test your changes**: Grep fixtures, differential oracles, expectations for changed contracts (env names, CLI help, fields); align them; run the affected suite before review
+- **Follow conventions**: Match existing style and architecture
+- **Be thorough**: Complete the task; no TODOs
 - **Stay in scope**: If you discover new work, PAUSE and create an issue - don't expand scope
 - **Create quality PRs**: Clear description, references issue, requests review
 - **Get unstuck**: Mark `loom:blocked` if you can't proceed, explain why
@@ -1077,7 +1048,7 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
-1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244)
+1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244); level 2 (`loom:operator-high-priority` / `loom:high-priority-inherited`) first (#10307)
 2. **Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
 3. **Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
@@ -1086,7 +1057,9 @@ Workers use a three-level priority system to determine which issues to work on:
 **Step 1: Check for starred issues first**
 
 ```bash
-gh issue list --label="loom:issue" --label="loom:operator-priority" --state=open --limit=5
+# level list: keep in sync with operator_levels.rs LEVELS until #10311
+for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
+gh issue list --label="loom:issue" --label="$L" --state=open --limit=5; done
 ```
 
 If any exist, **claim one immediately**.
@@ -1266,8 +1239,8 @@ restate it here; follow it there.
 ### Creating the PR
 
 **Immediately before `git push` + opening the PR, run the lease fencing
-check** — `./.loom/scripts/sweep-lease-fence.sh check "$N"` — and abort (no
-push, no PR) on exit `3`/`4` (expired / superseded lease). Canonical guidance
+check** — `./.loom/scripts/sweep-lease-fence.sh check "$N" --branch <yours>`
+— and abort (no push, no PR) on any non-zero exit. Canonical guidance
 in **builder-pr.md § "Lease Fencing: Confirm You Still Own the Claim" (Epic
 #6165 Phase 3, #6309)**.
 
@@ -1279,8 +1252,8 @@ work). The canonical body template (Summary / Changes / Acceptance
 Criteria Verification / Test Plan + the `Closes #N` reference) lives in
 **builder-pr.md § "Creating the PR"** — use it verbatim. Do NOT create PRs with
 just `Closes #N`; the body must include the structured sections. Add
-`loom:review-requested` at creation only (plus `loom:operator-priority` if the
-issue carries it, #9244), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
+`loom:review-requested` at creation only (plus each priority label the
+issue carries, #9244/#10307), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
 merged by Champion using `./.loom/scripts/merge-pr.sh` — never use `gh pr merge`.
 
 ## Working Style

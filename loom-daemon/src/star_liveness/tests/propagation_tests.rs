@@ -147,10 +147,21 @@ fn the_walk_caps_forge_reads_counting_closed_children_and_blocker_reads() {
     let r = Host::new("host-a").pass(&world, &[input], Vec::new(), t(10, 0));
     let got: Vec<u32> = inherited(&r).into_iter().map(|(n, _, _)| n).collect();
     assert_eq!(got, vec![10, 11, 12], "the open children are reached first and inherit");
-    let reads = world.repo(slug).issue_reads;
+    let (issue_reads, comment_reads) = {
+        let repo = world.repo(slug);
+        (repo.issue_reads, repo.comment_reads)
+    };
+    // Each stale-blocked child's comments are read three times: once by the
+    // walk (counted against the cap), then, outside it, once by the
+    // unblock's marker dedupe and once by the star materialization's
+    // operator-removed check (#10012 §2).
+    assert_eq!(comment_reads, 9);
+    let walk_comment_reads = 3;
     assert_eq!(
-        reads, MAX_WALK_READS_PER_PASS,
-        "3 children + 3 blocker reads + 44 closed children, then the walk stops"
+        issue_reads + walk_comment_reads,
+        MAX_WALK_READS_PER_PASS,
+        "3 children + 3 blocker reads + 3 comment reads + 41 closed children, then the walk \
+         stops: the comments read counts against the cap too"
     );
 }
 

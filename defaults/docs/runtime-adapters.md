@@ -386,6 +386,8 @@ set:
 | `RECOVERABLE` | rate limit / 5xx / network | retry with backoff |
 | `FATAL` | non-recoverable **configuration** fault — retrying the identical invocation cannot succeed | fail fast; do not retry, do not rotate |
 | `SANDBOX_UNAVAILABLE` | exit 0, but the runtime's own sandbox refused every tool call so nothing ran (Codex only; written by the adapter, not this file — see below) | role tick fails; the preference walk passes the runtime over for a short host-wide hold; account health untouched |
+| `SESSION_DOWN` | exit 78: the account's Codex session container was not running, so dispatch was refused (adapter-produced, #10455) | role tick fails with `loom.admission.reason="session-down"`; account health untouched |
+| `SESSION_MOUNT_STALE` | exit 78: the session container is running but does not mount the tick's working directory, so `session-exec host` refused before exec. Daemon-produced like `SESSION_DOWN`: `session-exec host` announces it with `# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE` and the terminal-record parser relabels the adapter's generic record; the adapter has no arm for it (#10364) | role tick fails with `loom.admission.reason="session-mount-stale"`; account health untouched; the container must be recreated |
 
 This file is now a **shared classification engine plus per-provider pattern
 tables** (the structure #4190 extracted, seeded by the fork's PR #6): the engine
@@ -1081,6 +1083,15 @@ can still opt a single command back in with an inline `CARGO_INCREMENTAL=1
 cargo …` prefix. Full rationale:
 [`build-gate.md` → Worker builds run with `CARGO_INCREMENTAL=0`](build-gate.md).
 
+Beside it, the dispatcher caps dev/test debuginfo (#11190):
+`CARGO_PROFILE_DEV_DEBUG` and `CARGO_PROFILE_TEST_DEBUG` are set to
+`line-tables-only`. These are `${VAR:-default}` defaults. An ambient value, or a
+`debug` key the repo sets in its `dev` or `test` profile table, is kept. The
+per-repo opt-out is `cargo.debuginfo: "full"` or `false` (env
+`LOOM_CARGO_DEBUGINFO`).
+Details:
+[`build-gate.md` → Worker builds cap debuginfo at `line-tables-only`](build-gate.md).
+
 ### Adapter observability markers
 
 Daemon-compatible runners emit a small, secret-free contract on stderr:
@@ -1230,6 +1241,17 @@ Add to `.loom/config.json`:
 `runtimes.default` names the runtime used when `LOOM_RUNTIME` is unset. The value
 must have a matching `spawn-<value>.sh` runner on disk (e.g. `"claude"` →
 `spawn-claude.sh`).
+
+### LLM gateway routing (issue #9473)
+
+`runtimes.llmGateway` (or the `LOOM_LLM_GATEWAY_*` environment, which wins)
+routes named, API-key model profiles on the native harnesses through a
+self-hosted LLM gateway: the harness gets the gateway's base URL and a virtual
+key in place of the provider's endpoint and key. Claude and Codex never receive
+it; `spawn-worker` scrubs the variables from every process it execs, and the
+sweep, role-runner and epic dispatch surfaces strip them from any child that
+cannot use them. Contract, per-runtime mapping and the red line:
+[`llm-gateway.md`](llm-gateway.md).
 
 ### Ordered runtime preference with fall-through (issue #8436)
 
@@ -2211,6 +2233,8 @@ collaboration:
 
 ## Related
 
+- [`llm-gateway.md`](llm-gateway.md) — routing opted-in API-key profiles on
+  the native harnesses through a self-hosted LLM gateway (#9473).
 - [`configuring-resources.md`](configuring-resources.md) — operator runbook that
   combines this doc's `runtimes.*` keys with the model, credential-pool and
   spend-bound axes into copy-pasteable recipes.

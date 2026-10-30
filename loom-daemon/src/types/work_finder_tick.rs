@@ -104,9 +104,11 @@ pub struct WorkFinderTickSummary {
     /// "not held". `#[serde(default)]` keeps pre-#4903 wire data compatible.
     #[serde(default)]
     pub saturation_held: bool,
-    /// Whether the build back-off (Issue #9410) was engaged for this tick,
-    /// even with nothing deferred. `#[serde(default)]` keeps pre-#9410 wire
-    /// data compatible.
+    /// Whether the build back-off (Issue #9410) was engaged for any repo this
+    /// tick (#10624: the hold is per repo), even with nothing deferred. The
+    /// `BUILD-BACKOFF-HELD` tag and the `build_backoff_held` tick result key on
+    /// [`deferred_build_backoff`](Self::deferred_build_backoff) instead.
+    /// `#[serde(default)]` keeps pre-#9410 wire data compatible.
     #[serde(default)]
     pub build_backoff_held: bool,
     /// Cumulative cross-host dispatch collisions observed by this tick's
@@ -129,6 +131,12 @@ pub struct WorkFinderTickSummary {
     /// missing from [`Self::queue`], which is then incomplete, not empty.
     #[serde(default)]
     pub listing_failed: Vec<String>,
+    /// Repos whose ready-issue listing returned only part of its queue on
+    /// this tick (#11139: a later page failed, the page cap, a mid-walk
+    /// change). Their rows are in [`Self::queue`], but not all of them: a
+    /// consumer must not read a missing row as "left the queue".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listing_incomplete: Vec<String>,
     /// The dispatch plan this tick's rows were annotated with (Issue #9288):
     /// slots, tick interval, shard posture, scope and key ordering. `None`
     /// for a single-workspace tick (which records no rows) and for a
@@ -141,6 +149,49 @@ pub struct WorkFinderTickSummary {
     /// pre-#10214 payload and before the first tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<CapView>,
+    /// How the starred-at cache answered since this process started: the
+    /// in-process cache, the restart store, a loom-ui intent, or a timeline
+    /// read (known / none / failed). `None` for a payload that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starred_at_cache: Option<StarredAtCacheTally>,
+}
+
+/// Outcome tally of the work finder's starred-at lookups, cumulative since
+/// the daemon started. The `read_*` rows are the forge timeline reads that
+/// remain; `read_none` vs `read_known` is the split that says whether
+/// unknown starred-ats (retried every 10 minutes) dominate them.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StarredAtCacheTally {
+    /// A starred issue the in-process cache already answered.
+    pub mem_hit: u64,
+    /// An in-process miss answered by the restart store.
+    pub disk_hit: u64,
+    /// An in-process miss answered by a loom-ui intent's `requested_at`.
+    pub intent_hit: u64,
+    /// A timeline read that found the starred-at.
+    pub read_known: u64,
+    /// A timeline read that found no star event (unknown; retried later).
+    pub read_none: u64,
+    /// A timeline read that failed (unknown; retried later).
+    pub read_err: u64,
+}
+
+impl StarredAtCacheTally {
+    /// Add `other`'s counts to these.
+    pub fn add(&mut self, other: &Self) {
+        self.mem_hit += other.mem_hit;
+        self.disk_hit += other.disk_hit;
+        self.intent_hit += other.intent_hit;
+        self.read_known += other.read_known;
+        self.read_none += other.read_none;
+        self.read_err += other.read_err;
+    }
+
+    /// How many lookups went to the forge.
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.read_known + self.read_none + self.read_err
+    }
 }
 
 /// What holds a tick's effective concurrency cap where it is (Issue #10214).
@@ -308,6 +359,14 @@ impl CapacityWait {
 }
 
 impl WorkFinderTickSummary {
+    /// Repos whose backlog this tick does not hold whole: those in
+    /// [`Self::listing_failed`] and those in [`Self::listing_incomplete`]
+    /// (#11139). A consumer that reads a missing row as "left the queue" or
+    /// "not held" uses this, not `listing_failed` alone.
+    pub fn listing_not_whole(&self) -> impl Iterator<Item = &String> {
+        self.listing_failed.iter().chain(&self.listing_incomplete)
+    }
+
     /// The single-line skip-reason summary `loom-daemon health` renders —
     /// only the non-zero terms, so a clean tick reads `12 seen, 2 dispatched`
     /// rather than a wall of zeros.
@@ -338,6 +397,9 @@ impl WorkFinderTickSummary {
                 parts.push(format!("{n} {label}"));
             }
         }
+        if !self.listing_incomplete.is_empty() {
+            parts.push(format!("{} listing-incomplete", self.listing_incomplete.len()));
+        }
         if self.collisions > 0 {
             parts.push(format!("{} cross-host-collision(s)", self.collisions));
         }
@@ -347,7 +409,10 @@ impl WorkFinderTickSummary {
         if self.saturation_held {
             parts.push("SATURATION-HELD".to_string());
         }
-        if self.build_backoff_held {
+        // Only when the back-off actually deferred something (#10624): with a
+        // per-repo hold some repo is often engaged, and the bare flag would
+        // tag nearly every tick.
+        if self.build_backoff_held && self.deferred_build_backoff > 0 {
             parts.push("BUILD-BACKOFF-HELD".to_string());
         }
         parts.join(", ")

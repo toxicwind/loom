@@ -146,6 +146,9 @@ async fn run_collector(
     identity_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
+    let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
+    ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
@@ -185,6 +188,10 @@ async fn run_collector(
             _ = identity_timer.tick() => {
                 identities.sample(queue.as_ref(), &host_id, &workspace_pool, &mut slug_cache)
                     .await;
+            }
+
+            _ = ratelimit_timer.tick() => {
+                super::ops::ratelimit::record(&workspace_root).await;
             }
 
             _ = snapshot_timer.tick() => {
@@ -810,6 +817,7 @@ fn terminal_records(
             story_points: None,
             tokens_status: None,
             tokens_status_reason: None,
+            no_phase_cause: None,
             // Issues #9444/#9465/#9466: terminal facts the reaper-side journal
             // (the real `sweep.outcome`) computes. Absent, never fabricated.
             attempt_index: None,
@@ -829,10 +837,29 @@ fn terminal_records(
 /// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root
 /// path (a repo's slug does not change while the daemon runs — same
 /// rationale as [`crate::safehouse`]'s own `slug_cache`).
+///
+/// With repo facts on (W3a) the slug comes from the fingerprint-invalidated
+/// repo-facts record instead (`gh repo view` semantics, no forge call when
+/// warm), so a moved remote is seen; `Legacy` keeps the path below.
 pub(super) async fn resolve_repo_slug_cached(
     cache: &mut HashMap<String, String>,
     workspace_root: &str,
 ) -> Option<String> {
+    if crate::forge_repo_facts::enabled() {
+        use crate::forge_repo_facts::{canonical, GhRepoEnv, Lookup};
+        let root = std::path::PathBuf::from(workspace_root);
+        match tokio::task::spawn_blocking(move || canonical(&root, GhRepoEnv::Ignore)).await {
+            Ok(Lookup::Fact(f)) => {
+                let slug = f.full_name();
+                cache.insert(workspace_root.to_string(), slug.clone());
+                return Some(slug);
+            }
+            // `Unavailable` (a failed verify, or its backoff) keeps the
+            // last-known slug or the legacy lookup rather than dropping
+            // the record.
+            Ok(Lookup::Unavailable | Lookup::Legacy) | Err(_) => {}
+        }
+    }
     if let Some(slug) = cache.get(workspace_root) {
         return Some(slug.clone());
     }
@@ -846,29 +873,24 @@ pub(super) async fn resolve_repo_slug_cached(
 /// timeout, an empty/malformed answer) degrades to `None` — the caller drops
 /// the record rather than emitting a fabricated repo identity.
 async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(crate::gh_invocation::gh_bin());
-    cmd.arg("repo")
-        .arg("view")
-        .arg("--json")
-        .arg("nameWithOwner")
-        .arg("--jq")
-        .arg(".nameWithOwner")
-        .current_dir(workspace_root);
-    // #5431: point this child at the owner-correct credential when
-    // `workspace_root` is a cross-owner managed repo (the root-keyed helper
-    // takes a `std::process::Command`, so set the env directly here for tokio's
-    // command type). A no-op for a single-owner fleet or the root owner's repos.
-    if let Some(dir) = crate::credential_preflight::gh_config_dir_for_root(workspace_root) {
-        cmd.env("GH_CONFIG_DIR", dir);
-    }
-    let run = cmd.output();
-    let output = tokio::time::timeout(SLUG_FETCH_TIMEOUT, run)
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    // #10089: through the facade (counted, bounded); it also points the child
+    // at the owner-correct credential for a cross-owner managed repo (#5431).
+    let op = Operation::new("collector.repo_slug");
+    let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, SLUG_FETCH_TIMEOUT)
+        .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
+        .current_dir(workspace_root)
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ])
+        .run_async()
+        .await;
+    let output = outcome.ok_output()?;
     let slug = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!slug.is_empty() && slug.contains('/')).then_some(slug)
 }
@@ -936,6 +958,17 @@ async fn sample_snapshots(
     )
     .await;
     queue.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::HostHealth(health_record)));
+    // This host's export view (Issue #11124): per-exporter queue depth,
+    // cumulative drops and last flush. Facts only; every host emits its own.
+    queue.offer(TelemetryEnvelope::new(
+        host_id,
+        TelemetryRecord::HostExport(crate::telemetry::kinds::host_export::HostExportRecord::build(
+            host_id,
+            Utc::now(),
+            &super::global_export_statuses(),
+            &super::global_export_queue_stats(),
+        )),
+    ));
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
@@ -944,18 +977,25 @@ async fn sample_snapshots(
     super::queue_snapshot::record(workspace_pool, slug_cache).await;
     // Forge label-stage dwell (Issue #8929), OTLP-only: ETag-cached stage
     // listings plus a bounded per-item budget; a no-op without the ops sink.
-    super::ops::stage_dwell::record(workspace_pool, slug_cache).await;
+    // W12: first the fleet-captain role for the fleet gauges, so a dispatcher
+    // skips the repos a fresh captain covers (`captain_gauges`).
+    super::captain_gauges::forge_gauges(workspace_root, workspace_pool, slug_cache).await;
+    // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
+    // reads, no forge call; a no-op without the ops sink.
+    super::ops::redate_chain::record(workspace_pool).await;
     // Per-issue dispatch disposition spans (Issue #9222), OTLP-only: a no-op
     // without the ops sink, and without a new work-finder tick since the last
     // export pass.
     super::ops::disposition::record(slug_cache).await;
-    // ETA (Issue #9289): review listings, outcome checks and re-estimates,
-    // after `stage_dwell` so the ETag-cached listings are warm.
-    super::eta::record(workspace_root, workspace_pool, slug_cache).await;
-    // This host's live estimate set (Issue #9329) — native HTTPS only, and
-    // only when the set changed. After `eta::record` so it carries this
-    // pass's estimates rather than the previous pass's.
-    super::eta_snapshot::record().await;
+    // Per-account Codex session-container state (Issue #10455): export the
+    // gauge from the always-on watch's newest observations. No docker call
+    // here (the watch owns the bounded snapshot), so a wedged Docker cannot
+    // stall this pass; the WARN lives in the watch and runs without telemetry.
+    super::ops::codex_session::record();
+    // This host's view of its held sweeps, review PRs and ready queue over
+    // OTLP (Issue #10196), independent of ETA. Hourly anchor, deltas only on
+    // change; its review listings are ETag-cached (warm after stage_dwell).
+    super::fleet_state::record(workspace_root, workspace_pool, slug_cache).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
@@ -1544,10 +1584,14 @@ where
             }
         };
         let priority = priorities.get(&root).copied();
+        // #10763: this host's release-pass tallies for the repo, if it ticked.
+        let stale_blocked_release =
+            crate::stale_blocked::release_outcome::counters(&root).map(|c| c.to_telemetry());
         entries.push(ManagedRepoEntry {
             slug,
             visibility,
             priority,
+            stale_blocked_release,
         });
     }
     // Deterministic order (the dashboard renders this list directly) and

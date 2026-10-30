@@ -48,7 +48,7 @@ fn each_non_agent_state_escalates_on_the_first_pass_once_across_ticks_and_hosts(
     let world = World::default();
     let expected = seed_non_agent_states(&world);
     let repos = inputs();
-    let mut a = Host::new("host-a");
+    let mut a = Host::without_propagation("host-a");
     let report = a.pass(&world, &repos, Vec::new(), t(10, 0));
 
     for (slug, kind) in &expected {
@@ -78,7 +78,7 @@ fn each_non_agent_state_escalates_on_the_first_pass_once_across_ticks_and_hosts(
     assert_eq!(reads_before, reads_after, "the ledger answers repeats without a forge read");
 
     // Another host managing the same repos: finds the markers, posts nothing.
-    let mut b = Host::new("host-b");
+    let mut b = Host::without_propagation("host-b");
     let other = b.pass(&world, &repos, Vec::new(), t(10, 3));
     assert_eq!(other.escalations_posted, 0);
     for (slug, _) in &expected {
@@ -109,7 +109,7 @@ fn the_watchdog_escalates_after_the_window_and_progress_resets_it() {
     world.add(slug, issue(7, &[STAR, "loom:building"]));
     world.add(slug, pr(8, 7, &["loom:review-requested"]));
     let repos = vec![repo_input(slug)];
-    let mut host = Host::new("host-a");
+    let mut host = Host::without_propagation("host-a");
 
     let r = host.pass(&world, &repos, Vec::new(), t(10, 0));
     assert_eq!(r.rows[0].stage, LandingStage::InReview);
@@ -199,11 +199,17 @@ fn a_blocker_inherits_the_star_and_loses_it_when_it_clears() {
         .is_operator_priority());
 
     // The blocker closes: it loses the star; #10 (still loom:blocked, now
-    // with no open blocker) goes to the operator.
+    // with no open blocker) is a stale block the pass clears, not an
+    // operator ask (#10151).
     world.repo(slug).items.get_mut(&11).unwrap().state = "closed".into();
     let r = host.pass(&world, &repos, Vec::new(), t(10, 5));
     assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0].ask.as_ref().map(|a| a.kind), Some(AskKind::BlockedUnnamed));
+    assert_eq!(r.rows[0].stage, LandingStage::StaleBlock);
+    assert!(r.rows[0].ask.is_none());
+    assert!(!world.repo(slug).items[&10]
+        .labels
+        .iter()
+        .any(|l| l == "loom:blocked"));
     let mut items = vec![WorkItem::new(11, vec!["loom:issue".into()])];
     inherit::apply(Some(&input.root), &mut items);
     assert!(!items[0].is_operator_priority(), "inheritance cleared");
