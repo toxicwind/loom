@@ -1,4 +1,8 @@
 {
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "bun-types": "^1.4.4"
+  },
   "name": "loom-workspace",
   "description": "Loom-managed workspace with AI development orchestration",
   "private": true,

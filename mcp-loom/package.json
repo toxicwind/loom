@@ -22,6 +22,8 @@
     "strip-ansi": "^7.2.0"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "bun-types": "^1.4.4",
     "@types/node": "^26.6.3",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",

@@ -1,4 +1,8 @@
 {
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "bun-types": "^1.4.4"
+  },
   "name": "loom",
   "version": "0.19.695",
   "description": "AI-powered development orchestration: a CLI + daemon that coordinates AI development workers using git worktrees and a forge (GitHub or Gitea) as the coordination layer.",
