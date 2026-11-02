@@ -1,1 +1,0 @@
-../../defaults/docs/ci-observability.md

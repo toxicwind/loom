@@ -1,1 +1,0 @@
-../../defaults/docs/priority-model.md

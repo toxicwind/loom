@@ -1,1 +1,0 @@
-../../defaults/docs/trace-identity.md

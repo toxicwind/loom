@@ -1,1 +1,0 @@
-../../defaults/docs/premise-gate.md

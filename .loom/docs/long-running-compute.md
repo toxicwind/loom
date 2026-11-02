@@ -1,1 +1,0 @@
-../../defaults/docs/long-running-compute.md

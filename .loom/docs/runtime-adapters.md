@@ -1,1 +1,0 @@
-../../defaults/docs/runtime-adapters.md

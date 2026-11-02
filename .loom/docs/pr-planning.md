@@ -1,1 +1,0 @@
-../../defaults/docs/pr-planning.md

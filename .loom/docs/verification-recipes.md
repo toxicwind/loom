@@ -1,1 +1,0 @@
-../../defaults/docs/verification-recipes.md

@@ -1,1 +1,0 @@
-../../defaults/docs/build-gate.md

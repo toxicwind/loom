@@ -1,1 +1,0 @@
-../../defaults/docs/operator-decision.md

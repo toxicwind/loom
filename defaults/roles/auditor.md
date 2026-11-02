@@ -1,1 +1,0 @@
-../.claude/commands/loom/auditor.md

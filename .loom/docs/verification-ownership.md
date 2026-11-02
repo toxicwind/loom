@@ -1,1 +1,0 @@
-../../defaults/docs/verification-ownership.md

@@ -1,1 +1,0 @@
-../../defaults/docs/role-runner-roster.md

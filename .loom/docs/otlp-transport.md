@@ -1,1 +1,0 @@
-../../defaults/docs/otlp-transport.md

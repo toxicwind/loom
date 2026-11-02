@@ -1,1 +1,0 @@
-../.claude/commands/loom/comment-body-literal-path.md

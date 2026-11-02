@@ -1,1 +1,0 @@
-../../defaults/docs/comment-trust.md

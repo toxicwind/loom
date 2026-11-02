@@ -1,1 +1,0 @@
-../../defaults/docs/issue-pr-linking.md

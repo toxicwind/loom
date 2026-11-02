@@ -1,1 +1,0 @@
-../../defaults/docs/agent-pool-cli.md

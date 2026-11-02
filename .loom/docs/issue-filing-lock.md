@@ -1,1 +1,0 @@
-../../defaults/docs/issue-filing-lock.md

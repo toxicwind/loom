@@ -1,1 +1,0 @@
-../../defaults/docs/macos-tcc-codesign.md

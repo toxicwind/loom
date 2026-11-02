@@ -1,1 +1,0 @@
-../../defaults/docs/configuring-resources.md

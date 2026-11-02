@@ -1,1 +1,0 @@
-../../defaults/docs/label-state-machine.md

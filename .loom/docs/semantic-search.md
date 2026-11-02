@@ -1,1 +1,0 @@
-../../defaults/docs/semantic-search.md

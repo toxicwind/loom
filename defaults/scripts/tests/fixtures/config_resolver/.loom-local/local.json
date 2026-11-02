@@ -1,9 +1,0 @@
-{
-  "worktree": {
-    "root": "/mnt/scratch"
-  },
-  "overriddenByLocal": "local-value",
-  "autonomous": {
-    "exampleTierProbe": 4
-  }
-}

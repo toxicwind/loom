@@ -1,1 +1,0 @@
-../../defaults/docs/token-pool.md

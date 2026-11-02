@@ -1,1 +1,0 @@
-../../defaults/docs/gh-issue-create-rest-fallback.md

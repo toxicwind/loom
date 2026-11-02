@@ -1,1 +1,0 @@
-../../defaults/docs/promotion-throughput.md

@@ -1,1 +1,0 @@
-../../defaults/docs/judge-reference-rationale.md

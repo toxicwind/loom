@@ -1,1 +1,0 @@
-../../defaults/docs/merge-sequencing.md

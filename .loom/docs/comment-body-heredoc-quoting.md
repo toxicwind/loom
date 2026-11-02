@@ -1,1 +1,0 @@
-../../defaults/docs/comment-body-heredoc-quoting.md

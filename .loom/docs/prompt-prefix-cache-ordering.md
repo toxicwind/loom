@@ -1,1 +1,0 @@
-../../defaults/docs/prompt-prefix-cache-ordering.md

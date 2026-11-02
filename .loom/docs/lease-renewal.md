@@ -1,1 +1,0 @@
-../../defaults/docs/lease-renewal.md

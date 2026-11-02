@@ -1,1 +1,0 @@
-../../defaults/docs/session-mode.md

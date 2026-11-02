@@ -1,1 +1,0 @@
-../../defaults/docs/transcript-token-ingest.md

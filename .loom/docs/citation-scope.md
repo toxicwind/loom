@@ -1,1 +1,0 @@
-../../defaults/docs/citation-scope.md

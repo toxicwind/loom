@@ -1,1 +1,0 @@
-../../defaults/docs/github-authentication.md

@@ -1,1 +1,0 @@
-../../defaults/docs/model-selection.md

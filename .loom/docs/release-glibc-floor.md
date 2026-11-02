@@ -1,1 +1,0 @@
-../../defaults/docs/release-glibc-floor.md
