@@ -1,0 +1,47 @@
+# BEGIN LOOM-MANAGED (merge drivers, #4528)
+# install-metadata.json is a machine-local install stamp (loom_version,
+# loom_commit, last_resync, loom_source) that every host's resync re-writes --
+# always keep our side on a merge conflict; the file is fully re-derived by
+# the next resync regardless of which side "wins". A `merge=ours` attribute
+# alone is inert: the `ours` driver must also be enabled in local (never
+# committed) git config -- `git config merge.ours.driver true` -- which Loom's
+# install and resync scripts set automatically (see #4528).
+#
+# Field-level guardrail (#7359): this `merge=ours` driver silently discards
+# whichever side loses on ANY field of this file, but only the `loom_version`
+# field is actually checked afterward -- by scripts/version.sh's
+# check_versions() (invoked as `./scripts/version.sh check`) and the
+# version-check-gate.sh CI gate. The other fields (`installed_files`,
+# `loom_source_remote`, `install_date`, `last_resync`, etc.) have no such
+# gate: a hand-edit to any of them that collides with an upstream touch to
+# this file during a rebase/merge would be silently dropped with nothing to
+# catch it. This is accepted as-is (see #7359) rather than broadening the
+# gate, because every field but `loom_version` is resync-owned and, per the
+# note above, "fully re-derived by the next resync regardless of which side
+# wins" -- so a dropped hand-edit to those fields is expected to self-heal on
+# the next resync. Consequently: never hand-edit `installed_files`,
+# `loom_source_remote`, `install_date`, or `last_resync` in a feature commit;
+# only defaults/scripts/resync-installed.sh's restamp_metadata() should write
+# them.
+.loom/install-metadata.json merge=ours
+# END LOOM-MANAGED (merge drivers, #4528)
+
+# Telemetry record-kind registry (#8921). This file is an append-only table of
+# self-contained one-line-per-kind rows, and it is the ONLY shared line a new
+# telemetry record kind touches (it generates the enum variant, the serde tag,
+# the envelope gate version, and the OTLP routing class). Two concurrent PRs
+# each adding a kind append at the same point, which is a textbook git conflict
+# -- #8915 and #8909 hit it on 2026-09-25 even though both were individually
+# clean. `merge=union` (a git built-in, needing no local driver config, unlike
+# the `merge=ours` above) takes BOTH sides' added rows instead of conflicting,
+# which is exactly the right resolution for a set of independent declarations.
+#
+# Safety: union merge is only safe because of what this file is. If two sides
+# edit the SAME existing row differently, union keeps both copies and the build
+# fails loudly on the duplicate variant -- it cannot silently produce a wrong
+# wire tag or a wrong gate version. The `kind_registry` tests additionally
+# assert wire-tag/variant uniqueness and that every pre-#8921 gate value is
+# unchanged, so a bad union is caught by `cargo test`, not by a backend.
+# Do NOT add unrelated logic to this file: the attribute below assumes every
+# line is an independent declaration.
+loom-daemon/src/telemetry/kinds.rs merge=union

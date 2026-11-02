@@ -1,0 +1,2516 @@
+#!/usr/bin/env bash
+# Install Loom into a target repository using the full workflow
+#
+# AGENT USAGE INSTRUCTIONS:
+#   This script installs Loom orchestration into a target Git repository.
+#
+#   Non-interactive mode (for Claude Code):
+#     ./scripts/install-loom.sh --yes /path/to/target-repo
+#     ./scripts/install-loom.sh -y /path/to/target-repo
+#
+#   Interactive mode (prompts for confirmations):
+#     ./scripts/install-loom.sh /path/to/target-repo
+#
+#   What this script does:
+#     0. Validates source/target checkout state (warns or refuses if either is
+#        on a non-main branch or behind origin/main; override with
+#        --allow-non-main-source / --allow-stale-target)
+#     1. Validates target repository (must be a Git repo)
+#     2. Creates installation worktree (.loom/worktrees/loom-install-vX.Y.Z)
+#     3. Initializes Loom configuration (copies defaults to .loom/)
+#     4. Syncs workflow labels (GitHub or Gitea)
+#     5. Configures branch rulesets (interactive mode only)
+#     6. Creates pull request with loom:review-requested label
+#
+#   Requirements:
+#     - Target must be a Git repository with a remote
+#     - For GitHub: GitHub CLI (gh) must be authenticated
+#     - For Gitea: GITEA_TOKEN or FORGE_TOKEN environment variable must be set
+#     - loom-daemon binary must be buildable (cargo build --package loom-daemon --release)
+#
+#   Environment:
+#     LOOM_INSTALL_KEEP_WORKTREE=1
+#       On failure, leave the install worktree in place instead of deleting it,
+#       so the failing tree can be inspected and the diagnostics this script
+#       suggests can actually be run against it (issue #8270). Remove it
+#       yourself afterwards: git -C <target> worktree remove <path> --force
+#
+#   After installation:
+#     - Merge the generated PR in the target repository
+#     - Loom will be ready to use in that workspace
+
+set -euo pipefail
+
+# Parse command line arguments
+NON_INTERACTIVE=false
+FORCE_OVERWRITE=false
+CLEAN_FIRST=false
+ALLOW_ACTIVE_SESSION=false
+DOGFOOD_MODE=""  # "" (auto-detect), "true" (forced), "false" (forced off)
+ALLOW_NON_MAIN_SOURCE=false
+ALLOW_STALE_TARGET=false
+SKIP_TARGET_CI=false  # When true, install PR carries `[skip ci]` (issue #3333)
+LOCAL_MODE=false      # --local/--gitignore: keep Loom impl out of repo history (#3836)
+UNTRACK=false         # --untrack: run the git rm --cached commands (#3836)
+# Plan-only mode (issue #5517, forwarded from ./install.sh --dry-run --full):
+# print what a run would do and exit 0 before any write. See the two
+# short-circuits below -- one ahead of the --local-mode block's mutations, one
+# ahead of the default (worktree+PR) path's first write (create-worktree.sh).
+DRY_RUN=false
+# Install-time workspace mode (--mode session, issue #8884), held as the literal
+# `loom-daemon init` argv pair so it can be spliced into the init call below
+# without re-deriving anything. Empty (the default) reproduces the pre-#8884
+# behavior exactly.
+MODE_FLAGS=()
+TARGET_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -y|--yes)
+      NON_INTERACTIVE=true
+      shift
+      ;;
+    -f|--force)
+      FORCE_OVERWRITE=true
+      shift
+      ;;
+    --clean) CLEAN_FIRST=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --allow-active-session)
+      ALLOW_ACTIVE_SESSION=true
+      shift
+      ;;
+    --dogfood)
+      DOGFOOD_MODE="true"
+      shift
+      ;;
+    --no-dogfood)
+      DOGFOOD_MODE="false"
+      shift
+      ;;
+    --allow-non-main-source)
+      ALLOW_NON_MAIN_SOURCE=true
+      shift
+      ;;
+    --allow-stale-target)
+      ALLOW_STALE_TARGET=true
+      shift
+      ;;
+    --skip-target-ci)
+      SKIP_TARGET_CI=true
+      shift
+      ;;
+    --local|--gitignore)
+      LOCAL_MODE=true
+      shift
+      ;;
+    --untrack) UNTRACK=true; shift ;;
+    --mode)
+      # `default` is accepted as an explicit no-op; it does NOT remove a
+      # `"mode": "session"` marker already on disk (defaults/docs/session-mode.md).
+      case "${2:-}" in session|default) MODE_FLAGS=(--mode "$2") ;; *) echo "Error: invalid --mode: '${2:-}' (expected 'session' or 'default')" >&2; exit 1 ;; esac
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [OPTIONS] /path/to/target-repo"
+      echo ""
+      echo "Options:"
+      echo "  -y, --yes                  Non-interactive mode"
+      echo "  -f, --force                Force overwrite existing files and enable auto-merge"
+      echo "                             (does NOT bypass active-session detection)"
+      echo "  --clean                    Run uninstall first, then fresh install (combines both operations)"
+      echo "  --allow-active-session     Proceed even if a live Loom session is detected in"
+      echo "                             the target (daemon running, recent state file, or"
+      echo "                             active issue worktrees). Required to override the"
+      echo "                             pre-flight active-session guard."
+      echo "  --dogfood                  Force dogfood mode: symlink .claude/agents and .claude/commands/loom into defaults/"
+      echo "                             (auto-detected when installing into the Loom source repo itself)"
+      echo "  --no-dogfood               Disable dogfood mode even when installing into the Loom source repo"
+      echo "  --allow-non-main-source    Proceed even if the Loom source checkout is not on a clean main"
+      echo "                             (non-main branch, detached HEAD, or behind origin/main)"
+      echo "  --allow-stale-target       Proceed even if the target checkout is not on a clean main"
+      echo "                             (non-main branch or behind origin/main); ignored in dogfood mode"
+      echo "  --skip-target-ci           Add '[skip ci]' to the install PR title and commit subject so the"
+      echo "                             target repository's CI does not run on the install PR. Use only when"
+      echo "                             the target's required-checks rulesets do not depend on CI completing"
+      echo "                             (the universal GitHub-native skip directive)."
+      echo "  --local, --gitignore       Local (uncommitted) mode: instead of the full copy-into-worktree +"
+      echo "                             PR install, append a Loom-managed block of the installed"
+      echo "                             implementation paths (.loom/, .claude/commands/loom/,"
+      echo "                             .claude/agents/loom-*.md, .loom-local/) to the target repo's"
+      echo "                             .gitignore (idempotent) so the Loom files are never committed. If any"
+      echo "                             of those paths are already tracked, the exact 'git rm -r --cached'"
+      echo "                             commands to untrack them are printed. Does NOT run loom-daemon init."
+      echo "  --untrack                  With --local: actually run the 'git rm -r --cached' untrack commands"
+      echo "                             (staged as deletions; files stay on disk) instead of just printing"
+      echo "                             them. No effect without --local."
+      echo "  --mode session|default     Install-time workspace mode. 'session' installs for an attended"
+      echo "                             operator: terminals: [] (no tmux agent pool) and the daemon-tier"
+      echo "                             work generators off, persisted as \"mode\": \"session\" in"
+      echo "                             .loom/config.json. See defaults/docs/session-mode.md."
+      echo "  --dry-run                  Print what would be written and exit 0; creates, modifies, and"
+      echo "                             removes nothing. Implies --yes (never prompts). Composes with --local."
+      echo "  -h, --help                 Show this help message"
+      echo ""
+      echo "Default install PR markers (always on — see .loom/docs/ci-integration.md after install):"
+      echo "  - PR title prefix:        chore(loom): Install Loom <version>"
+      echo "  - PR body marker line:    loom-install: true"
+      echo "  - Commit trailer:         Skip-CI-Hint: docs-only"
+      echo "  These passive markers are detectable by opt-in CI (path-ignore, title filters,"
+      echo "  body grep) and do NOT suppress CI globally. Use --skip-target-ci for the active"
+      echo "  global skip when the target's required-checks rulesets do not depend on CI."
+      exit 0
+      ;;
+    *)
+      if [[ "$1" == -* ]]; then
+        echo "Error: unknown flag: $1" >&2
+        echo "       (--quick and --full belong to ./install.sh, not scripts/install-loom.sh)" >&2
+        echo "Use --help for usage." >&2
+        exit 1
+      fi
+      TARGET_PATH="$1"
+      shift
+      ;;
+  esac
+done
+
+# Determine Loom repository root (where this script lives)
+# requires-daemon: host optional   #10179 opted-out host refuses installs (guard on next line); absent/older binary (no `host` verb, exit 1/2) proceeds unguarded.
+LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; command -v loom-daemon >/dev/null 2>&1 && { _hc="$(loom-daemon host check --entry-point install-loom.sh 2>&1)"; [ $? -ne 10 ] || { printf '%s\n' "$_hc" >&2; exit 1; }; } || true  # only exit 10 = disabled; an older binary (1/2 for unknown `host`) proceeds
+
+# ANSI color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+error() {
+  echo -e "${RED}✗ Error: $*${NC}" >&2
+  exit 1
+}
+
+info() {
+  echo -e "${BLUE}ℹ $*${NC}"
+}
+
+success() {
+  echo -e "${GREEN}✓ $*${NC}"
+}
+
+warning() {
+  echo -e "${YELLOW}⚠ Warning: $*${NC}"
+}
+
+header() {
+  echo -e "${CYAN}$*${NC}"
+}
+
+# Source the installed-files manifest helper (#3450). The helper is in its
+# own file so the test suite can exercise it without sourcing the full
+# installer (which has argv-parsing side effects).
+# shellcheck source=scripts/install/manifest.sh
+source "$LOOM_ROOT/scripts/install/manifest.sh"
+
+# Source the machine-level loom-daemon provisioning helper (#3922). Kept in its
+# own file so the test suite can exercise it without sourcing the full
+# installer.
+# shellcheck source=scripts/install/provision-daemon.sh
+source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
+
+# Source the machine-level `loom` dispatcher provisioning helper (Epic #3835
+# Phase 3a, #4157). Sibling of provision-daemon.sh; installs ~/.local/bin/loom
+# and establishes the ~/.local/share/loom checkout link. Own file so the test
+# suite can exercise it without sourcing the full installer.
+# shellcheck source=scripts/install/provision-dispatcher.sh
+source "$LOOM_ROOT/scripts/install/provision-dispatcher.sh"
+
+# User-scope skills + agents provisioning (Epic #3835 Phase 4, #4261). Sibling
+# of provision-dispatcher.sh; links ~/.claude/commands/loom and
+# ~/.claude/agents/loom-*.md into the machine checkout so `/loom:*` skills and
+# `loom-*` subagents resolve from the single machine-level checkout and update
+# with `loom update`. Own file so the test suite can exercise it standalone.
+# shellcheck source=scripts/install/provision-skills.sh
+source "$LOOM_ROOT/scripts/install/provision-skills.sh"
+
+# User-scope guard-hook wiring (Epic #3835 Phase 5, #4262). Sibling of
+# provision-skills.sh; wires the Loom PreToolUse/UserPromptSubmit/Stop guard
+# hooks into ~/.claude/settings.json so they execute from the machine checkout
+# instead of a per-repo .loom/hooks/ copy that drifts stale. Own file so the
+# test suite can exercise it standalone.
+# shellcheck source=scripts/install/provision-hooks.sh
+source "$LOOM_ROOT/scripts/install/provision-hooks.sh"
+
+# Dogfood command-dir linker (issue #3682) — extracted so the test suite can
+# exercise the scoped-symlink logic without running the full installer.
+# shellcheck source=scripts/install/dogfood-commands.sh
+source "$LOOM_ROOT/scripts/install/dogfood-commands.sh"
+
+# install-metadata.json merge=ours wiring (#4528) — extracted so the test
+# suite can exercise it without running the full installer.
+# shellcheck source=scripts/install/gitattributes.sh
+source "$LOOM_ROOT/scripts/install/gitattributes.sh"
+
+# Check the state of the Loom *source* checkout (the directory that contains
+# this script). We refuse to install from a feature branch, a stale main, or
+# an arbitrary detached HEAD unless the operator explicitly opts in. Detached
+# HEAD on a `v*` tag is treated as a clean tagged release (still emits a mild
+# warning so the operator knows they're not on a moving branch). Staleness is
+# best-effort: we never run `git fetch` here — the operator is responsible for
+# refreshing `origin/main` if they want the staleness check to be accurate.
+check_source_state() {
+  local branch tag_match=""
+  branch=$(git -C "$LOOM_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+
+  # Tagged-release exemption: detached HEAD that resolves to a v* tag is OK.
+  if [[ "$branch" == "HEAD" ]]; then
+    tag_match=$(git -C "$LOOM_ROOT" describe --exact-match --tags HEAD 2>/dev/null || true)
+  fi
+
+  local stale=""
+  # Best-effort: only check upstream if origin/main exists locally. If there
+  # is no origin remote at all, or origin/main has never been fetched, we
+  # skip the staleness check silently rather than erroring — the operator
+  # has not opted into upstream tracking.
+  if git -C "$LOOM_ROOT" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+    local behind
+    behind=$(git -C "$LOOM_ROOT" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+    if [[ "$behind" -gt 0 ]]; then
+      stale="local is $behind commit(s) behind origin/main (run 'git -C $LOOM_ROOT fetch && git -C $LOOM_ROOT pull' to refresh)"
+    fi
+  fi
+
+  # Tagged release on a clean snapshot is fine — just announce it.
+  if [[ "$branch" == "HEAD" ]] && [[ -n "$tag_match" ]] && [[ -z "$stale" ]]; then
+    info "Loom source is at tagged release: $tag_match (detached HEAD)"
+    return 0
+  fi
+
+  # Clean main, up to date — nothing to say.
+  if [[ "$branch" == "main" ]] && [[ -z "$stale" ]]; then
+    return 0
+  fi
+
+  warning "Loom source checkout is not on a clean main:"
+  if [[ "$branch" != "main" ]]; then
+    if [[ "$branch" == "HEAD" ]] && [[ -n "$tag_match" ]]; then
+      echo "    detached HEAD on tag: $tag_match (no branch)"
+    elif [[ "$branch" == "HEAD" ]]; then
+      echo "    detached HEAD (no branch, no matching tag)"
+    else
+      echo "    branch: $branch (expected: main)"
+    fi
+  fi
+  [[ -n "$stale" ]] && echo "    $stale"
+  echo "  Source path: $LOOM_ROOT"
+
+  if [[ "$ALLOW_NON_MAIN_SOURCE" == "true" ]]; then
+    info "Continuing anyway (--allow-non-main-source)"
+    return 0
+  fi
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    error "Refusing to install from non-main / stale source in --yes mode. Pass --allow-non-main-source to override."
+  fi
+
+  local reply=""
+  read -r -p "Proceed with this source checkout anyway? [y/N] " -n 1 reply
+  echo ""
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    error "Aborted by user. Switch to main and pull, or pass --allow-non-main-source."
+  fi
+}
+
+# Cleanup function called on error
+cleanup_on_error() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 ]]; then
+    echo ""
+    warning "Installation failed at step: ${CURRENT_STEP:-unknown}"
+
+    # Post-mortem escape hatch (#8270): the failing tree is the ONLY evidence of
+    # why an install failed, and every diagnostic this script suggests has to be
+    # run INSIDE it. Deleting it first makes the suggestion unrunnable — that is
+    # how #8270's dangling-link list ended up having to be re-derived by hand in
+    # a scratch clone. `LOOM_INSTALL_KEEP_WORKTREE=1` suppresses the removal.
+    # Implemented by blanking WORKTREE_PATH rather than by a second guard on the
+    # removal block below, so the branch deletion nested inside it (which would
+    # orphan the kept worktree) is skipped by the same one decision.
+    if [[ "${LOOM_INSTALL_KEEP_WORKTREE:-0}" != "0" && -n "${WORKTREE_PATH:-}" ]]; then
+      warning "LOOM_INSTALL_KEEP_WORKTREE set — keeping ${TARGET_PATH}/${WORKTREE_PATH} for inspection (remove with: git -C '${TARGET_PATH}' worktree remove '${WORKTREE_PATH}' --force)"
+      WORKTREE_PATH=""
+    fi
+
+    if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -d "${TARGET_PATH}/${WORKTREE_PATH}" ]]; then
+      info "Cleaning up worktree: ${WORKTREE_PATH}..."
+      cd "$TARGET_PATH" 2>/dev/null || true
+      git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
+      git worktree prune 2>/dev/null || true
+      rm -rf "${TARGET_PATH:?refusing to remove a worktree with an empty TARGET_PATH}/${WORKTREE_PATH:?refusing to remove a worktree with an empty WORKTREE_PATH}"
+      if [[ -n "${BRANCH_NAME:-}" ]]; then
+        git branch -D "${BRANCH_NAME}" 2>/dev/null || true
+
+        # Delete the remote branch too if create-pr.sh pushed it before
+        # failing (e.g. fail at the gh-pr-create step left vibesql/kicad-tools
+        # with orphan remote branches in #3244). Restrict to our install branch
+        # prefix so unrelated branches are never touched.
+        if [[ "${BRANCH_NAME}" =~ ^feature/loom-install-v ]]; then
+          if git ls-remote --heads origin "${BRANCH_NAME}" 2>/dev/null | grep -q .; then
+            info "Deleting orphan remote branch: ${BRANCH_NAME}"
+            git push origin --delete "${BRANCH_NAME}" 2>/dev/null || \
+              warning "Could not delete remote branch ${BRANCH_NAME} (manual cleanup may be needed)"
+          fi
+        fi
+      fi
+    fi
+
+    echo ""
+    error "Installation did not complete. See above for details."
+  fi
+}
+
+trap cleanup_on_error EXIT
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
+
+# Validate arguments
+if [[ -z "$TARGET_PATH" ]]; then
+  error "Target repository path required\nUsage: $0 [--yes|-y] /path/to/target-repo"
+fi
+
+# Auto-detect non-interactive mode when stdin is not a TTY (e.g. `curl | bash`,
+# CI pipelines, or any redirected stdin). Without this guard, interactive
+# `read -p` prompts fail under `set -euo pipefail`, which trips the EXIT
+# cleanup trap and rolls back the entire installation. The explicit `--yes`
+# flag is still honored when set on a TTY.
+if [[ "$NON_INTERACTIVE" != "true" ]] && [[ ! -t 0 ]]; then
+  NON_INTERACTIVE=true
+  info "Detected non-interactive stdin (not a TTY) — running in non-interactive mode"
+fi
+
+# --dry-run must never block on stdin (issue #5517) -- force non-interactive
+# so every downstream prompt is skipped in favor of its report-only branch.
+if [[ "$DRY_RUN" == "true" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+  NON_INTERACTIVE=true
+  info "--dry-run implies non-interactive mode"
+fi
+
+# Export for sub-scripts
+export NON_INTERACTIVE
+
+# --untrack is meaningless without --local (it modifies which files the local-mode
+# untrack step acts on). Fail loudly rather than silently ignoring it.
+if [[ "$UNTRACK" == "true" ]] && [[ "$LOCAL_MODE" != "true" ]]; then
+  error "--untrack requires --local (it controls the local-mode untrack step)"
+fi
+
+# --mode is applied by `loom-daemon init`, which --local deliberately never runs
+# (see the LOCAL MODE short-circuit below), so the combination would silently
+# write no config at all. A safety flag must never no-op quietly (#8884).
+if [[ ${#MODE_FLAGS[@]} -gt 0 ]] && [[ "$LOCAL_MODE" == "true" ]]; then
+  error "--mode cannot be combined with --local: local mode does not run 'loom-daemon init', so no .loom/config.json is written"
+fi
+
+# ============================================================================
+# LOCAL MODE (--local / --gitignore) short-circuit (issue #3836)
+# ============================================================================
+# In local mode we deliberately do NOT run the full copy-into-worktree + PR
+# install. Instead we keep the installed Loom implementation out of the consumer
+# repo's git history:
+#   1. Append a Loom-managed block of the implementation paths to the target's
+#      .gitignore (idempotent — re-running refreshes the block in place).
+#   2. For any of those paths that are already tracked, print the exact
+#      `git rm -r --cached` commands to untrack them (gitignore alone does not
+#      stop tracking already-committed files), or run them when --untrack is set.
+#
+# This is a self-contained operation that runs BEFORE the source-state guard and
+# every heavy dependency/build step: no daemon build, no worktree, no PR. The
+# default committed-install path is completely unchanged unless --local is passed.
+if [[ "$LOCAL_MODE" == "true" ]]; then
+  # shellcheck source=scripts/install/local-mode.sh
+  source "$LOOM_ROOT/scripts/install/local-mode.sh"
+
+  LOCAL_TARGET="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
+    error "Target path does not exist: $TARGET_PATH"
+  if ! git -C "$LOCAL_TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+    error "Target path is not a git repository: $LOCAL_TARGET"
+  fi
+
+  # Resolve to the main worktree root so .gitignore lands at the repo root, not
+  # inside a linked worktree.
+  LOCAL_MAIN_WT=$(git -C "$LOCAL_TARGET" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
+  if [[ -n "$LOCAL_MAIN_WT" ]] && [[ "$LOCAL_TARGET" != "$LOCAL_MAIN_WT" ]]; then
+    info "Target is inside a worktree; resolving to main repository root: $LOCAL_MAIN_WT"
+    LOCAL_TARGET="$LOCAL_MAIN_WT"
+  fi
+
+  header "Loom Local Mode (gitignore + untrack)"
+  echo ""
+  info "Target: $LOCAL_TARGET"
+  echo ""
+
+  # --dry-run short-circuits HERE (issue #5517), before the only two writes
+  # local mode performs: the .gitignore block write and (with --untrack) the
+  # `git rm -r --cached` untrack commands.
+  if [[ "$DRY_RUN" == "true" ]]; then
+    info "Would write the Loom-managed local-mode block to $LOCAL_TARGET/.gitignore (idempotent)."
+    echo ""
+    DRY_LOCAL_TRACKED=()
+    while IFS= read -r _dry_tracked_path; do
+      [[ -n "$_dry_tracked_path" ]] && DRY_LOCAL_TRACKED+=("$_dry_tracked_path")
+    done < <(loom_local_tracked_paths "$LOCAL_TARGET")
+    if [[ ${#DRY_LOCAL_TRACKED[@]} -eq 0 ]]; then
+      success "No installed Loom implementation paths are currently tracked — nothing to untrack"
+    else
+      warning "These installed Loom implementation paths are still tracked:"
+      printf '    %s\n' "${DRY_LOCAL_TRACKED[@]}"
+      echo ""
+      if [[ "$UNTRACK" == "true" ]]; then
+        info "Would run these untrack commands (--untrack):"
+      else
+        info "Would print these untrack commands (pass --untrack to also preview running them):"
+      fi
+      loom_local_untrack_commands "$LOCAL_TARGET" | sed 's/^/    /'
+    fi
+    echo ""
+    success "Dry run complete — no files were created, modified, or removed"
+    trap - EXIT SIGINT SIGTERM
+    exit 0
+  fi
+
+  if loom_local_apply_gitignore "$LOCAL_TARGET"; then
+    success "Wrote Loom-managed local-mode block to .gitignore (idempotent)"
+  else
+    error "Failed to update .gitignore in $LOCAL_TARGET"
+  fi
+  echo ""
+
+  # Collect the implementation paths git still tracks (bash 3.2: no mapfile).
+  LOCAL_TRACKED=()
+  while IFS= read -r _tracked_path; do
+    [[ -n "$_tracked_path" ]] && LOCAL_TRACKED+=("$_tracked_path")
+  done < <(loom_local_tracked_paths "$LOCAL_TARGET")
+
+  if [[ ${#LOCAL_TRACKED[@]} -eq 0 ]]; then
+    success "No installed Loom implementation paths are tracked — nothing to untrack"
+  elif [[ "$UNTRACK" == "true" ]]; then
+    info "Untracking ${#LOCAL_TRACKED[@]} Loom implementation path(s)..."
+    loom_local_run_untrack "$LOCAL_TARGET"
+    success "Untracked Loom implementation paths (staged as deletions — commit to finalize)"
+    info "The files remain on disk; only their git tracking was removed."
+  else
+    warning "These installed Loom implementation paths are still tracked:"
+    printf '    %s\n' "${LOCAL_TRACKED[@]}"
+    echo ""
+    info "Run these commands to untrack them (or re-run with --untrack):"
+    loom_local_untrack_commands "$LOCAL_TARGET" | sed 's/^/    /'
+  fi
+  echo ""
+  success "Local mode complete"
+
+  # Disable the error/cleanup trap and exit cleanly — no worktree was created.
+  trap - EXIT SIGINT SIGTERM
+  exit 0
+fi
+
+# Source-state guard (#3327): before doing any heavy work, verify that the
+# Loom source checkout is on a clean main. Refuse / prompt / continue based
+# on flags + interactive vs. --yes mode. Runs after NON_INTERACTIVE finalization
+# so the refusal logic sees the effective value (including TTY auto-detect).
+#
+# Skipped under --dry-run (issue #5517): NON_INTERACTIVE is forced true above
+# for a dry run, which would otherwise turn a non-main/stale source checkout
+# into a hard `error()` (aborting the preview) instead of the informational
+# preview a plan-only run is supposed to give. --allow-non-main-source still
+# works normally for a real (non-dry-run) install.
+if [[ "$DRY_RUN" != "true" ]]; then
+  check_source_state
+fi
+
+# Resolve target to absolute path (git repository root, not worktree)
+TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
+  error "Target path does not exist: $TARGET_PATH"
+
+# Snapshot the pre-install working tree state. The post-install verification
+# (near the end of this script) compares against this snapshot so that the
+# user's pre-existing dirty state is not incorrectly flagged as "unstaged
+# changes after installation". Without this snapshot, the installer would
+# recommend destructive cleanup commands (git restore --staged . && git
+# checkout -- .) that destroy the user's uncommitted work.
+PRE_INSTALL_STATUS=""
+if git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+  PRE_INSTALL_STATUS=$(git -C "$TARGET_PATH" status --porcelain 2>/dev/null || true)
+fi
+
+# --dry-run short-circuits HERE (issue #5517) -- before the "is this a git
+# repository" check below, which can itself prompt interactively to run
+# `git init`. Every write this script performs (worktree creation,
+# loom-daemon init, label sync, PR creation) sits downstream of this point.
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo ""
+  header "═══════════════════════════════════════════════════════════"
+  header "  DRY RUN — no files will be created, modified, or removed"
+  header "═══════════════════════════════════════════════════════════"
+  echo ""
+  info "Target repository: $TARGET_PATH"
+  echo ""
+  if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+    warning "$TARGET_PATH is not a git repository."
+    info "A real Full Install run would offer to 'git init' it, create a remote"
+    info "repository, and set up 'origin' before proceeding (Full Install requires"
+    info "a remote). Nothing further to preview until a git repository exists."
+    echo ""
+    success "Dry run complete — no files were created, modified, or removed"
+    trap - EXIT SIGINT SIGTERM
+    exit 0
+  fi
+  success "Valid git repository detected"
+  echo ""
+  info "A real run would:"
+  echo "  1. Create an isolated installation worktree (.loom/worktrees/loom-install-vX.Y.Z)"
+  echo "     branched from the target's default branch -- the live checkout at"
+  echo "     $TARGET_PATH is never modified directly."
+  echo "  2. Run 'loom-daemon init' inside that worktree to copy Loom's configuration"
+  echo "     (.loom/, .claude/commands/loom/, CLAUDE.md, AGENTS.md, .github/labels.yml,"
+  echo "     .github/ISSUE_TEMPLATE/, etc. -- see defaults/ for the full payload)."
+  echo "  3. Sync GitHub workflow labels (.github/labels.yml) to the target repository."
+  echo "  4. Commit the changes on an install branch and push it."
+  echo "  5. Open a pull request labeled 'loom:review-requested' for review."
+  if [[ -d "$TARGET_PATH/.loom" ]]; then
+    echo ""
+    info "An existing Loom install was detected at $TARGET_PATH/.loom -- this would be"
+    info "a merge-mode upgrade (preserving customizations) rather than a fresh install."
+  fi
+  echo ""
+  success "Dry run complete — no files were created, modified, or removed"
+  trap - EXIT SIGINT SIGTERM
+  exit 0
+fi
+
+# Check if target is a git repository - offer to initialize if not
+if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # In non-interactive mode, require --init-git flag for git initialization
+    error "Target path is not a git repository: $TARGET_PATH\n       Use interactive mode to initialize git, or run 'git init' first."
+  fi
+
+  echo ""
+  warning "$TARGET_PATH is not a git repository."
+  echo ""
+  echo "Would you like to initialize git and set up a remote repository?"
+  echo ""
+  echo "This will:"
+  echo "  1. Run 'git init' in the directory"
+  echo "  2. Create a sensible .gitignore file"
+  echo "  3. Create an initial commit"
+  echo "  4. Create a remote repository and set up the origin (required for Full Install)"
+  echo ""
+  read -r -p "Initialize git and remote? [y/N] " -n 1 INIT_GIT
+  echo ""
+
+  if [[ ! $INIT_GIT =~ ^[Yy]$ ]]; then
+    error "Full Install requires a git repository with a remote.\n       Run 'git init' and set up a remote manually, or use Quick Install."
+  fi
+
+  # Initialize git
+  info "Initializing git repository..."
+  cd "$TARGET_PATH"
+  git init --quiet || error "Failed to initialize git repository"
+  success "Git repository initialized"
+
+  # Create basic .gitignore if it doesn't exist
+  if [[ ! -f "$TARGET_PATH/.gitignore" ]]; then
+    info "Creating .gitignore..."
+    cat > "$TARGET_PATH/.gitignore" << 'GITIGNORE'
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+build/
+target/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Loom runtime state (added by loom-daemon init)
+# These patterns are also managed by loom-daemon's update_gitignore().
+GITIGNORE
+    success "Created .gitignore"
+  fi
+
+  # Create initial commit
+  #
+  # #8734 audit (follow-up to #7818/#8005): this branch only runs when
+  # $TARGET_PATH was NOT already a git repository, so the .gitignore written
+  # just above (which does not yet carry loom-daemon's managed
+  # CREDENTIAL_PATTERNS block -- that lands later, during the actual .loom/
+  # install) cannot be relied on. A directory can still hold a live
+  # credential-bearing path here: an operator who ran `loom-daemon tokens
+  # bootstrap` (or set up .loom/accounts.env / .loom/gh-config* manually) in
+  # this same directory *before* ever running `git init` -- e.g. staging a
+  # shared token pool ahead of formalizing the project as a repo -- leaves
+  # .loom/tokens/ etc. sitting untracked on disk exactly where this `git add
+  # -A` would sweep it into the very first commit. Exclude the class
+  # unconditionally, the same way land-resync-commit.sh / resync-installed.sh
+  # do (machine-checked against loom-daemon/src/init/post_init.rs
+  # CREDENTIAL_PATTERNS by credential_class_tests.rs). #9134: each exclusion
+  # carries a trailing `*` so it also excludes a sibling rename/backup (e.g.
+  # `.loom/tokens.bak-<ts>/`), not just the exact credential path.
+  info "Creating initial commit..."
+  git add -A -- . ':!.loom/claude-config*' ':!.loom/tokens*' ':!.loom/accounts.env*' ':!.loom/api-keys*' ':!.loom/gh-config*' ':!.loom/gh-config-by-owner*'
+  git commit -m "Initial commit" --quiet || error "Failed to create initial commit"
+  success "Initial commit created"
+  echo ""
+
+  # Remote repository creation is required for Full Install
+  info "Full Install requires a remote repository (GitHub or Gitea)."
+  echo ""
+
+  # Check if gh CLI is available (needed for GitHub repo creation)
+  if command -v gh &> /dev/null; then
+    # Check GitHub authentication
+    if ! gh auth status &> /dev/null; then
+      warning "GitHub CLI is not authenticated"
+      info "Please authenticate with GitHub:"
+      echo ""
+      gh auth login || error "GitHub authentication failed"
+      echo ""
+    fi
+
+    # Prompt for repository visibility
+    echo "Repository visibility:"
+    echo "  1. Private (default)"
+    echo "  2. Public"
+    read -r -p "Choose visibility [1/2]: " -n 1 VISIBILITY
+    echo ""
+
+    VISIBILITY_FLAG="--private"
+    if [[ "$VISIBILITY" == "2" ]]; then
+      VISIBILITY_FLAG="--public"
+    fi
+
+    # Get directory name for repo name suggestion
+    DIR_NAME=$(basename "$TARGET_PATH")
+    read -r -p "Repository name [$DIR_NAME]: " REPO_NAME
+    REPO_NAME="${REPO_NAME:-$DIR_NAME}"
+
+    info "Creating GitHub repository: $REPO_NAME..."
+    if gh repo create "$REPO_NAME" $VISIBILITY_FLAG --source="$TARGET_PATH" --push; then
+      success "GitHub repository created and pushed"
+    else
+      error "Failed to create repository. Cannot proceed with Full Install."
+    fi
+  else
+    warning "GitHub CLI (gh) not available."
+    info "For GitHub repos: install gh CLI (brew install gh)"
+    info "For Gitea repos: create the repository manually and add the remote:"
+    echo "  git remote add origin https://your-gitea-instance/owner/repo.git"
+    echo "  git push -u origin main"
+    error "Cannot auto-create repository without gh CLI. Set up the remote manually and re-run."
+  fi
+  echo ""
+fi
+
+# If target is inside a worktree, resolve to the main repository root
+# git worktree list --porcelain returns the main worktree first
+# Note: Use head -4 before grep to avoid SIGPIPE when repo has many worktrees
+# (grep -m1 exits early, causing SIGPIPE to git with pipefail enabled)
+MAIN_WORKTREE=$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
+if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
+  warning "Target path is inside a worktree: $TARGET_PATH"
+  info "Resolving to main repository root: $MAIN_WORKTREE"
+  TARGET_PATH="$MAIN_WORKTREE"
+fi
+
+# ============================================================================
+# PRE-FLIGHT: Active Loom session detection (issue #3331)
+# ============================================================================
+# Refuse to install on top of a live Loom session unless the operator passes
+# --allow-active-session. This guards against installing while a daemon is
+# running or builders are actively in-flight (state corruption, lost work).
+#
+# Indicators (any one triggers detection):
+#   1. .loom/daemon-loop.pid exists AND PID is alive (kill -0 / ps -p check)
+#   2. .loom/daemon-state.json has "running": true AND was updated within the
+#      last 5 minutes
+#   3. Any .loom/worktrees/issue-N directory with mtime activity in the last
+#      5 minutes (in-flight builder)
+#
+# --force does NOT imply --allow-active-session by design: --force is for
+# overwriting files, not for racing with live processes. The operator must
+# opt in to both independently.
+ACTIVE_SESSION_CHECK="$LOOM_ROOT/scripts/install/check-active-session.sh"
+if [[ -x "$ACTIVE_SESSION_CHECK" ]]; then
+  if ! "$ACTIVE_SESSION_CHECK" "$TARGET_PATH"; then
+    if [[ "$ALLOW_ACTIVE_SESSION" == "true" ]]; then
+      warning "Continuing despite active session (--allow-active-session was passed)"
+      echo ""
+    else
+      echo "" >&2
+      error "Refusing to install: an active Loom session was detected in the target.
+
+To proceed:
+  • Stop the autonomous daemon: cd '$TARGET_PATH' && ./.loom/scripts/cli/loom-daemon-stop.sh
+  • Stop the tmux agent pool:   cd '$TARGET_PATH' && ./.loom/bin/loom stop
+  • Wait for in-flight builders to finish, OR
+  • Pass --allow-active-session to override this guard (use with caution).
+
+Note: --force does NOT bypass this check; --allow-active-session must be set explicitly."
+    fi
+  fi
+fi
+
+# Dogfood mode detection (issue #3311):
+# When installing Loom *on* the Loom source repo itself, copying
+# defaults/.claude/agents/ into .claude/agents/ would create silent drift
+# from the source of truth. Instead, replace the copied directory with a
+# gitignored symlink so the in-repo .claude/agents/ always reflects the
+# committed defaults/.claude/agents/ tree.
+#
+# Detection: TARGET_PATH equals LOOM_ROOT (the same git repo). Operator can
+# force on/off with --dogfood / --no-dogfood. Defaults to auto-detect.
+if [[ -z "$DOGFOOD_MODE" ]]; then
+  if [[ "$TARGET_PATH" == "$LOOM_ROOT" ]]; then
+    DOGFOOD_MODE="true"
+    info "Detected dogfood install (target == Loom source repo): .claude/agents will be symlinked"
+  else
+    DOGFOOD_MODE="false"
+  fi
+elif [[ "$DOGFOOD_MODE" == "true" ]] && [[ "$TARGET_PATH" != "$LOOM_ROOT" ]]; then
+  warning "--dogfood specified but target ($TARGET_PATH) is not the Loom source repo ($LOOM_ROOT)"
+  warning "Dogfood symlink would point outside the target repository; disabling dogfood mode"
+  DOGFOOD_MODE="false"
+fi
+
+# ============================================================================
+# PRE-INSTALLATION: Clean existing installation if --clean flag was passed
+# ============================================================================
+if [[ "$CLEAN_FIRST" == "true" ]]; then
+  header "Pre-Installation: Running Uninstall"
+  echo ""
+
+  # Check if Loom is installed (has .loom directory)
+  if [[ -d "$TARGET_PATH/.loom" ]]; then
+    # Preserve uncommitted user changes before uninstall
+    # The uninstall --local mode runs 'git add -A' which would stage user changes
+    # along with uninstall deletions, and our cleanup would discard them.
+    #
+    # Issue #3597: scope the stash to Loom-owned paths. The original unscoped
+    # `git stash push` swept sibling installers' uncommitted tracked changes
+    # into the stash (and the cleanup's `git checkout -- .` would otherwise
+    # revert them outright). Restrict to dirty ∩ (Loom ownership set +
+    # .gitignore); empty intersection → no stash.
+    # shellcheck source=scripts/install/stash-scope.sh
+    source "$LOOM_ROOT/scripts/install/stash-scope.sh"
+    STASHED_USER_CHANGES=false
+    CLEAN_OWNED_DIRTY=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && CLEAN_OWNED_DIRTY+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+    if [[ ${#CLEAN_OWNED_DIRTY[@]} -gt 0 ]]; then
+      warning "Working tree has uncommitted Loom-owned changes"
+      info "Stashing Loom-owned changes to preserve them during clean install..."
+      if git -C "$TARGET_PATH" stash push \
+           -m "loom-install: preserving user changes before --clean" \
+           -- "${CLEAN_OWNED_DIRTY[@]}" 2>/dev/null; then
+        STASHED_USER_CHANGES=true
+        CLEAN_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1)"
+        success "Loom-owned changes stashed → ${CLEAN_STASH_REF:-stash@{0}}"
+        info "  Stashed ${#CLEAN_OWNED_DIRTY[@]} Loom-owned path(s): ${CLEAN_OWNED_DIRTY[*]}"
+      else
+        warning "Failed to stash changes - uncommitted changes may be lost during --clean install"
+        warning "Consider committing your changes first, then retry"
+      fi
+    fi
+
+    info "Running local uninstall to clean existing installation..."
+
+    # Build uninstall flags from current flags
+    # Always use --local so removal happens in working directory (not a worktree)
+    # This way the install worktree captures both removals and additions in one PR
+    # Always use --clean so unknown files in managed directories are removed
+    UNINSTALL_FLAGS="--local --clean"
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+      UNINSTALL_FLAGS="$UNINSTALL_FLAGS --yes"
+    fi
+
+    # Run uninstall script in local mode
+    "$LOOM_ROOT/scripts/uninstall-loom.sh" $UNINSTALL_FLAGS "$TARGET_PATH" || \
+      error "Clean install failed - uninstall step encountered an error"
+
+    echo ""
+    success "Uninstall complete - proceeding with fresh installation"
+
+    # Clean up staged deletions from uninstall
+    # The uninstall ran in --local mode, staging file deletions directly in the
+    # main working directory. The fresh install will happen in a worktree, so
+    # main must stay clean to avoid leftover staged changes after completion.
+    info "Cleaning staged changes from uninstall..."
+
+    CLEANUP_FAILED=false
+
+    # Issue #3597: scope the unstage/checkout to Loom-owned dirty paths so
+    # sibling installers' uncommitted tracked changes (which were NOT stashed
+    # above) are never reverted. The uninstall only stages Loom-managed paths
+    # (#3450), so this intersection is exactly the set of staged deletions to
+    # undo and restore.
+    CLEANUP_PATHS=()
+    while IFS= read -r _owned_path; do
+      [[ -n "$_owned_path" ]] && CLEANUP_PATHS+=("$_owned_path")
+    done < <(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")
+
+    if [[ ${#CLEANUP_PATHS[@]} -gt 0 ]]; then
+      if ! git -C "$TARGET_PATH" restore --staged -- "${CLEANUP_PATHS[@]}" 2>/dev/null; then
+        warning "Failed to unstage changes from uninstall"
+        CLEANUP_FAILED=true
+      fi
+
+      if ! git -C "$TARGET_PATH" checkout -- "${CLEANUP_PATHS[@]}" 2>/dev/null; then
+        warning "Failed to restore files from uninstall"
+        CLEANUP_FAILED=true
+      fi
+    fi
+
+    # Also clean any untracked files left by the uninstall process
+    # Only clean Loom-owned directories — NOT .claude/ which is a shared directory
+    # that may contain custom project-specific commands not installed by Loom
+    git -C "$TARGET_PATH" clean -fd .loom/ .codex/ .github/labels.yml 2>/dev/null || true
+
+    # Verify no Loom-owned path is still dirty. Scoped to the ownership set so
+    # legitimately-preserved sibling changes don't trip a false "not clean"
+    # warning (issue #3597).
+    if [[ -n "$(_emit_loom_owned_dirty_paths "$LOOM_ROOT" "$TARGET_PATH")" ]]; then
+      CLEANUP_FAILED=true
+    fi
+
+    if [[ "$CLEANUP_FAILED" == "true" ]]; then
+      echo ""
+      warning "Working tree may not be fully clean after uninstall cleanup"
+      warning "Remaining changes:"
+      git -C "$TARGET_PATH" status --short 2>/dev/null || true
+      echo ""
+      warning "To fix manually after installation:"
+      warning "  cd $TARGET_PATH"
+      warning "  git restore --staged ."
+      warning "  git checkout -- ."
+    else
+      success "Working tree is clean after uninstall cleanup"
+    fi
+
+    # Restore stashed user changes
+    #
+    # Issue #3597: surface pop conflicts instead of silencing them with
+    # `2>/dev/null`. A conflicting pop (e.g. a Loom-managed file `init` also
+    # rewrote) previously hid the conflict and stranded the stash silently.
+    if [[ "$STASHED_USER_CHANGES" == "true" ]]; then
+      info "Restoring stashed user changes..."
+      if CLEAN_POP_OUTPUT="$(git -C "$TARGET_PATH" stash pop 2>&1)"; then
+        success "User changes restored"
+      else
+        CLEAN_STASH_REF="$(git -C "$TARGET_PATH" stash list 2>/dev/null | head -1 | cut -d: -f1)"
+        [[ -z "$CLEAN_STASH_REF" ]] && CLEAN_STASH_REF="stash@{0}"
+        warning "Failed to restore stashed user changes automatically"
+        echo ""
+        echo "  git stash pop reported:"
+        printf '%s\n' "$CLEAN_POP_OUTPUT" | sed 's/^/    /'
+        echo ""
+        echo "  Your changes are preserved in the stash ($CLEAN_STASH_REF)."
+        echo "  Recover with: cd $TARGET_PATH && git stash pop"
+      fi
+    fi
+
+    echo ""
+  else
+    info "No existing Loom installation detected - proceeding with fresh install"
+    echo ""
+  fi
+fi
+
+echo ""
+header "╔═══════════════════════════════════════════════════════════╗"
+header "║           Loom Installation - Full Workflow               ║"
+header "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+
+info "Target: $TARGET_PATH"
+echo ""
+
+# Check required dependencies
+header "Checking Dependencies"
+echo ""
+
+# Known-good pnpm line per Node major (issue #5394, ported to this standalone
+# entry point in #5411).
+#
+#   Node 18.x / 20.x  ->  pnpm 10.x   (last line that runs on Node < 22.13)
+#   Node >= 22.13     ->  pnpm 11.x   (pnpm 11 hard-requires Node >= 22.13)
+#
+# `corepack enable pnpm` floats to the LATEST pnpm release, which today is the
+# 11.x line. On a Node 20 host that installs a pnpm shim that exists but cannot
+# run -- every invocation dies with `ERR_UNKNOWN_BUILTIN_MODULE: No such
+# built-in module: node:sqlite`. `command -v pnpm` happily passes anyway, so
+# a presence-only check used to green-light a host where `pnpm daemon:build`
+# was guaranteed to fail. Pin instead of floating:
+#
+#   corepack prepare pnpm@10.15.1 --activate     # Node 18/20 hosts
+#
+# Bump this pin alongside install.sh's copy when Node's supported floor moves.
+LOOM_PNPM_PIN_FOR_LEGACY_NODE="10.15.1"
+
+# Run `pnpm --version` and record the version it reports.
+#
+# This is deliberately an *execution* probe rather than a version-matrix
+# comparison: the failure mode in issue #5394 is a pnpm that is present but
+# unrunnable, and only actually running it proves the node/pnpm pair works.
+#
+# Results are returned via globals (NOT stdout) so the caller does not have to
+# use a command substitution -- a subshell would discard the diagnostic:
+#   LOOM_PNPM_VERSION     -- the reported version (set on success)
+#   LOOM_PNPM_PROBE_ERROR -- combined stdout+stderr (set on failure)
+# Returns 0 if pnpm ran and reported a version, 1 otherwise. Never aborts the
+# installer under `set -e`.
+pnpm_probe_version() {
+  local out
+  LOOM_PNPM_VERSION=""
+  LOOM_PNPM_PROBE_ERROR=""
+  if ! out="$(pnpm --version 2>&1)"; then
+    LOOM_PNPM_PROBE_ERROR="$out"
+    return 1
+  fi
+  # A working pnpm prints exactly the version, but the line it prints is not
+  # something to be brittle about: corepack emits deprecation warnings first,
+  # and wrapper shims (asdf/volta/mise, CI harness stubs) can decorate the line
+  # itself -- e.g. `pnpm (some wrapper) 10.15.1`. So scan for a semver TOKEN
+  # anywhere in the output and take the last one, rather than requiring the
+  # whole line to be nothing but the version.
+  #
+  # `-w` keeps that tolerance from becoming a free-for-all: it demands
+  # non-word characters on both sides of the token, so a Node version embedded
+  # in an error trailer (`Node.js v20.20.2`) is NOT mistaken for a pnpm
+  # version. The real guard against a broken pnpm remains the exit status
+  # checked above -- an unrunnable pnpm exits non-zero -- with this parse
+  # catching the narrower "exited 0 but printed no version at all" case.
+  LOOM_PNPM_VERSION="$(printf '%s\n' "$out" | grep -Eow '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' | tail -1 || true)"
+  if [[ -z "$LOOM_PNPM_VERSION" ]]; then
+    LOOM_PNPM_PROBE_ERROR="$out"
+    return 1
+  fi
+  return 0
+}
+
+# Build actionable remediation text for a failed pnpm probe (issue #5394).
+# $1 = the captured probe output, $2 = `node --version` output (may be empty).
+# Echoes a multi-line hint; never exits.
+pnpm_failure_hint() {
+  local probe_output="${1:-}"
+  local node_version="${2:-}"
+  local hint=""
+
+  # Issue #7285: here-string, not `printf | grep -q` (broken-pipe race under pipefail).
+  if grep -qiE 'requires at least Node|node:sqlite|ERR_UNKNOWN_BUILTIN_MODULE' <<<"$probe_output"; then
+    hint="${hint}\n  • pnpm is installed but too new for this Node.js${node_version:+ ($node_version)}."
+    hint="${hint}\n    \`corepack enable pnpm\` floats to the latest pnpm (11.x), which requires"
+    hint="${hint}\n    Node >= 22.13. Pin a pnpm that runs on this Node, or upgrade Node:"
+  else
+    hint="${hint}\n  • pnpm is installed but \`pnpm --version\` failed. Reinstall or pin it:"
+  fi
+
+  hint="${hint}\n      corepack prepare pnpm@${LOOM_PNPM_PIN_FOR_LEGACY_NODE} --activate   # Node 18/20 hosts"
+  hint="${hint}\n      # ...or upgrade to Node >= 22.13 and keep pnpm 11.x"
+  hint="${hint}\n      # ...or, without corepack: npm install -g pnpm@${LOOM_PNPM_PIN_FOR_LEGACY_NODE}"
+  hint="${hint}\n    NOTE: do NOT run \`corepack prepare\` under sudo. \`sudo corepack enable pnpm\`"
+  hint="${hint}\n    installs the shim (/usr/bin/pnpm) as root, but \`corepack prepare\` resolves"
+  hint="${hint}\n    the version per-user in ~/.cache/node/corepack/. Running prepare under sudo"
+  hint="${hint}\n    pins root's cache while your shell keeps resolving the broken version."
+
+  printf '%b' "$hint"
+}
+
+MISSING_DEPS=()
+
+# Check if node is available (needed for version extraction)
+NODE_VERSION=""
+if command -v node &> /dev/null; then
+  NODE_VERSION="$(node --version 2>/dev/null || true)"
+  success "node: ${NODE_VERSION:-unknown}"
+else
+  MISSING_DEPS+=("node")
+fi
+
+# Check for pnpm (used by the JS workspace; no longer required for the daemon build)
+#
+# Issue #5394 (ported here by #5411): `command -v pnpm` only proves the shim
+# exists -- it does not prove pnpm can run under the installed Node. Actually
+# execute it, so a corepack-floated pnpm that is too new for this Node fails
+# HERE with an actionable message instead of blowing up later inside a build
+# step with a raw ERR_UNKNOWN_BUILTIN_MODULE stack trace.
+if command -v pnpm &> /dev/null; then
+  if pnpm_probe_version; then
+    success "pnpm: $LOOM_PNPM_VERSION"
+  else
+    MISSING_DEPS+=("pnpm (present but not runnable)")
+    warning "pnpm found at $(command -v pnpm), but 'pnpm --version' failed:"
+    printf '%s\n' "${LOOM_PNPM_PROBE_ERROR:-(no output)}" | sed 's/^/      /'
+  fi
+else
+  MISSING_DEPS+=("pnpm")
+fi
+
+# Check for cargo (needed to build daemon)
+if command -v cargo &> /dev/null; then
+  success "cargo: $(cargo --version | head -1)"
+else
+  MISSING_DEPS+=("cargo")
+fi
+
+# NO PYTHON PREREQUISITE (epic #4081 Phase 4, #4557).
+#
+# A "Check for Python 3.10+ (needed for loom-tools)" block used to sit here and
+# push `python3.10+` into MISSING_DEPS, which made a missing Python a HARD
+# install failure ("Cannot proceed without required dependencies"). The Python
+# `loom-tools` package it gated was retired: Loom's orchestration layer is the
+# native `loom-daemon` binary plus bash, and a fresh machine provision installs
+# no Python at all.
+#
+# The one surviving Python module — the opt-in, off-by-default `loom-search`
+# carve-out — is deliberately NOT installed here and is NOT a prerequisite. It
+# is installed by hand, only by hosts that want it:
+#   cd <loom-checkout>/loom-tools && pip install -e .        # or -e '.[search]'
+# See defaults/docs/semantic-search.md and
+# docs/adr/0013-loom-tools-python-retirement.md.
+
+echo ""
+
+# Report missing dependencies
+if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
+  echo -e "${RED}✗ Missing required dependencies: ${MISSING_DEPS[*]}${NC}"
+  echo ""
+  info "Please install the missing dependencies:"
+  for dep in "${MISSING_DEPS[@]}"; do
+    case "$dep" in
+      node)
+        echo "  • Node.js: brew install node (or https://nodejs.org/)"
+        ;;
+      pnpm)
+        echo "  • pnpm: npm install -g pnpm (or https://pnpm.io/installation)"
+        ;;
+      "pnpm (present but not runnable)")
+        echo -e "$(pnpm_failure_hint "$LOOM_PNPM_PROBE_ERROR" "$NODE_VERSION")"
+        ;;
+      cargo)
+        echo "  • Rust/Cargo: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        ;;
+      # No `python3.10+` arm: Python stopped being a prerequisite in epic #4081
+      # Phase 4 (#4557) — nothing this installer provisions needs it.
+    esac
+  done
+  echo ""
+  error "Cannot proceed without required dependencies"
+fi
+
+# Extract Loom version from package.json
+if [[ ! -f "$LOOM_ROOT/package.json" ]]; then
+  error "Cannot find package.json in Loom repository"
+fi
+
+LOOM_VERSION=$(node -pe "require('$LOOM_ROOT/package.json').version" 2>/dev/null) || \
+  error "Failed to extract version from package.json"
+
+# Extract Loom commit hash
+cd "$LOOM_ROOT"
+LOOM_COMMIT=$(git rev-parse --short HEAD 2>/dev/null) || \
+  error "Failed to get git commit hash"
+
+success "Loom Version: v${LOOM_VERSION}"
+success "Loom Commit: ${LOOM_COMMIT}"
+echo ""
+
+# Export environment variables for installation scripts
+export LOOM_VERSION
+export LOOM_COMMIT
+export LOOM_ROOT
+export ALLOW_STALE_TARGET
+
+# Export FORCE_AUTO_MERGE for create-pr.sh
+# When --force is passed, also enable auto-merge on the installation PR
+if [[ "$FORCE_OVERWRITE" == "true" ]]; then
+  export FORCE_AUTO_MERGE=true
+else
+  export FORCE_AUTO_MERGE=false
+fi
+
+# Export SKIP_TARGET_CI for create-pr.sh (issue #3333).
+# When --skip-target-ci is passed, the install PR title and commit subject
+# are prepended with `[skip ci]` — the universal GitHub-native CI skip
+# directive. Default-off so install PRs into repos with required-check
+# rulesets do not silently break CI gating.
+export SKIP_TARGET_CI
+
+# Verify installation scripts directory exists
+if [[ ! -d "$LOOM_ROOT/scripts/install" ]]; then
+  error "Installation scripts directory not found: $LOOM_ROOT/scripts/install"
+fi
+
+# ============================================================================
+# PRE-FLIGHT: Idempotency Checks
+# ============================================================================
+# Skip idempotency checks if --force or --clean flags are set
+if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
+  header "Pre-flight: Idempotency Checks"
+  echo ""
+
+  # Check 1: Is Loom already installed with the same version?
+  # Layered version detection — .loom/install-metadata.json (deterministic JSON
+  # written at install time) is the authoritative source; the two CLAUDE.md
+  # sources below are LEGACY-ONLY fallbacks kept for repos installed before
+  # #8147, which removed the `**Loom Version**:` header from both guides (a
+  # per-release token in a file injected into every session's prompt prefix
+  # invalidated every agent's cached prefix on each bump). On a post-#8147
+  # install their `grep` matches nothing and detection falls through cleanly to
+  # an empty INSTALLED_VERSION, i.e. "treat as a fresh install" — the same
+  # behavior as a repo with no metadata file at all. Reject `{{...}}`
+  # placeholder leaks from stale/corrupted installs.
+  INSTALLED_VERSION=""
+
+  # Source 1: .loom/install-metadata.json (preferred — deterministic JSON)
+  if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      INSTALLED_VERSION=$(jq -r '.loom_version // empty' "$TARGET_PATH/.loom/install-metadata.json" 2>/dev/null || true)
+    else
+      # Robust grep fallback when jq is unavailable
+      INSTALLED_VERSION=$(grep -o '"loom_version"[[:space:]]*:[[:space:]]*"[^"]*"' "$TARGET_PATH/.loom/install-metadata.json" 2>/dev/null | head -1 | sed 's/.*"loom_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+    fi
+  fi
+
+  # Source 2: .loom/CLAUDE.md (legacy, pre-#8147 installs only)
+  if [[ -z "$INSTALLED_VERSION" ]] && [[ -f "$TARGET_PATH/.loom/CLAUDE.md" ]]; then
+    INSTALLED_VERSION=$(grep 'Loom Version' "$TARGET_PATH/.loom/CLAUDE.md" 2>/dev/null | head -1 | sed 's/.*Loom Version.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
+  fi
+
+  # Source 3: root CLAUDE.md (legacy, pre-#8147/pre-#3000 installs only)
+  if [[ -z "$INSTALLED_VERSION" ]] && [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
+    INSTALLED_VERSION=$(grep 'Loom Version' "$TARGET_PATH/CLAUDE.md" 2>/dev/null | head -1 | sed 's/.*Loom Version.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
+  fi
+
+  # Reject placeholder leaks (e.g. literal `{{LOOM_VERSION}}` from corrupted/stale
+  # template that was never substituted).
+  if [[ "$INSTALLED_VERSION" =~ ^\{\{.*\}\}$ ]]; then
+    INSTALLED_VERSION="unknown (stale template — see reinstall options below)"
+  fi
+
+  if [[ -n "$INSTALLED_VERSION" ]]; then
+    if [[ "$INSTALLED_VERSION" == "$LOOM_VERSION" ]]; then
+      info "Loom v${LOOM_VERSION} is already installed in this repository."
+      # #5559: --force/--clean are flags THIS script (scripts/install-loom.sh)
+      # accepts directly -- but most users reach this idempotency check through
+      # the top-level install.sh wrapper, whose own arg parser does NOT accept
+      # --force and hard-errors "Unknown flag: --force" if they follow a bare
+      # "Use --force" hint. Name both paths explicitly, and do not conflate
+      # --force with install.sh's --confirm-reinstall: --force overwrites this
+      # installation in place (and enables PR auto-merge on the Full Install
+      # path), while --confirm-reinstall uninstalls and then reinstalls --
+      # a heavier, destructive operation, not an equivalent shortcut.
+      info "Running this script directly? Use --force to reinstall in place, or --clean for a fresh install."
+      info "Running via the top-level install.sh instead (it does not accept --force)? Use"
+      info "'install.sh --confirm-reinstall', which uninstalls and reinstalls (not equivalent"
+      info "to --force's in-place overwrite)."
+      echo ""
+
+      # Disable error trap and exit successfully
+      trap - EXIT SIGINT SIGTERM
+      exit 0
+    else
+      info "Existing Loom installation detected: v${INSTALLED_VERSION}"
+      info "Upgrading to: v${LOOM_VERSION}"
+    fi
+  fi
+
+  # Check 2: Is there already an open installation PR?
+  # Extract owner/repo from URL (handles GitHub, Gitea, and other forges)
+  _ORIGIN_URL=$(git -C "$TARGET_PATH" config --get remote.origin.url 2>/dev/null || true)
+  REPO_NWOPATH=$(echo "$_ORIGIN_URL" | sed -E 's/\.git$//; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)
+  if [[ -n "$REPO_NWOPATH" ]] && [[ "$REPO_NWOPATH" =~ ^[^/]+/[^/]+$ ]]; then
+    EXISTING_INSTALL_PR=$(gh pr list -R "$REPO_NWOPATH" --state open --search "Install Loom" --json url,headRefName --jq '
+      [.[] | select(.headRefName | startswith("feature/loom-install-"))][0].url' 2>/dev/null || true)
+
+    if [[ -n "$EXISTING_INSTALL_PR" ]]; then
+      warning "An open Loom installation PR already exists:"
+      info "  ${EXISTING_INSTALL_PR}"
+      echo ""
+
+      if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        info "Non-interactive mode: Skipping duplicate installation."
+        info "Use --force to create a new PR regardless."
+        echo ""
+        trap - EXIT SIGINT SIGTERM
+        exit 0
+      else
+        read -r -p "Create a new installation PR anyway? [y/N] " -n 1 CREATE_ANYWAY
+        echo ""
+        if [[ ! $CREATE_ANYWAY =~ ^[Yy]$ ]]; then
+          info "Aborting. Merge or close the existing PR first, or use --force."
+          trap - EXIT SIGINT SIGTERM
+          exit 0
+        fi
+      fi
+    fi
+  fi
+
+  success "Idempotency checks passed"
+  echo ""
+fi
+
+# ============================================================================
+# STEP 1: Validate Target Repository
+# ============================================================================
+CURRENT_STEP="Validate Target"
+header "Step 1: Validating Target Repository"
+echo ""
+
+if [[ ! -x "$LOOM_ROOT/scripts/install/validate-target.sh" ]]; then
+  error "Installation script not found: validate-target.sh"
+fi
+
+"$LOOM_ROOT/scripts/install/validate-target.sh" "$TARGET_PATH" || \
+  error "Target validation failed"
+
+echo ""
+
+# ============================================================================
+# STEP 2: Create Installation Worktree
+# ============================================================================
+CURRENT_STEP="Create Worktree"
+header "Step 2: Creating Installation Worktree"
+echo ""
+
+if [[ ! -x "$LOOM_ROOT/scripts/install/create-worktree.sh" ]]; then
+  error "Installation script not found: create-worktree.sh"
+fi
+
+WORKTREE_OUTPUT=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH") || \
+  error "Failed to create worktree"
+
+# Parse output: WORKTREE_PATH|BRANCH_NAME|BASE_BRANCH
+WORKTREE_PATH=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f1)
+BRANCH_NAME=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f2)
+BASE_BRANCH=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f3)
+
+# Validate worktree path format (should be relative path starting with .loom/worktrees/)
+if [[ ! "$WORKTREE_PATH" =~ ^\.loom/worktrees/ ]]; then
+  error "Invalid worktree path returned: $WORKTREE_PATH"
+fi
+
+if [[ ! -d "$TARGET_PATH/$WORKTREE_PATH" ]]; then
+  error "Worktree was not created: $TARGET_PATH/$WORKTREE_PATH"
+fi
+
+info "Worktree: $WORKTREE_PATH"
+info "Branch: $BRANCH_NAME"
+info "Base branch: $BASE_BRANCH"
+echo ""
+
+# ============================================================================
+# STEP 3: Initialize Loom Configuration
+# ============================================================================
+CURRENT_STEP="Initialize Loom"
+header "Step 3: Initializing Loom Configuration"
+echo ""
+
+# Build loom-daemon (always rebuild to ensure binary matches current source)
+# Cargo's incremental compilation makes this fast (~1-2s) when nothing changed
+info "Building loom-daemon..."
+cd "$LOOM_ROOT"
+# Delegates to scripts/daemon-build.sh (rather than `pnpm daemon:build`) to decouple
+# from pnpm preflight (issue #3252) — the daemon is pure Rust; invoking via pnpm
+# forced lockfile/workspace/build-script validation of the loom source checkout,
+# causing unrelated JS-toolchain drift to abort installation.
+#
+# daemon-build.sh resolves Cargo's *actual* target directory (honoring
+# `build.target-dir` / `CARGO_TARGET_DIR`, issue #5922) rather than assuming the
+# relative `target/` default, and prints it to stdout on success so downstream
+# steps below can locate the built binary correctly under any configuration.
+#
+# It signals a missing-binary-after-successful-build via exit code 3, distinct
+# from a genuine compile failure (exit 1), so this wrapper can report a
+# different, non-misleading top-level message for each (issue #5922) instead
+# of always claiming "Failed to build" when the build itself actually succeeded.
+# (Temporarily disable errexit so a nonzero exit doesn't abort before we can
+# branch on the specific status code.)
+set +e
+TARGET_DIR=$("$LOOM_ROOT/scripts/daemon-build.sh")
+DAEMON_BUILD_STATUS=$?
+set -e
+if [ "$DAEMON_BUILD_STATUS" -eq 3 ]; then
+  error "loom-daemon built successfully, but the binary was not found at the resolved Cargo target directory (see details above) — check build.target-dir / CARGO_TARGET_DIR"
+elif [ "$DAEMON_BUILD_STATUS" -ne 0 ]; then
+  error "Failed to build loom-daemon"
+fi
+
+success "loom-daemon binary ready"
+
+# Log the daemon binary identity so a stale binary can be diagnosed
+# post-hoc when an install regression is reported (issue #3287).
+DAEMON_VERSION=$("$TARGET_DIR/release/loom-daemon" --version 2>/dev/null || echo "(unknown)")
+info "loom-daemon binary: $DAEMON_VERSION"
+
+# Provision a machine-level loom-daemon binary for the consumer (issue #3922).
+# The consumer repo ships loom-daemon-start.sh but no binary; install the
+# freshly-built one to ~/.local/bin (on PATH) so `command -v loom-daemon`
+# resolves it post-install with no manual steps. Best-effort: a soft failure
+# (e.g. ~/.local/bin unwritable) is logged but never aborts the install — the
+# consumer can still point LOOM_DAEMON_BIN at the source build. Also mirrors
+# $LOOM_ROOT/defaults to a machine-level location so `loom-daemon init` has a
+# working recovery path even on a host with no on-host `loom` git checkout
+# to find it via cwd/git-root search (#5389).
+info "Provisioning machine-level loom-daemon binary..."
+provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
+  warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
+
+# Provision the machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).
+# Installs ~/.local/bin/loom and links ~/.local/share/loom -> this Loom source
+# checkout so `loom start|stop|status|sweep|update` resolves a machine-level
+# runtime with no per-repo copy. Best-effort: a soft failure is logged but never
+# aborts the install. It writes ONLY those two paths — it never touches the
+# ~/.local/bin/loom-* Python console-script symlinks (Epic #4081's scope).
+info "Provisioning machine-level loom dispatcher..."
+provision_loom_dispatcher "$LOOM_ROOT" || \
+  warning "Machine-level loom dispatcher not fully provisioned (see note above); use ./.loom/bin/loom in-repo, or set LOOM_HOME."
+
+# Provision user-scope skills + agents (Epic #3835 Phase 4, #4261). Links
+# ~/.claude/commands/loom (whole dir) and ~/.claude/agents/loom-*.md (per file)
+# THROUGH the machine checkout established just above (PROVISIONED_LOOM_CHECKOUT),
+# so `/loom:*` skills and `loom-*` subagents resolve from the single machine-level
+# checkout and update with `loom update`, instead of drifting per-repo. Additive
+# and best-effort: it never clobbers an operator's real files, and a soft failure
+# is logged but never aborts the install. (Existing per-repo copies are NOT
+# removed here — that is Phase 6 migration territory, #4254.)
+info "Provisioning user-scope loom skills + agents..."
+provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
+  warning "User-scope loom skills/agents not fully provisioned; /loom:* skills still resolve from any per-repo copy."
+
+# Provision user-scope guard hooks (Epic #3835 Phase 5, #4262). Wires the Loom
+# guard hooks into ~/.claude/settings.json so they execute from the machine
+# checkout — a freshly-installed consumer repo needs NO per-repo .loom/hooks/
+# copy. Each wired command self-gates: it no-ops outside a Loom workspace and
+# defers to any still-present per-repo .loom/hooks/ copy (Phase 6 / #4254 strips
+# those; until then the project copy wins, so guards run exactly once). Additive
+# and best-effort — an operator's non-Loom hook entries are preserved and a soft
+# failure is logged but never aborts the install.
+info "Provisioning user-scope loom guard hooks..."
+provision_loom_hooks || \
+  warning "User-scope loom guard hooks not fully provisioned; guards still fire from any per-repo .loom/hooks/ copy + project-level settings entry."
+
+# Run loom-daemon init in the worktree
+cd "$TARGET_PATH/$WORKTREE_PATH"
+
+# Use --force to overwrite existing installation when requested (--force or --clean flags)
+# Otherwise, use merge mode to preserve custom project roles/commands
+# Use --defaults to point to Loom's defaults directory
+INIT_FLAGS=""
+if [ "$FORCE_OVERWRITE" = true ] || [ "$CLEAN_FIRST" = true ]; then
+  INIT_FLAGS="--force"
+fi
+"$TARGET_DIR/release/loom-daemon" init $INIT_FLAGS ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} --defaults "$LOOM_ROOT/defaults" . || \
+  error "loom-daemon init failed"
+
+echo ""
+
+# Dogfood mode (issue #3311): replace the copied .claude/agents/ tree in the
+# main checkout with a symlink to defaults/.claude/agents/. This avoids silent
+# drift between defaults/ and .claude/agents/ when working *on* the Loom
+# source repo. The .gitignore entry for `.claude/agents` (committed) ensures
+# git status stays clean and the install PR does not stage agent files.
+#
+# Why operate on $TARGET_PATH (main checkout) rather than the install worktree:
+#   - The relative symlink target `../defaults/.claude/agents` only resolves
+#     correctly when `.claude/` sits next to `defaults/` (i.e. at the repo
+#     root, not inside `.loom/worktrees/loom-install-*/`).
+#   - The install worktree's `.claude/agents/` files are now gitignored, so
+#     they will not be staged by `git add -A` in create-pr.sh — leaving them
+#     in place is harmless and avoids a destructive delete inside the
+#     worktree before the PR is created.
+if [[ "$DOGFOOD_MODE" == "true" ]]; then
+  info "Dogfood mode: ensuring .claude/agents symlink in $TARGET_PATH..."
+  DOGFOOD_LINK_PATH="$TARGET_PATH/.claude/agents"
+  DOGFOOD_LINK_TARGET="../defaults/.claude/agents"
+  DOGFOOD_ABS_TARGET="$TARGET_PATH/defaults/.claude/agents"
+
+  if [[ ! -d "$DOGFOOD_ABS_TARGET" ]]; then
+    warning "Dogfood symlink target does not exist: $DOGFOOD_ABS_TARGET"
+    warning "Skipping symlink creation; .claude/agents may be missing or stale"
+  else
+    mkdir -p "$TARGET_PATH/.claude"
+    if [[ -L "$DOGFOOD_LINK_PATH" ]]; then
+      EXISTING_TARGET=$(readlink "$DOGFOOD_LINK_PATH")
+      if [[ "$EXISTING_TARGET" == "$DOGFOOD_LINK_TARGET" ]]; then
+        success ".claude/agents symlink already correct (-> $DOGFOOD_LINK_TARGET)"
+      else
+        info "Updating .claude/agents symlink: $EXISTING_TARGET -> $DOGFOOD_LINK_TARGET"
+        rm -f "$DOGFOOD_LINK_PATH"
+        ln -s "$DOGFOOD_LINK_TARGET" "$DOGFOOD_LINK_PATH"
+        success "Updated .claude/agents symlink"
+      fi
+    elif [[ -e "$DOGFOOD_LINK_PATH" ]]; then
+      # Real directory or file occupies the path — replace with symlink.
+      # Safe because (a) defaults/.claude/agents/ has the canonical content,
+      # and (b) .claude/agents is gitignored so any local edits would not have
+      # been committed anyway. Preserve any local-only files by refusing to
+      # delete when the directory contains files not present in defaults.
+      LOCAL_ONLY_FILES=$(comm -23 \
+        <(cd "$DOGFOOD_LINK_PATH" 2>/dev/null && find . -type f | sort) \
+        <(cd "$DOGFOOD_ABS_TARGET" 2>/dev/null && find . -type f | sort) \
+        2>/dev/null || true)
+      if [[ -n "$LOCAL_ONLY_FILES" ]]; then
+        warning ".claude/agents contains local-only files not present in defaults:"
+        echo "$LOCAL_ONLY_FILES" | sed 's/^/    /'
+        warning "Refusing to replace with symlink. Move or commit these files, then re-run."
+      else
+        info "Replacing copied .claude/agents/ directory with symlink to defaults/..."
+        rm -rf "$DOGFOOD_LINK_PATH"
+        ln -s "$DOGFOOD_LINK_TARGET" "$DOGFOOD_LINK_PATH"
+        success "Replaced .claude/agents/ with symlink -> $DOGFOOD_LINK_TARGET"
+      fi
+    else
+      ln -s "$DOGFOOD_LINK_TARGET" "$DOGFOOD_LINK_PATH"
+      success "Created .claude/agents symlink -> $DOGFOOD_LINK_TARGET"
+    fi
+  fi
+  echo ""
+
+  # Dogfood mode (issue #3682): symlink loom's live `.claude/commands/loom/`
+  # to the shipped source-of-truth at `defaults/.claude/commands/loom/`, scoped
+  # to the `loom/` subdir only. A symlink cannot drift the way the previous
+  # copy (issue #3565) did — the stale copies produced a false bug report
+  # (#3665). Scoping the link to `loom/` keeps `.claude/commands/` itself a real
+  # directory, so #3565's failure mode (a co-installed tool writing a sibling
+  # namespace THROUGH a symlinked parent into loom's `defaults/` artifact) does
+  # not recur: no tool other than loom's own installer writes the `loom/`
+  # namespace. Full rationale lives in scripts/install/dogfood-commands.sh.
+  info "Dogfood mode: linking .claude/commands/loom -> defaults/ in $TARGET_PATH..."
+  link_dogfood_commands "$TARGET_PATH"
+  echo ""
+fi
+
+# Configure git hooks path so .githooks/ pre-commit works without husky/npx
+info "Configuring git hooks path..."
+git config core.hooksPath .githooks
+success "Set core.hooksPath to .githooks"
+echo ""
+
+# Hook SCRIPTS are no longer copied into the consumer's .loom/hooks/ (Epic #3835
+# Phase 5, #4262). They now execute from the machine-level checkout via the
+# user-scope ~/.claude/settings.json wiring provisioned above
+# (provision_loom_hooks), so a freshly-installed consumer repo carries no
+# hook-script copies and they can never drift stale. Hook POLICY (guards.*,
+# buildGate) is read from the tracked .loom-project/ project config through the
+# tiered resolver — it does NOT live alongside the scripts.
+#
+# Existing per-repo .loom/hooks/ copies on an ALREADY-installed repo are left
+# untouched here: removing them is Phase 6 (#4254) migration territory, and the
+# user-scope wrapper defers to a present copy so guards do not double-fire during
+# the transition. The #4041 canonical-Repo-Skills-guard preference logic lives in
+# the guard-destructive.sh dispatcher (path-relative; it moves with the script),
+# so no install-time canonical-guard probe is needed anymore.
+info "Hooks execute from the machine checkout (user-scope wiring) — not copied per-repo (#4262)"
+echo ""
+
+# Copy default config files (skill-routes.json template, etc.)
+info "Installing default config files..."
+if [[ -d "$LOOM_ROOT/defaults/config" ]]; then
+  mkdir -p .loom/config
+  for config_file in "$LOOM_ROOT/defaults/config/"*.json; do
+    [[ -f "$config_file" ]] || continue
+    config_name=$(basename "$config_file")
+    if [[ -f ".loom/config/$config_name" ]] && [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
+      info "Skipping existing config: $config_name (use --force to overwrite)"
+    else
+      cp "$config_file" ".loom/config/$config_name"
+      success "Installed config: $config_name"
+    fi
+  done
+else
+  info "No config directory found in defaults (skipping)"
+fi
+echo ""
+
+# NO PYTHON SETUP STEP (epic #4081 Phase 4, #4557).
+#
+# A "Setting up Python tools..." step used to run
+# `scripts/install/setup-python-tools.sh`, which created `loom-tools/.venv` and
+# `pip install -e`'d the Python package, verifying the result with a
+# `loom-tokens` console-script sentinel. Both the script and the package are
+# gone: everything they provided is a native `loom-daemon` subcommand, and the
+# sentinel would now never appear (so every fresh install would print a
+# permanent "Python tools setup failed" warning).
+#
+# The one surviving Python module (`loom-search`) is opt-in and installed by
+# hand — see defaults/docs/semantic-search.md. Installing it here would be
+# exactly the editable-install-with-frozen-console-scripts hazard that motivated
+# this epic (#4079).
+
+# Store Loom source repository path for wrapper scripts
+# (agent-metrics.sh and friends resolve the Loom source checkout through it)
+#
+# This sidecar is a DURABLE pointer -- resync-installed.sh and
+# check-main-freshness.sh keep reading it long after this install finishes --
+# so warn (non-blocking) when it resolves under an ephemeral/scratch location
+# (#6780).
+info "Recording Loom source path..."
+if [[ -f "$LOOM_ROOT/scripts/install/loom-source-path.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$LOOM_ROOT/scripts/install/loom-source-path.sh"
+  warn_if_ephemeral_loom_source_path "$LOOM_ROOT"
+fi
+echo "$LOOM_ROOT" > .loom/loom-source-path
+# Also write to target repo root — the worktree copy is gitignored and will be
+# lost when the installation worktree is cleaned up after PR merge
+echo "$LOOM_ROOT" > "$TARGET_PATH/.loom/loom-source-path"
+success "Loom source path recorded"
+
+# Store installation metadata (commit hash moved here from CLAUDE.md for idempotency)
+# Also record the list of installed files so the uninstaller knows exactly what to remove.
+# This prevents the uninstaller from using heuristics and accidentally touching project files.
+info "Recording installation metadata..."
+
+# Collect all installed files (relative paths from repo root).
+#
+# Issue #3450: the old implementation walked the *target* repo with
+#   find .loom .claude .codex .github .githooks CLAUDE.md .gitignore
+# which over-captured consumer-authored files. The uninstaller trusted that
+# manifest as authoritative for deletion and silently destroyed consumer
+# .github/workflows/*.yml, .gitignore, and CLAUDE.md. Now we walk
+# $LOOM_ROOT/defaults/ (the actual Loom-shipped files) via the
+# _emit_installed_files_manifest helper above.
+INSTALLED_FILES_JSON="$(_emit_installed_files_manifest)"
+
+# --- Stale-file sweep (upgrade path) ---
+# Compare the previous install's file list (from install-metadata.json) against
+# the new set. Files present in the old set but not the new set are orphans from
+# upstream renames/deletions and must be removed so they don't accumulate.
+# Only files the installer originally wrote are candidates — operator-added files
+# are never in PREV_INSTALLED_FILES, so they are safe by construction.
+#
+# Issue #3450 defense-in-depth: v0.7.2 (and earlier) wrote an over-broad
+# manifest that included consumer-authored .github/workflows/*.yml, custom
+# .gitignore entries, and pre-existing CLAUDE.md. The narrowed manifest no
+# longer lists those paths — but the sweep below would happily git-rm them
+# as "stale". The carve-out here mirrors the uninstall-side skip list so an
+# upgrade from a v0.7.2 install does NOT delete consumer-owned files. See
+# scripts/uninstall-loom.sh near the "v0.7.2's over-broad manifest" comment.
+#
+# Issue #3492 ownership-boundary intersection: in addition to the
+# `.github/*`-style allowlist below, every candidate is intersected
+# against the CURRENT Loom ownership set (_emit_loom_ownership_set —
+# the same path set _emit_installed_files_manifest produces). If a
+# stale-manifest entry is NOT in the current ownership set, the current
+# defaults/ does not ship it; it is preserved with a warning rather
+# than git-rm'd. This defends against pre-#3450 manifests that listed
+# consumer-authored .claude/skills/**, .claude/commands/<non-loom>/**,
+# etc.
+LOOM_OWNERSHIP_SET="$(_emit_loom_ownership_set)"
+STALE_FILES=()
+PRESERVED_NOT_OWNED=()
+if [[ -f "$TARGET_PATH/.loom/install-metadata.json" ]] && command -v jq >/dev/null 2>&1; then
+  while IFS= read -r prev_file; do
+    [[ -n "$prev_file" ]] || continue
+
+    # Defense-in-depth (#3450, #3480): never sweep files in Loom's
+    # "consumer-owned" carve-out, even if they appear in the previous
+    # manifest. Mirrors the uninstall-side skip list.
+    #
+    # .github/ is an ALLOWLIST: only the files Loom actually ships into
+    # targets (source of truth: defaults/.github/ as walked by
+    # scripts/install/manifest.sh) fall through to the sweep. Everything
+    # else under .github/ — consumer workflows, composite actions,
+    # dependabot.yml, etc. — is consumer-owned by default and never swept,
+    # even when a legacy over-broad manifest (v0.7.x, #3450) lists it.
+    # If Loom ever ships new .github/ files (e.g. workflows), add those
+    # exact paths here AND in scripts/uninstall-loom.sh.
+    case "$prev_file" in
+      CLAUDE.md|AGENTS.md|.gitignore|.claude/settings.json)
+        continue
+        ;;
+      .github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
+        # Loom-shipped — fall through to the sweep. Note (#4187): labels.yml is
+        # co-owned — Loom manages only its BEGIN/END LOOM LABELS block. This
+        # sweep only fires if Loom STOPS shipping the file entirely; while it is
+        # shipped the block-merge in loom-daemon init owns updates. If labels.yml
+        # is ever retired, a whole-file git rm here would still take consumer
+        # labels with it — prefer a marker-block strip (see uninstall-loom.sh).
+        ;;
+      .github/*)
+        # Consumer-owned by default.
+        continue
+        ;;
+    esac
+
+    # Issue #3492: intersect against the current ownership boundary. A
+    # path the previous manifest claimed Loom owned but that the current
+    # defaults/ no longer ships is consumer-authored (captured by an
+    # over-broad pre-#3450 manifest) and must NOT be git-rm'd.
+    # Issue #7285: here-string, never `printf ... | grep -q` — the
+    # ownership set is multi-KB, so an early-exiting `grep -q` can
+    # SIGPIPE printf mid-write and, under `pipefail`, that broken-pipe
+    # status masks a real match (inverting this ownership decision).
+    if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
+        && ! grep -Fxq -- "$prev_file" <<<"$LOOM_OWNERSHIP_SET"; then
+      PRESERVED_NOT_OWNED+=("$prev_file")
+      continue
+    fi
+
+    # Is this file still in the new installed set?
+    if ! echo "$INSTALLED_FILES_JSON" | grep -qF "\"${prev_file}\""; then
+      STALE_FILES+=("$prev_file")
+    fi
+  done < <(jq -r '.installed_files[]' "$TARGET_PATH/.loom/install-metadata.json")
+fi
+
+# Issue #3492: surface preserved paths so operators can audit their tree
+# for other pre-#3450 contamination. Single warning per file, no silent
+# skip.
+if (( ${#PRESERVED_NOT_OWNED[@]} > 0 )); then
+  for f in "${PRESERVED_NOT_OWNED[@]}"; do
+    warning "preserving ${f} (not owned by current Loom defaults/; likely consumer-authored, captured by pre-#3450 manifest)"
+  done
+fi
+
+if (( ${#STALE_FILES[@]} > 0 )); then
+  echo ""
+  info "Stale files from previous Loom install (removed or renamed upstream):"
+  for f in "${STALE_FILES[@]}"; do
+    echo "    - $f"
+  done
+  echo ""
+  PROCEED_DELETE=true
+  if [[ "$NON_INTERACTIVE" != "true" ]] && [[ "$FORCE_OVERWRITE" != "true" ]]; then
+    read -r -p "Remove these ${#STALE_FILES[@]} stale file(s)? [y/N] " CONFIRM_DELETE
+    [[ "$CONFIRM_DELETE" =~ ^[Yy]$ ]] || PROCEED_DELETE=false
+  fi
+  if [[ "$PROCEED_DELETE" == "true" ]]; then
+    DELETED_COUNT=0
+    for f in "${STALE_FILES[@]}"; do
+      if git rm --quiet --force "$f" 2>/dev/null; then
+        (( DELETED_COUNT++ )) || true
+      else
+        warning "Could not remove stale file: $f (may have been removed already)"
+      fi
+    done
+    success "Removed $DELETED_COUNT stale file(s) from previous Loom version"
+  else
+    info "Skipping stale file removal (user declined)"
+  fi
+fi
+# --- End stale-file sweep ---
+
+# --- Retired-file cleanup (content-gated) ---
+# A handful of files Loom once shipped were later RETIRED outright (deleted
+# upstream, not renamed). The generic stale-file sweep above deliberately will
+# NOT remove them:
+#   * The #3492 ownership-boundary intersection preserves any stale-manifest
+#     entry that is no longer in the current defaults/ ownership set — a
+#     retired path is by definition not owned, so it lands in
+#     PRESERVED_NOT_OWNED and is never git-rm'd. That defense-in-depth is
+#     correct (it protects consumer-authored files captured by pre-#3450
+#     over-broad manifests) and must stay.
+#   * A retired file that was never in the previous manifest at all is never
+#     even a sweep candidate.
+# So a retired file lingers on disk in every consumer that installed before the
+# retirement. This block removes such strays narrowly and safely.
+#
+# Gate: a frozen allowlist of (retired path -> sha256 of every version Loom
+# ever shipped at that path). A file is removed ONLY when it exists AND its
+# content hash matches a shipped digest — i.e. it is byte-identical to
+# something Loom shipped and therefore unmodified. A consumer who customized
+# the file (hash matches none) is left untouched with an informational line.
+# Absent -> no-op. Idempotent by construction (once removed, the existence
+# check is false on every subsequent run).
+#
+# Issue #3572: retire the stray `.claude/commands/loom/release.md` left behind
+# by #3563 (which deleted the shipped `/loom:release` skill but deliberately
+# did not sweep existing consumer copies). release.md's only placeholder is the
+# Claude-Code *runtime* token {{workspace}} — it is NOT install-time
+# substituted (see substitute_template_variables in
+# loom-daemon/src/init/templates.rs), so the shipped bytes are identical across
+# all consumers and a content-hash gate is exact. The digest set is frozen:
+# release.md will never ship again, so no maintenance burden accrues.
+_loom_sha256() {
+  # Portable sha256 -> bare hex digest (shasum on macOS, sha256sum on Linux).
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
+# Frozen retired-file allowlist. One "<relative-path> <sha256>" row per shipped
+# version; multiple rows per path enumerate every version. Comment (#) and
+# blank lines are ignored. Append-only — never remove a historical digest.
+LOOM_RETIRED_FILES=$(cat <<'RETIRED'
+# .claude/commands/loom/release.md — every version shipped in the #3495 -> #3563
+# window (retired by #3563 / PR #3571). Any match is unmodified Loom content.
+.claude/commands/loom/release.md 11aef217942f45bd03d90a24e5efae9209041cb59f09c888df4dc7e8208910dd
+.claude/commands/loom/release.md 0df6c20846c98850413243362c80dea2fd01330c8d97033ef5f7c3989578fe8c
+.claude/commands/loom/release.md c45841f8da42d1bda20bc180c8a93d14242238d9a2c1d9f5a1bdac32b5e9e556
+.claude/commands/loom/release.md d91e198e977ad7799f44fa1a6827c9836bca6d31c9357ed92fc400a3c88381de
+.claude/commands/loom/release.md 0d7030dd14f32f6f382a6430cd04e5f0475825d567aaed7570b73a4c43128ad1
+.claude/commands/loom/release.md 4a077ed25cb44add0afbc4d6bda23cb372f5f3c4c2ef23b7a24b586e66e4f3e7
+.claude/commands/loom/release.md 5f9930dc72a263866122b18018a64b8fed4bd53ef623d0eef27ed1e31fa0502f
+.claude/commands/loom/release.md b7fae9d13d2bfaee3bde514cabe44ac70b6551351a9e49357ede00f82c17cf35
+.claude/commands/loom/release.md f6523d9be058e40397f0ce30c08a8f2b60e9b38adae04bd7c919e0cc840acfec
+.claude/commands/loom/release.md 29a845f7f8912545d23832551753304df6e72dd4a9c8082c2d8ada1f09f449e1
+.claude/commands/loom/release.md 795c1df1d3f3706ba448482b037a0c9e4eb6272a719adb2688b9ddfc91ab4de6
+# .claude/agents/loom-shepherd.md — every version shipped from #1259/#1264
+# (initial subagent files) through #3871, before the v0.10.0 shepherd/daemon
+# deletion (#3884) removed it outright (#4097). .claude/ is merge-copied with
+# no orphan removal, so a pre-#3884 install keeps this stray forever unless
+# swept here.
+.claude/agents/loom-shepherd.md 1cbca10c8b0352fc3db636e0abb6fdf25ddcfb6138b7a21ab5faeb8b21f730a2
+.claude/agents/loom-shepherd.md 2be39b1d7978dbb3a8d502eaed2cfff9a8f9832aae801c8683a425405c0a2753
+.claude/agents/loom-shepherd.md 35830eb68c9ab3ad1cbeaf6ce2b62c7d919f3e06cc5234c46ad2c6c4f637c8ff
+.claude/agents/loom-shepherd.md 6c7e207a5f040675f31447427b4241999adab4d58831e8d5bc605c2ac5d500b2
+.claude/agents/loom-shepherd.md 8cfc89428135cb55c91a6ae768bbd3373dbe2a1d22eb088694bc158ce0091d34
+RETIRED
+)
+
+RETIRED_REMOVE=()
+RETIRED_PRESERVE=()
+# Unique retired paths (a path may have several allowed digests).
+RETIRED_PATHS=$(printf '%s\n' "$LOOM_RETIRED_FILES" \
+  | awk 'NF>=2 && $1 !~ /^#/ {print $1}' | sort -u)
+while IFS= read -r retired_path; do
+  [[ -n "$retired_path" ]] || continue
+  [[ -f "$TARGET_PATH/$retired_path" ]] || continue
+  file_hash=$(_loom_sha256 "$TARGET_PATH/$retired_path")
+  hash_matched=false
+  if [[ -n "$file_hash" ]]; then
+    while read -r allow_path allow_hash; do
+      [[ -n "$allow_path" && "${allow_path:0:1}" != "#" ]] || continue
+      if [[ "$allow_path" == "$retired_path" && "$allow_hash" == "$file_hash" ]]; then
+        hash_matched=true
+        break
+      fi
+    done <<< "$LOOM_RETIRED_FILES"
+  fi
+  if [[ "$hash_matched" == "true" ]]; then
+    RETIRED_REMOVE+=("$retired_path")
+  else
+    RETIRED_PRESERVE+=("$retired_path")
+  fi
+done <<< "$RETIRED_PATHS"
+
+# Preserved: retired path present, but content matches no shipped version.
+if (( ${#RETIRED_PRESERVE[@]} > 0 )); then
+  for f in "${RETIRED_PRESERVE[@]}"; do
+    info "preserving ${f} (retired by Loom, but on-disk content matches no shipped version — likely consumer-customized; leaving in place)"
+  done
+fi
+
+# Removed: retired path present with unmodified, shipped-identical content.
+if (( ${#RETIRED_REMOVE[@]} > 0 )); then
+  echo ""
+  info "Retired Loom files still present (deleted upstream, unmodified copy on disk):"
+  for f in "${RETIRED_REMOVE[@]}"; do
+    echo "    - $f"
+  done
+  echo ""
+  PROCEED_RETIRED=true
+  if [[ "$NON_INTERACTIVE" != "true" ]] && [[ "$FORCE_OVERWRITE" != "true" ]]; then
+    read -r -p "Remove these ${#RETIRED_REMOVE[@]} retired file(s)? [y/N] " CONFIRM_RETIRED
+    [[ "$CONFIRM_RETIRED" =~ ^[Yy]$ ]] || PROCEED_RETIRED=false
+  fi
+  if [[ "$PROCEED_RETIRED" == "true" ]]; then
+    RETIRED_DELETED=0
+    for f in "${RETIRED_REMOVE[@]}"; do
+      if git rm --quiet --force "$f" 2>/dev/null; then
+        (( RETIRED_DELETED++ )) || true
+      else
+        warning "Could not remove retired file: $f (may have been removed already or is untracked)"
+      fi
+    done
+    success "Removed $RETIRED_DELETED retired Loom file(s)"
+  else
+    info "Skipping retired file removal (user declined)"
+  fi
+fi
+# --- End retired-file cleanup ---
+
+# NOTE (#5624): this file is intentionally NOT gitignored (it records which
+# Loom version a repo was installed from, which is useful to keep committed)
+# — so it must never carry the installing machine's absolute filesystem path
+# (which leaks a local username/hostname on public repos). The raw path is
+# recorded separately in the gitignored `.loom/loom-source-path` sidecar
+# above, which is the only thing `uninstall-loom.sh` / the upgrade detector
+# actually need.
+#
+# Record the source clone's `origin` remote URL alongside the sidecar (#6780
+# AC3). A remote URL carries no username/hostname of the installing machine,
+# so it is safe to commit -- and it means a vanished/unreachable local clone
+# can still be identified and re-cloned instead of becoming an opaque dead
+# path. Best-effort: empty when the source isn't a git checkout or has no
+# `origin` configured.
+LOOM_SOURCE_REMOTE=""
+if [[ -f "$LOOM_ROOT/scripts/install/loom-source-path.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$LOOM_ROOT/scripts/install/loom-source-path.sh"
+  LOOM_SOURCE_REMOTE="$(loom_source_remote_url "$LOOM_ROOT")"
+fi
+# Minimal JSON string escaping (backslash and double-quote).
+LOOM_SOURCE_REMOTE="${LOOM_SOURCE_REMOTE//\\/\\\\}"
+LOOM_SOURCE_REMOTE="${LOOM_SOURCE_REMOTE//\"/\\\"}"
+
+cat > .loom/install-metadata.json <<METADATA
+{
+  "loom_version": "${LOOM_VERSION}",
+  "loom_commit": "${LOOM_COMMIT}",$(loom_source_requires_daemon_field "$LOOM_ROOT" 2>/dev/null)
+  "install_date": "$(date +%Y-%m-%d)",
+  "loom_source_remote": "${LOOM_SOURCE_REMOTE}",
+  "installed_files": ${INSTALLED_FILES_JSON}
+}
+METADATA
+success "Installation metadata recorded ($(echo "$INSTALLED_FILES_JSON" | grep -o '"' | wc -l | awk '{print $1/2}') files tracked)"
+echo ""
+
+# Wire the install-metadata.json merge=ours driver (#4528) so this host's
+# resync commits stop conflicting with other hosts' on `git merge`.
+ensure_install_metadata_merge_driver "$TARGET_PATH"
+success "Configured install-metadata.json merge=ours driver (.gitattributes + local git config)"
+echo ""
+
+# Reconcile install-metadata.json against on-disk state.
+# Issue #3287: a metadata-vs-disk divergence is itself a hard error — regardless
+# of which step caused it (a stale daemon binary, a hostile gitignore, a copy
+# race, etc.). This is the cheapest single check that catches every variant.
+info "Verifying all metadata-listed files exist on disk..."
+MISSING_FROM_METADATA=()
+if command -v jq >/dev/null 2>&1; then
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    if [[ ! -e "$path" ]]; then
+      MISSING_FROM_METADATA+=("$path")
+    fi
+  done < <(jq -r '.installed_files[]' .loom/install-metadata.json)
+else
+  warning "jq not available — skipping metadata reconciliation check"
+fi
+if (( ${#MISSING_FROM_METADATA[@]} > 0 )); then
+  echo "" >&2
+  for f in "${MISSING_FROM_METADATA[@]}"; do
+    echo "  MISSING: $f" >&2
+  done
+  error "${#MISSING_FROM_METADATA[@]} file(s) in install-metadata.json are missing from disk — install incomplete (see #3287)"
+fi
+success "Metadata reconciliation passed (all listed files present)"
+echo ""
+
+# Verify no installed lib files are gitignored.
+# This catches the hostile-gitignore variant of issue #3287 *after* the
+# daemon's own check, providing belt-and-suspenders coverage for users on
+# stale daemon binaries that predate the in-daemon gitignore audit.
+#
+# Issue #3326: use `git check-ignore -v` so we can surface the specific
+# `<gitignore-file>:<line>:<pattern>` triple and offer an actionable fix
+# instead of a generic "commonly '.loom/' or '.loom/scripts/'" hint.
+if [[ -d ".loom/scripts/lib" ]]; then
+  info "Checking that installed lib/*.sh files are not gitignored..."
+  # -v emits "<gitignore>:<line>:<pattern>\t<file>" for each match.
+  IGNORED_LIB_FILES=$(git check-ignore -v .loom/scripts/lib/*.sh 2>/dev/null || true)
+  if [[ -n "$IGNORED_LIB_FILES" ]]; then
+    # Parse first match to extract gitignore path, line, and pattern for the
+    # suggested-fix block. Subsequent matches are still listed verbatim below.
+    first_match=$(echo "$IGNORED_LIB_FILES" | head -1)
+    pattern_info="${first_match%%$'\t'*}"          # "<gitignore>:<line>:<pattern>"
+    pattern="${pattern_info##*:}"                  # "<pattern>"
+    gi_path_and_line="${pattern_info%:*}"          # "<gitignore>:<line>"
+    line_no="${gi_path_and_line##*:}"              # "<line>"
+    gi_file="${gi_path_and_line%:*}"               # "<gitignore>"
+
+    echo "" >&2
+    echo "  The following lib files are matched by a .gitignore rule:" >&2
+    while IFS=$'\t' read -r match file; do
+      [[ -z "$match" && -z "$file" ]] && continue
+      # match is "<gitignore>:<line>:<pattern>"
+      m_pattern="${match##*:}"
+      m_path_and_line="${match%:*}"
+      m_line="${m_path_and_line##*:}"
+      m_gi="${m_path_and_line%:*}"
+      echo "    $file" >&2
+      echo "      matched by ${m_gi}:${m_line} pattern '${m_pattern}'" >&2
+    done <<<"$IGNORED_LIB_FILES"
+    echo "" >&2
+
+    # Suggest a fix based on the shape of the offending pattern.
+    # 1. Unanchored single-segment dir (e.g. `lib/`, `bin/`, `share/`): suggest
+    #    anchoring to repo root by prefixing with `/`. This is the most common
+    #    cause (Python venv-template .gitignores ship with unanchored `lib/`).
+    # 2. Loom-wildcard pattern (e.g. `.loom`, `.loom/`, `.loom*`): the user is
+    #    explicitly hiding Loom — they need to delete the rule, not anchor it,
+    #    because Loom's working dir must be committed.
+    # 3. Anything else: generic guidance to narrow or remove the pattern.
+    if [[ "$pattern" =~ ^[a-zA-Z0-9_-]+/$ ]]; then
+      echo "  Suggested fix: anchor the pattern to the repo root." >&2
+      echo "    Change line ${line_no} of ${gi_file} from:  ${pattern}" >&2
+      echo "    To:                                          /${pattern}" >&2
+    elif [[ "$pattern" == .loom* ]]; then
+      echo "  Suggested fix: remove this pattern from ${gi_file}:${line_no}." >&2
+      echo "  Loom's working directory (.loom/) must be committed to git." >&2
+    else
+      echo "  Suggested fix: remove or narrow the pattern '${pattern}' at ${gi_file}:${line_no}." >&2
+    fi
+    echo "" >&2
+    echo "  Then commit the .gitignore fix and re-run the installer." >&2
+    error "Installed lib files are gitignored — install would produce a broken commit (see #3287)"
+  fi
+  success "lib/*.sh files are not gitignored"
+  echo ""
+fi
+
+# Verify expected files were created
+# NOTE: lib/ entries are listed explicitly as a defensive belt-and-suspenders check.
+# The recursive verification block below catches any other missing files under
+# defaults/scripts/, but listing lib/ here ensures these specific helpers
+# (sourced by ~17 other scripts) cannot regress silently. See issue #3220.
+EXPECTED_FILES=(
+  ".loom/config.json"
+  ".loom/roles"
+  ".loom/scripts/worktree.sh"
+  ".loom/scripts/lib/loom-tools.sh"
+  ".loom/scripts/lib/forge-helpers.sh"
+  ".loom/scripts/lib/pipe-pane-cmd.sh"
+  # NOTE (#4262): .loom/hooks/*.sh are intentionally NOT expected — hook scripts
+  # execute from the machine checkout via user-scope settings wiring, so a fresh
+  # install carries no per-repo hook copies.
+  "CLAUDE.md"
+  ".github/labels.yml"
+  ".claude/commands/loom"
+  ".claude/agents"
+  ".claude/settings.json"
+)
+
+info "Verifying installation files..."
+for file in "${EXPECTED_FILES[@]}"; do
+  if [[ ! -e "$file" ]]; then
+    error "Expected file not created: $file"
+  fi
+done
+
+success "All Loom files installed"
+echo ""
+
+# Verify installed scripts match source defaults (recursive walk).
+# Missing files are now a HARD ERROR — the previous warning-only behavior
+# allowed regressions like #3220 (lib/forge-helpers.sh missing) to slip through.
+# Content mismatches remain warnings since template substitution and platform
+# differences (line endings, etc.) can cause false positives.
+info "Verifying scripts match source..."
+VERIFY_MISSING=0
+VERIFY_MISMATCHES=0
+MISSING_SCRIPTS=()
+if [[ -d "$LOOM_ROOT/defaults/scripts" ]] && [[ -d ".loom/scripts" ]]; then
+  while IFS= read -r -d '' src_file; do
+    rel_path="${src_file#$LOOM_ROOT/defaults/scripts/}"
+    dst_file=".loom/scripts/$rel_path"
+    if [[ -f "$dst_file" ]]; then
+      if ! cmp -s "$src_file" "$dst_file"; then
+        warning "Script mismatch: .loom/scripts/$rel_path differs from source"
+        VERIFY_MISMATCHES=$((VERIFY_MISMATCHES + 1))
+      fi
+    else
+      MISSING_SCRIPTS+=(".loom/scripts/$rel_path")
+      VERIFY_MISSING=$((VERIFY_MISSING + 1))
+    fi
+  done < <(find "$LOOM_ROOT/defaults/scripts" -type f -print0)
+fi
+if [[ $VERIFY_MISSING -gt 0 ]]; then
+  echo "" >&2
+  for missing in "${MISSING_SCRIPTS[@]}"; do
+    echo "  MISSING: $missing" >&2
+  done
+  error "$VERIFY_MISSING script(s) missing from installation — install incomplete (see #3220)"
+fi
+if [[ $VERIFY_MISMATCHES -gt 0 ]]; then
+  warning "$VERIFY_MISMATCHES script(s) had content mismatches — see above"
+else
+  success "All scripts verified (match source defaults)"
+fi
+echo ""
+
+# Install Loom CLI wrapper (.loom/bin/loom)
+if [[ -f "$LOOM_ROOT/defaults/.loom/bin/loom" ]]; then
+  info "Installing Loom CLI wrapper..."
+  mkdir -p ".loom/bin"
+  cp "$LOOM_ROOT/defaults/.loom/bin/loom" ".loom/bin/loom" || \
+    error "Failed to copy Loom CLI"
+  chmod +x ".loom/bin/loom"
+  success "Installed .loom/bin/loom CLI"
+fi
+echo ""
+
+# Generate the checksum manifest (.loom/manifest.json) and check that every
+# intra-repo link in the installed markdown resolves. Body lives in
+# scripts/install/manifest.sh (already sourced above) — see _verify_installed_tree
+# there for why, and for the #8270 reporting fixes it carries. CWD is the install
+# worktree here, which is what that function requires.
+_verify_installed_tree
+echo ""
+
+# ============================================================================
+# STEP 4: Sync GitHub Labels
+# ============================================================================
+CURRENT_STEP="Sync Labels"
+header "Step 4: Syncing Workflow Labels"
+echo ""
+
+if [[ ! -x "$LOOM_ROOT/scripts/install/sync-labels.sh" ]]; then
+  error "Installation script not found: sync-labels.sh"
+fi
+
+"$LOOM_ROOT/scripts/install/sync-labels.sh" "$TARGET_PATH/$WORKTREE_PATH" || \
+  warning "Label sync had issues but continuing..."
+
+echo ""
+
+# ============================================================================
+# STEP 4b: Build MCP Server and Generate Configuration
+# ============================================================================
+CURRENT_STEP="MCP Setup"
+header "Step 4b: MCP Server Setup"
+echo ""
+
+# Primary path (#4230, epic #3835 Phase 3c): the `loom` MCP server is registered
+# ONCE PER MACHINE at USER scope, pointing at the machine-level checkout's bundle
+# — a single instance serves every repo (it resolves the invoking repo from its
+# CWD), which kills the #3803 per-repo stale-dist drift class.
+#
+# setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
+# (what the user-scope server serves), strips any legacy project-scope `loom`
+# entry so it cannot shadow the user-scope server, and emits a safehouse-only
+# .mcp.json when safehouse is enabled.
+info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
+if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
+  success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"
+else
+  warning "setup-mcp.sh failed - the served bundle may be missing"
+  info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
+fi
+
+# Register the loom MCP server at USER scope, pointing at the machine-level
+# checkout (~/.local/share/loom, overridable via LOOM_HOME). Fall back to the
+# source checkout if the machine checkout's bundle is not present yet.
+MCP_MACHINE_ENTRY="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
+if [[ ! -f "$MCP_MACHINE_ENTRY" ]]; then
+  MCP_MACHINE_ENTRY="$LOOM_ROOT/mcp-loom/dist/index.js"
+fi
+if command -v claude >/dev/null 2>&1; then
+  info "Registering the 'loom' MCP server at user scope (machine-level, #4230)..."
+  # Idempotent: drop any existing user-scope entry before re-adding.
+  claude mcp remove --scope user loom >/dev/null 2>&1 || true
+  if claude mcp add --scope user loom -- node "$MCP_MACHINE_ENTRY"; then
+    success "Registered user-scope 'loom' MCP server -> $MCP_MACHINE_ENTRY"
+    info "'loom update' refreshes this bundle for every repo at once (no per-repo action)."
+  else
+    warning "Failed to register the user-scope 'loom' MCP server. Register it manually:"
+    info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+  fi
+else
+  warning "'claude' CLI not on PATH — cannot register the user-scope 'loom' MCP server now."
+  info "Once 'claude' is available, register it manually (one time, per machine):"
+  info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+fi
+
+echo ""
+
+# ============================================================================
+# STEP 5: Configure Branch Rulesets
+# ============================================================================
+# Optional post-install hardening — wrap the entire block in a non-fatal
+# subshell. If anything inside fails (interactive read on non-TTY, missing
+# permissions, etc.), the installation continues to PR creation rather than
+# triggering the EXIT cleanup trap and rolling back completed work.
+CURRENT_STEP="Configure Branch Rulesets"
+header "Step 5: Configure Branch Rulesets"
+echo ""
+
+step5_branch_rulesets() {
+  # Detect default branch
+  cd "$TARGET_PATH"
+  local DEFAULT_BRANCH
+  DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+  info "Detected default branch: ${DEFAULT_BRANCH}"
+
+  # Prompt user
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    info "Non-interactive mode: Skipping branch ruleset setup"
+    info "To configure manually, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
+  else
+    echo ""
+    local REPLY
+    read -p "Configure branch ruleset for '${DEFAULT_BRANCH}' branch? (y/N) " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      info "Applying branch ruleset..."
+
+      # Apply ruleset (interactive — setup-branch-protection.sh will prompt on
+      # cross-name overlap; LOOM_NON_INTERACTIVE is explicitly unset/false here
+      # so the helper presents the Skip/Replace/Update options when overlap
+      # is detected — see issue #3216).
+      if LOOM_NON_INTERACTIVE=false "$LOOM_ROOT/scripts/install/setup-branch-protection.sh" "$TARGET_PATH" "$DEFAULT_BRANCH"; then
+        echo ""
+      else
+        echo ""
+        warning "Failed to configure branch ruleset (may require admin permissions)"
+        info "You can configure manually via your forge's Settings > Branch Protection"
+      fi
+    else
+      info "Skipping branch ruleset setup"
+      info "To configure later, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
+    fi
+  fi
+}
+
+# Run Step 5 non-fatally — never let an optional hardening step roll back the install.
+if ! step5_branch_rulesets; then
+  warning "Step 5 (branch rulesets) encountered an error — continuing with installation"
+  info "To configure manually after install: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH"
+fi
+
+echo ""
+
+# ============================================================================
+# STEP 5b: Configure Repository Settings
+# ============================================================================
+# Optional post-install configuration — wrapped in a non-fatal helper for the
+# same reason as Step 5: an interactive prompt on non-TTY stdin (or a missing
+# admin permission) must not roll back the entire installation.
+CURRENT_STEP="Configure Repository Settings"
+header "Step 5b: Configure Repository Settings"
+echo ""
+
+step5b_repository_settings() {
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # In non-interactive mode, apply repository settings automatically
+    # This is needed for auto-merge to work on the installation PR
+    info "Applying repository settings (required for auto-merge)..."
+    if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
+      echo ""
+    else
+      echo ""
+      warning "Failed to configure repository settings (may require admin permissions)"
+      info "Auto-merge may not be available for the installation PR"
+    fi
+  else
+    echo ""
+    local REPLY
+    read -p "Configure repository merge and auto-merge settings? (y/N) " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      info "Applying repository settings..."
+      if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
+        echo ""
+      else
+        echo ""
+        warning "Failed to configure repository settings (may require admin permissions)"
+        info "You can configure manually via GitHub Settings > General"
+      fi
+    else
+      info "Skipping repository settings"
+      info "To configure later, run: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+    fi
+  fi
+}
+
+# Run Step 5b non-fatally — see comment on Step 5 above.
+if ! step5b_repository_settings; then
+  warning "Step 5b (repository settings) encountered an error — continuing with installation"
+  info "To configure manually after install: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+fi
+
+echo ""
+
+# ============================================================================
+# STEP 5c: Verify Merge Configuration (#9287)
+# ============================================================================
+# Steps 5 and 5b configure a ruleset and the repo's merge settings
+# independently; their COMBINED effect (or a pre-existing ruleset's) can leave
+# merge-pr.sh no usable merge method, and that only surfaces as a 405 at the
+# end of a Builder -> Judge cycle. check-merge-config.sh reports it now.
+# Advisory and read-only: it never writes a ruleset or setting and always exits
+# 0; the `||` only guards against the step itself failing to run.
+CURRENT_STEP="Verify Merge Configuration"
+header "Step 5c: Verify Merge Configuration"
+( cd "$TARGET_PATH" && LOOM_DAEMON_BIN="$TARGET_DIR/release/loom-daemon" "$LOOM_ROOT/defaults/scripts/check-merge-config.sh" --verbose ) || warning "Step 5c (merge configuration check) could not run — continuing with installation"
+echo ""
+
+# ============================================================================
+# STEP 6: Create Pull Request
+# ============================================================================
+CURRENT_STEP="Create PR"
+header "Step 6: Creating Pull Request"
+echo ""
+
+if [[ ! -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
+  error "Installation script not found: create-pr.sh"
+fi
+
+PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$BASE_BRANCH") || {
+  # create-pr.sh prints detailed error info to stderr (visible above)
+  error "Failed to create pull request (see details above)"
+}
+
+# Check if installation was already complete (no changes needed)
+# IMPORTANT: Check this BEFORE trying to parse as URL
+if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
+  info "Loom is already installed - cleaning up..."
+
+  # Remove the worktree
+  cd "$TARGET_PATH"
+  git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
+  git worktree prune 2>/dev/null || true
+  rm -rf "${TARGET_PATH:?refusing to remove a worktree with an empty TARGET_PATH}/${WORKTREE_PATH:?refusing to remove a worktree with an empty WORKTREE_PATH}"
+  git branch -D "${BRANCH_NAME}" 2>/dev/null || true
+
+  # Restore any staged changes left by --clean uninstall
+  # When --clean runs uninstall in --local mode, it stages file deletions
+  # Since no changes are needed, we restore those files to their original state
+  if [[ "$CLEAN_FIRST" == "true" ]]; then
+    info "Restoring files staged by uninstall..."
+    if ! git -C "$TARGET_PATH" restore --staged . 2>/dev/null; then
+      warning "Failed to unstage changes - run 'git restore --staged .' in $TARGET_PATH"
+    fi
+    if ! git -C "$TARGET_PATH" checkout -- . 2>/dev/null; then
+      warning "Failed to restore files - run 'git checkout -- .' in $TARGET_PATH"
+    fi
+
+    # Verify cleanup
+    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
+       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
+      warning "Working tree still has changes after cleanup:"
+      git -C "$TARGET_PATH" status --short 2>/dev/null || true
+      warning "To fix: cd $TARGET_PATH && git restore --staged . && git checkout -- ."
+    fi
+  fi
+
+  # Disable error trap and exit successfully
+  trap - EXIT SIGINT SIGTERM
+
+  echo ""
+  success "Loom is already installed in this repository"
+  echo ""
+  info "No pull request was created because all files are up to date."
+  echo ""
+  exit 0
+fi
+
+# Parse output: PR_URL|MERGE_STATUS
+# Extract the last line containing PR_URL|STATUS format
+LAST_OUTPUT_LINE=$(echo "$PR_URL_RAW" | tail -1)
+PR_URL=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f1)
+MERGE_STATUS=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f2)
+
+# Validate PR URL - also try to extract from the raw output if parsing failed
+if [[ ! "$PR_URL" =~ ^https:// ]]; then
+  # Fallback: try to extract URL from anywhere in the output (GitHub or Gitea)
+  PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://[^[:space:]|]+/(pull|pulls)/[0-9]+' | head -1 | tr -d '[:space:]')
+fi
+
+if [[ ! "$PR_URL" =~ ^https:// ]]; then
+  error "Invalid PR URL returned: $PR_URL"
+fi
+
+# Default merge status if not set
+MERGE_STATUS="${MERGE_STATUS:-manual}"
+
+success "Pull request created"
+echo ""
+
+# ============================================================================
+# Post-Install Verification: Detect changes introduced by the installer
+# ============================================================================
+# We compare the current `git status --porcelain` against the snapshot taken
+# at install start (PRE_INSTALL_STATUS). Only entries that did not exist in
+# the pre-install snapshot are reported as install residue. Pre-existing
+# dirty state in the user's working tree was already acknowledged earlier
+# (validate-target.sh); we must not flag it again here, and we must never
+# recommend destructive cleanup that would discard the user's work.
+CURRENT_STEP="Verify Working Tree"
+header "Verifying main working directory..."
+echo ""
+
+cd "$TARGET_PATH"
+
+POST_INSTALL_STATUS=$(git status --porcelain 2>/dev/null || true)
+
+# Compute install-introduced entries: lines present after install but not
+# before. We use line-level set difference via grep -F -v -x against the
+# pre-install snapshot. Empty snapshot is handled by treating all current
+# entries as new (which is correct).
+if [[ -z "$POST_INSTALL_STATUS" ]]; then
+  INSTALL_RESIDUE=""
+elif [[ -z "$PRE_INSTALL_STATUS" ]]; then
+  INSTALL_RESIDUE="$POST_INSTALL_STATUS"
+else
+  INSTALL_RESIDUE=$(printf '%s\n' "$POST_INSTALL_STATUS" \
+    | grep -F -x -v -f <(printf '%s\n' "$PRE_INSTALL_STATUS") \
+    || true)
+fi
+
+if [[ -z "$INSTALL_RESIDUE" ]]; then
+  success "Main working directory is clean (relative to pre-install state)"
+else
+  echo ""
+  warning "Installer left changes in the main working directory:"
+  printf '%s\n' "$INSTALL_RESIDUE"
+  echo ""
+  warning "These paths appear new since the installer started. Inspect them"
+  warning "before cleaning up — do not blindly discard, as some may overlap"
+  warning "with your own in-progress work."
+  echo ""
+  warning "To inspect:"
+  warning "  cd $TARGET_PATH"
+  warning "  git status"
+  warning "  git diff <path>"
+fi
+
+echo ""
+
+# ============================================================================
+# Installation Complete
+# ============================================================================
+CURRENT_STEP="Complete"
+
+# Disable error trap - we completed successfully
+trap - EXIT SIGINT SIGTERM
+
+echo ""
+header "╔═══════════════════════════════════════════════════════════╗"
+header "║              ✓ Installation Complete!                    ║"
+header "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+
+success "Loom ${LOOM_VERSION} installed successfully"
+echo ""
+
+# Show PR status based on merge result
+case "$MERGE_STATUS" in
+  merged)
+    info "✓ Pull Request: ${PR_URL} (merged)"
+    ;;
+  auto)
+    info "⏳ Pull Request: ${PR_URL} (auto-merge enabled)"
+    ;;
+  *)
+    info "📦 Pull Request: ${PR_URL}"
+    ;;
+esac
+echo ""
+
+header "What's Included:"
+echo "  ✅ .loom/ directory with configuration and scripts"
+echo "  ✅ .claude/ directory with slash commands"
+echo "  ✅ .github/ directory with labels and issue templates"
+echo "  ✅ CLAUDE.md documentation (Claude Code)"
+echo "  ✅ AGENTS.md documentation (OpenAI Codex)"
+echo ""
+
+header "Next Steps:"
+case "$MERGE_STATUS" in
+  merged)
+    # PR was merged - ready to use immediately
+    echo "  Loom is ready to use! Choose your workflow:"
+    echo ""
+    echo "  Manual Mode (recommended to start):"
+    echo "    cd $TARGET_PATH && claude"
+    echo "    Then use /builder, /judge, or other role commands"
+    echo ""
+    echo "  Daemon Mode (autonomous orchestration):"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
+    echo "    Then in Claude Code: /loom"
+    ;;
+  auto)
+    # Auto-merge enabled - PR will merge once requirements are met
+    echo "  The installation PR has auto-merge enabled and will merge"
+    echo "  automatically once ruleset requirements are met."
+    echo ""
+    echo "  Once merged, choose your workflow:"
+    echo ""
+    echo "  Manual Mode (recommended to start):"
+    echo "    cd $TARGET_PATH && claude"
+    echo "    Then use /builder, /judge, or other role commands"
+    echo ""
+    echo "  Daemon Mode (autonomous orchestration):"
+    echo "    cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
+    echo "    Then in Claude Code: /loom"
+    ;;
+  *)
+    # Manual merge required
+    echo "  1. Review and merge the pull request: ${PR_URL}"
+    echo "  2. Choose your workflow:"
+    echo "     Manual Mode (recommended to start):"
+    echo "       cd $TARGET_PATH && claude"
+    echo "       Then use /builder, /judge, or other role commands"
+    echo "     Daemon Mode (autonomous orchestration):"
+    echo "       cd $TARGET_PATH && ./.loom/scripts/cli/loom-daemon-start.sh"
+    echo "       Then in Claude Code: /loom"
+    ;;
+esac
+echo ""
+
+# ---------------------------------------------------------------------------
+# CI integration hint (issue #3333).
+#
+# The install PR carries passive markers (chore(loom): title prefix,
+# `loom-install: true` body line, `Skip-CI-Hint: docs-only` commit trailer)
+# that target repos can detect via path-ignore, title filters, or body grep
+# to skip expensive CI on docs-only install PRs. Point operators at the
+# integration doc so they know what's available.
+# ---------------------------------------------------------------------------
+header "Optional: Skip CI on this and future install PRs"
+echo "  The install PR includes passive markers (title prefix, body line,"
+echo "  commit trailer) detectable by opt-in CI filters. To skip CI for"
+echo "  Loom install/update PRs, add a paths-ignore block to the target's"
+echo "  workflows:"
+echo ""
+echo "      on:"
+echo "        pull_request:"
+echo "          paths-ignore:"
+echo "            - '.loom/**'"
+echo "            - '.claude/**'"
+echo "            - '.codex/**'"
+echo "            - 'CLAUDE.md'"
+echo "            - 'AGENTS.md'"
+echo "            - '.github/labels.yml'"
+echo ""
+echo "  Full integration guide: ${TARGET_PATH}/.loom/docs/ci-integration.md"
+if [[ "$SKIP_TARGET_CI" == "true" ]]; then
+  echo ""
+  echo "  Note: --skip-target-ci was set — this install PR carries [skip ci]"
+  echo "  and target CI workflows were skipped via the universal directive."
+fi
+echo ""
+
+info "See CLAUDE.md in the target repository for complete usage details."

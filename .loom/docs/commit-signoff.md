@@ -1,0 +1,1 @@
+../../defaults/docs/commit-signoff.md

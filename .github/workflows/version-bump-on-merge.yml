@@ -1,0 +1,136 @@
+name: Version Bump on Merge
+
+# Single post-merge owner for VERSION (and the other version-bearing files
+# scripts/version.sh manages) -- see #7743.
+#
+# Why this exists: previously every PR touching `defaults/` had to carry a
+# 9(then 7)-file mechanical version-bump diff, which conflicted under any
+# concurrency and produced a steady stream of Doctor/operator rounds re-cut
+# against a moved `main` (nine closed issues about this in 60 days, #7743's
+# own body has the table). Moving the bump here removes the requirement
+# instead of teaching every actor to comply with it better: one workflow,
+# triggered only when a just-merged commit touched `defaults/`, always
+# bumping from the tree it is bumping -- correct by construction, not by
+# review. `defaults/scripts/check-defaults-version-bump.sh --forbid-bump`
+# (wired into ci.yml's `defaults-version-bump-check` job) is the matching
+# gate: it now REJECTS a PR that hand-edits a version-bearing file's value,
+# since that value change should only ever come from this workflow.
+#
+# Self-trigger note: the bump commit this workflow pushes never touches
+# `defaults/` (it only rewrites the version-bearing files themselves --
+# `package.json`, `mcp-loom/package.json`, `Cargo.toml`,
+# `VERSION`, `.loom/install-metadata.json` if present, plus the derived
+# `Cargo.lock` / `mcp-loom/package-lock.json`), so the `paths: ['defaults/**']`
+# filter below can never see its own push and re-trigger a loop. Do NOT add
+# an extra guard for that -- a naive one (e.g. skipping when the pusher is
+# this workflow's own bot identity) would also suppress a legitimate human
+# push that happens to share that identity, for no benefit, since the path
+# filter already makes the loop structurally impossible.
+#
+# The repository's main ruleset permits the loom-fleet-dispatch App to push
+# version commits. The default GITHUB_TOKEN cannot bypass that ruleset on a
+# user-owned repository (#7829). Provision the two named App secrets before
+# activation; missing credentials must fail rather than fall back to a
+# different identity. This workflow does not change repository rules.
+#
+# Releasing is not this workflow's job (#10826): a version in a bump commit is
+# released only if that commit, or a later `main` commit carrying the same
+# unreleased `VERSION`, finishes green in `CI` — release.yml runs on
+# `workflow_run` of `CI`, not on this push. A version whose commits never go
+# green is skipped (no tag); see defaults/docs/release-cadence.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "defaults/**"
+
+# Serialize runs instead of racing them -- deliberately NOT cancel-in-progress:
+# every merge that touched `defaults/` needs its own bump (this is a queue of
+# real work, not redundant re-verification of the same commit; see
+# .loom/docs/ci-principles.md), so back-to-back merges should queue and each
+# run should bump from whatever `main` looks like when it starts (which, for
+# a queued run, already includes every earlier run's own bump commit).
+concurrency:
+  group: version-bump-on-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bump-version:
+    name: Bump VERSION after a defaults/ merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Create repository-scoped version publisher token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.LOOM_FLEET_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.LOOM_FLEET_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      # No `ref:`/pinned sha here -- always check out the CURRENT tip of
+      # `main` at run start. For a queued run that matters: it must bump from
+      # wherever `main` actually is now, not from the commit that originally
+      # triggered it (which may already be several bumps behind by the time
+      # this run gets to the front of the concurrency group).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Bump version and push (retries on a racing push to main)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+
+          bot_login="${APP_SLUG}[bot]"
+          bot_id="$(gh api "users/$bot_login" --jq '.id')"
+          git config user.name "$bot_login"
+          git config user.email "${bot_id}+${bot_login}@users.noreply.github.com"
+
+          attempts=5
+          for attempt in $(seq 1 "$attempts"); do
+            # Re-sync to the current tip every attempt, not just the first --
+            # a losing race means another push landed on main while we were
+            # bumping, so the bump itself (not just the push) must be redone
+            # against the new tip.
+            git fetch origin main
+            git checkout -B main origin/main
+
+            ./scripts/version.sh bump patch
+            new_version="$(./scripts/version.sh show)"
+
+            git add package.json mcp-loom/package.json mcp-loom/package-lock.json \
+                   Cargo.toml Cargo.lock VERSION
+            if [ -f .loom/install-metadata.json ]; then
+              git add .loom/install-metadata.json
+            fi
+            git commit -m "chore: bump version to $new_version"
+
+            if git push origin HEAD:main; then
+              echo "Pushed version bump to $new_version"
+              exit 0
+            fi
+
+            echo "Push attempt $attempt/$attempts failed (main moved under us) -- retrying" >&2
+            sleep $((attempt * 3))
+          done
+
+          echo "ERROR: failed to push the version bump after $attempts attempts -- main kept moving faster than we could bump it." >&2
+          exit 1

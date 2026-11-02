@@ -1,0 +1,1197 @@
+//! Loom workspace initialization module
+//!
+//! This module provides functionality for initializing Loom workspaces
+//! from the daemon and CLI surface. It can be used from:
+//! - CLI mode (loom-daemon init)
+//! - MCP tools (shared code)
+//!
+//! The initialization process:
+//! 1. Validates the target is a git repository
+//! 2. Detects self-installation (Loom source repo) and runs validation-only mode
+//! 3. Copies `.loom/` configuration from `defaults/` (merge mode preserves custom files)
+//! 4. Sets up repository scaffolding (CLAUDE.md, .claude/, .codex/)
+//! 5. Updates .gitignore with Loom ephemeral patterns
+//! 6. Reports which files were preserved vs added
+//!
+//! # Module Structure
+//!
+//! - [`git`]: Git detection, validation, and path resolution
+//! - [`file_ops`]: File copy/merge/clean operations with reporting
+//! - [`templates`]: Template variable substitution
+//! - [`scaffolding`]: Repository scaffolding setup (CLAUDE.md, .claude/, etc.)
+//! - [`post_init`]: Post-initialization operations (manifest, gitignore)
+//! - [`repo_owned`]: Ownership boundary for the reinstall clean sweep (#5971)
+//! - [`payload`]: The install payload embedded in this binary, and the resync
+//!   that diffs and applies it (#10717)
+
+mod file_ops;
+pub(crate) mod git;
+pub mod payload;
+mod post_init;
+mod repo_owned;
+mod retired;
+mod scaffolding;
+pub mod session_mode;
+mod templates;
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+use serde_json::Value;
+
+use file_ops::{clean_managed_dir, copy_dir_with_report, verify_copied_files, TemplateContext};
+use post_init::{find_overbroad_loom_patterns, generate_manifest, write_install_metadata};
+use repo_owned::OwnershipBoundary;
+use retired::cleanup_retired_files;
+use scaffolding::setup_repository_scaffolding;
+
+// Re-export public types and functions
+pub use git::is_loom_source_repo;
+// The install-time workspace mode (#8884). `main.rs` derives its `--mode` clap
+// value from this enum, so the CLI surface and the config writer can never
+// disagree about which modes exist.
+pub use session_mode::InstallMode;
+// Re-exported so the `loom-daemon update-gitignore` subcommand (#4280) can
+// rewrite the marker-delimited managed block on its own, without running a full
+// `init`. The pattern list stays single-sourced in `post_init::EPHEMERAL_PATTERNS`.
+pub use post_init::update_gitignore;
+// The credential-bearing subset of EPHEMERAL_PATTERNS (#8005): the single
+// declared class every Loom stager must refuse regardless of `.gitignore`.
+pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
+
+// Import the rest for internal use
+use git::{
+    link_dogfood_symlinks, resolve_defaults_path, validate_git_repository,
+    validate_loom_source_repo,
+};
+
+/// Report of files affected during initialization
+///
+/// This struct tracks which files were added from defaults vs preserved
+/// from the existing installation, enabling users to identify custom files
+/// and deprecated files that may need cleanup.
+#[derive(Debug, Default)]
+pub struct InitReport {
+    /// Files that were added from defaults (didn't exist before)
+    pub added: Vec<String>,
+    /// Files that were preserved (existed before, not overwritten)
+    pub preserved: Vec<String>,
+    /// Files that were updated (existed before, overwritten on reinstall)
+    pub updated: Vec<String>,
+    /// Files that were removed (existed in destination but not in source, cleaned on reinstall)
+    pub removed: Vec<String>,
+    /// Files inside a managed `.loom/` directory that the reinstall clean
+    /// sweep left alone because the repo declared them repo-owned by pinning
+    /// them in `.loom/resync-ignore` (issue #5971).
+    pub preserved_repo_owned: Vec<String>,
+    /// Files inside a managed `.loom/` directory that the reinstall clean
+    /// sweep left alone because nothing attributes them to Loom: the current
+    /// `defaults/` tree does not ship them and the previous install's
+    /// `installed_files` record does not list them (issue #5971). Reported so
+    /// the operator can decide — pin them in `.loom/resync-ignore` to make the
+    /// intent explicit, or delete them by hand.
+    pub preserved_unmanaged: Vec<String>,
+    /// Files that failed post-copy verification (destination doesn't match source)
+    pub verification_failures: Vec<String>,
+    /// Whether this was a self-installation (Loom source repo)
+    pub is_self_install: bool,
+    /// Validation results for self-installation mode
+    pub validation: Option<ValidationReport>,
+}
+
+/// Validation report for self-installation mode
+#[derive(Debug, Default)]
+pub struct ValidationReport {
+    /// Role definitions found
+    pub roles_found: Vec<String>,
+    /// Scripts found
+    pub scripts_found: Vec<String>,
+    /// Slash commands found
+    pub commands_found: Vec<String>,
+    /// Subagent definitions found in .claude/agents/
+    pub agents_found: Vec<String>,
+    /// Whether CLAUDE.md exists
+    pub has_claude_md: bool,
+    /// Whether AGENTS.md exists (issue #4479, dual-runtime instruction anchor).
+    /// Unlike `has_claude_md`, a missing AGENTS.md is NOT recorded as a
+    /// validation issue — it is not mandatory for pre-existing installs that
+    /// predate the dual-runtime work.
+    pub has_agents_md: bool,
+    /// Whether .github/labels.yml exists
+    pub has_labels_yml: bool,
+    /// Issues found during validation
+    pub issues: Vec<String>,
+}
+
+/// Initialize a Loom workspace in the target directory
+///
+/// # Arguments
+///
+/// * `workspace_path` - Path to the workspace directory (must be a git repository)
+/// * `defaults_path` - Path to the defaults directory (usually "defaults" or bundled resource)
+/// * `force` - If true, overwrite existing files (otherwise merge mode preserves custom files)
+///
+/// # Returns
+///
+/// * `Ok(InitReport)` - Workspace successfully initialized with report of changes
+/// * `Err(String)` - Initialization failed with error message
+///
+/// # Behavior
+///
+/// - **Fresh install** (no .loom directory): Copies all files from defaults
+/// - **Reinstall with force=false** (merge mode): Adds new files, preserves ALL existing files
+/// - **Reinstall with force=true** (force-merge mode): Updates default files, preserves custom files
+///
+/// Both reinstall modes preserve custom project roles/commands (files not in defaults).
+/// Force mode is useful when you want to update Loom's built-in roles to the latest version.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The workspace path doesn't exist or isn't a directory
+/// - The workspace isn't a git repository (no .git directory)
+/// - File operations fail (insufficient permissions, disk full, etc.)
+pub fn initialize_workspace(
+    workspace_path: &str,
+    defaults_path: &str,
+    force: bool,
+) -> Result<InitReport, String> {
+    initialize_workspace_with_mode(workspace_path, defaults_path, force, InstallMode::Default)
+}
+
+/// [`initialize_workspace`], plus the install-time workspace mode (issue #8884).
+///
+/// `mode` is the operator's `loom-daemon init --mode <MODE>` selection.
+/// [`InstallMode::Default`] reproduces the pre-#8884 behaviour exactly, which is
+/// why the three-argument wrapper above is still the entry point every other
+/// caller uses. [`InstallMode::Session`] additionally asserts the session-mode
+/// key set on `.loom/config.json` — see [`session_mode`] for what that is and
+/// why the marker lives there.
+///
+/// A workspace whose existing `.loom/config.json` already carries the marker is
+/// treated as session-mode **regardless of `mode`**, so `loom update` and any
+/// other reinstall cannot silently restore the shipped `terminals` array.
+pub fn initialize_workspace_with_mode(
+    workspace_path: &str,
+    defaults_path: &str,
+    force: bool,
+    mode: InstallMode,
+) -> Result<InitReport, String> {
+    let workspace = Path::new(workspace_path);
+    let loom_path = workspace.join(".loom");
+    let mut report = InitReport::default();
+
+    // Validate workspace is a git repository
+    validate_git_repository(workspace_path)?;
+
+    // Check for over-broad gitignore patterns that would shadow installed Loom
+    // files (e.g., `.loom/scripts/lib/*.sh`). This catches the regression
+    // reported in issue #3287, where a target repo's `.gitignore` contained
+    // `.loom/` and caused the install worktree's lib files to never be
+    // committed to main. We fail fast here, before any file operations.
+    let bad_patterns = find_overbroad_loom_patterns(workspace);
+    if !bad_patterns.is_empty() {
+        return Err(format!(
+            "Refusing to install: .gitignore contains pattern(s) that would block \
+             installed Loom files from being committed (e.g., .loom/scripts/lib/*.sh). \
+             Remove or scope these patterns to specific runtime files before \
+             reinstalling. Offending patterns: {}",
+            bad_patterns.join(", ")
+        ));
+    }
+
+    // Check for self-installation (Loom source repo)
+    if is_loom_source_repo(workspace) {
+        report.is_self_install = true;
+        // Issue #6440: idempotently create the dogfood symlinks
+        // (`.claude/commands/loom`, `.claude/agents` -> `defaults/...`)
+        // BEFORE validating, so a fresh clone's very first `loom-daemon init`
+        // — the call `fleet add-worker` actually makes when provisioning a
+        // daemon workspace — closes the structural gap itself instead of
+        // merely reporting it missing every time. Strictly scoped to this
+        // `is_loom_source_repo` branch; see `link_dogfood_symlinks`'s own
+        // doc comment for why that scoping must never widen.
+        for line in link_dogfood_symlinks(workspace) {
+            log::info!("loom-daemon init (dogfood, #6440): {line}");
+        }
+        report.validation = Some(validate_loom_source_repo(workspace));
+        update_gitignore(workspace)?;
+        return Ok(report);
+    }
+
+    // Resolve defaults path (development mode or bundled resource)
+    let defaults = resolve_defaults_path(defaults_path)?;
+    let is_reinstall = loom_path.exists();
+    let _ = (is_reinstall, force); // These affect behavior in called functions
+
+    // Create .loom directory if it doesn't exist
+    fs::create_dir_all(&loom_path).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
+
+    // Copy config and README files.
+    //
+    // `config.json` is merge-aware (issue #3598): unlike the README (a
+    // Loom-owned doc that is safe to overwrite), `.loom/config.json` is
+    // committed CONSUMER configuration that may carry local overrides such as
+    // `worktree.root`. A bare `fs::copy` from the template would silently drop
+    // those keys — see `merge_config_file`.
+    merge_config_file(&defaults, &loom_path, mode, &mut report)?;
+    // The Loom payload proper: every file this step writes is a verbatim
+    // function of `defaults/` and the previous install's ownership record.
+    // `payload::materialize_payload` (#10717) runs this same step into a
+    // staging tree, so a resync and an install cannot disagree about it.
+    install_payload_files(workspace, &defaults, &loom_path, is_reinstall, &mut report)?;
+
+    // Update .gitignore and setup scaffolding
+    update_gitignore(workspace)?;
+    setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
+
+    // Post-condition for the `defaults/.loom/` walk above (#9123). Run AFTER
+    // scaffolding, because the two template-substituted members of that tree
+    // (`.loom/CLAUDE.md`, `.loom/AGENTS.md`) are written by
+    // `setup_repository_scaffolding`, not by the verbatim walk. Checking here
+    // covers them too, so `LOOM_TREE_SCAFFOLDED_FILES` cannot silently become
+    // a way to drop a file from the install.
+    assert_loom_payload_tree_complete(&defaults, &loom_path)?;
+
+    // Verify all copied files match their sources
+    verify_all_copied_files(workspace, &defaults, &loom_path, &mut report);
+
+    // Filter out verification failures for files that were intentionally preserved.
+    // Preserved files (existing user customizations) are expected to differ from the
+    // source defaults — flagging them as failures is misleading and the prior
+    // "rerun with --force" remediation would clobber the user's intentional edits.
+    filter_preserved_from_verification_failures(&mut report);
+
+    // Content-gated cleanup of retired Loom strays (issue #3576). The daemon
+    // init sync is source-driven and never removes destination-only files, so a
+    // stray `.claude/commands/loom/release.md` (the `/loom:release` skill
+    // retired by #3563) lingers on disk for Quick-Install consumers. Remove it
+    // iff its sha256 matches a frozen shipped digest (unmodified); preserve a
+    // customized copy; no-op when absent. Mirrors the shell-side
+    // `LOOM_RETIRED_FILES` block in scripts/install-loom.sh (PR #3575).
+    //
+    // Placed after scaffolding (post-sync) and before generate_manifest so the
+    // manifest reflects on-disk state. The self-install short-circuit above
+    // (returns at ~line 147 before scaffolding) means this never runs on the
+    // Loom source repo — it must not mutate the source tree.
+    cleanup_retired_files(workspace, &mut report);
+
+    // Write .loom/install-metadata.json (and the gitignored loom-source-path
+    // sidecar) BEFORE generate_manifest so verify-install.sh reads the fresh
+    // loom_commit when it builds manifest.json (#4050). A direct `loom-daemon
+    // init` sets no LOOM_* env, so from_env() supplies the binary's compiled-in
+    // version/commit rather than the literal "unknown". The shell wrappers run
+    // finalize_quick_install after init and overwrite this with richer data.
+    write_install_metadata(workspace, &templates::LoomMetadata::from_env(), &defaults);
+
+    // Generate installation manifest (.loom/manifest.json)
+    generate_manifest(workspace);
+
+    Ok(report)
+}
+
+/// Install the Loom payload files into `loom_path` (`<workspace>/.loom`): the
+/// README, the rate card, the managed directories and the `defaults/.loom/`
+/// walk, then the executable bits.
+///
+/// Split out of [`initialize_workspace_with_mode`] for #10717: the resync in
+/// [`payload`] runs exactly this step into a staging copy of a workspace to
+/// learn what this binary would install, so the two can never drift apart.
+/// Consumer configuration (`config.json`) and the template-substituted
+/// scaffolding are deliberately not part of it.
+fn install_payload_files(
+    workspace: &Path,
+    defaults: &Path,
+    loom_path: &Path,
+    is_reinstall: bool,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    copy_single_file(defaults, loom_path, ".loom-README.md", ".loom/README.md", report)?;
+
+    // `.loom/pricing.json` (#8177): the model rate card
+    // `activity::pricing_card` loads at runtime, so a vendor price change can
+    // reach the fleet on a resync rather than on a Loom release.
+    //
+    // Loom PAYLOAD, not consumer configuration: overwritten wholesale here and
+    // on every resync (contrast `merge_config_file` above). The manifest
+    // generator (scripts/install/manifest.sh) translates `defaults/pricing.json`
+    // to `.loom/pricing.json` and registers it as Loom-installed, so this copy
+    // must exist or the installer's post-install metadata-vs-disk check fails
+    // with "MISSING: .loom/pricing.json" and rolls the install back.
+    //
+    // A repo that somehow ends up without it is not broken: loom-daemon falls
+    // back to the rate card compiled into the binary and logs the fallback at
+    // warn level.
+    copy_single_file(defaults, loom_path, "pricing.json", ".loom/pricing.json", report)?;
+
+    // Ownership evidence for the reinstall clean sweep (issue #5971). Read
+    // BEFORE any sync, because `write_install_metadata` below overwrites
+    // `.loom/install-metadata.json` with a stub whose `installed_files` is
+    // empty — reading it later would discard the previous install's record.
+    let ownership = OwnershipBoundary::load(workspace);
+
+    // Sync managed directories (clean stale Loom-owned files on reinstall,
+    // then copy fresh; repo-owned content is preserved and reported)
+    sync_managed_dir(defaults, loom_path, "roles", is_reinstall, &ownership, report)?;
+    sync_managed_dir(defaults, loom_path, "scripts", is_reinstall, &ownership, report)?;
+    sync_managed_dir(defaults, loom_path, "hooks", is_reinstall, &ownership, report)?;
+    // `docs` ships static reference documentation (e.g. ci-integration.md
+    // from issue #3333). Sync alongside other managed dirs so installed
+    // repos always carry the latest copy.
+    sync_managed_dir(defaults, loom_path, "docs", is_reinstall, &ownership, report)?;
+    // `runtimes` ships the per-runtime capability manifests consumed by
+    // `runtime_admission::roots()` (#4688). This directory was declared in
+    // the install manifest (scripts/install/manifest.sh) since #4183 but
+    // never actually synced by this Rust-native path — every fresh install
+    // and Rust-native reinstall left `.loom/runtimes/` unpopulated, which
+    // made the admission gate fall through to a nonexistent
+    // `defaults/runtimes/...` on every consumer dispatch.
+    sync_managed_dir(defaults, loom_path, "runtimes", is_reinstall, &ownership, report)?;
+
+    // Materialize `defaults/.loom/` -> `<workspace>/.loom/` by WALKING the
+    // source tree (#9123). Every entry is discovered, none is named here:
+    // this is the copy-side counterpart of the `find defaults/ -type f` walk
+    // in `scripts/install/manifest.sh::_emit_installed_files_manifest`, which
+    // registers everything under `defaults/.loom/` as Loom-installed. The two
+    // enumerations are now the same enumeration, so a file added to
+    // `defaults/.loom/` cannot be recorded in `install-metadata.json` while
+    // never reaching disk.
+    //
+    // Members of that tree and the issues that put them there, for grep value
+    // — none of these names appears in the walk itself: `.loom/bin/loom` (the
+    // CLI wrapper), `.loom/biome.jsonc` (#6031 — the nested Biome config that
+    // takes the whole machine-managed `.loom/` tree out of a consumer's
+    // repo-wide `biome check .`, without which the shipped Workflow-tool
+    // experiment script is a hard PARSE error and every installer-emitted JSON
+    // stamp is a perpetual format diff), `.loom/credentials.md.example`
+    // (#9123 — the file whose absence exposed this divergence), and the
+    // template-substituted `.loom/CLAUDE.md` / `.loom/AGENTS.md` that
+    // `setup_repository_scaffolding` writes instead (see
+    // `LOOM_TREE_SCAFFOLDED_FILES`). All are Loom payload, overwritten
+    // wholesale on reinstall — contrast `merge_config_file` above, which
+    // exists because `.loom/config.json` is consumer configuration.
+    sync_loom_payload_tree(defaults, loom_path, is_reinstall, &ownership, report)?;
+
+    make_shell_scripts_executable(&loom_path.join("hooks"));
+    make_shell_scripts_executable(&loom_path.join("scripts"));
+    make_shell_scripts_executable(&loom_path.join("bin"));
+
+    Ok(())
+}
+
+/// Remove `verification_failures` entries whose path appears in `preserved`.
+///
+/// Verification failure entries are formatted as `"{rel_path} ({reason})"`. We
+/// extract the leading path component and drop the entry if it matches a
+/// preserved path. A preserved file is, by definition, expected to differ from
+/// the source default (the user customized it), so it should not surface as a
+/// "verification failure".
+fn filter_preserved_from_verification_failures(report: &mut InitReport) {
+    if report.preserved.is_empty() || report.verification_failures.is_empty() {
+        return;
+    }
+    let preserved: HashSet<&str> = report.preserved.iter().map(String::as_str).collect();
+    report.verification_failures.retain(|f| {
+        let rel_path = f.split(" (").next().unwrap_or(f.as_str());
+        !preserved.contains(rel_path)
+    });
+}
+
+/// Copy a single file from defaults to the loom directory, tracking in report.
+fn copy_single_file(
+    defaults: &Path,
+    loom_path: &Path,
+    src_name: &str,
+    report_name: &str,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let src = defaults.join(src_name);
+    // The destination may differ from the source name (e.g., ".loom-README.md" → "README.md")
+    let dst_name = report_name.strip_prefix(".loom/").unwrap_or(src_name);
+    let dst = loom_path.join(dst_name);
+    if src.exists() {
+        let existed = dst.exists();
+        fs::copy(&src, &dst).map_err(|e| format!("Failed to copy {src_name}: {e}"))?;
+        if existed {
+            report.updated.push(report_name.to_string());
+        } else {
+            report.added.push(report_name.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Merge-aware copy of `.loom/config.json` from defaults (issue #3598).
+///
+/// `.loom/config.json` is committed consumer configuration, not a runtime
+/// artifact. A bare `fs::copy` (as `copy_single_file` performs) would clobber
+/// consumer keys such as the documented `worktree.root` override every time the
+/// installer reran. This function instead:
+///
+/// - **Destination missing** → the template is parsed and re-emitted through
+///   the same canonical `to_string_pretty` serialize path the merge branch
+///   uses (issue #3619), recorded as `added`. Routing the fresh install through
+///   serialization (rather than a raw `fs::copy` of the hand-formatted
+///   template) makes the on-disk file canonical from the very first install, so
+///   a later reinstall merge re-emits byte-identical output and config.json is
+///   never left dirty. (If the template is not valid JSON, falls back to a raw
+///   copy.)
+/// - **Destination is a valid JSON object** → deep-merge with the shipped
+///   template as the base and the **existing consumer values winning** on
+///   conflict; keys new in the template are added, unknown consumer keys at any
+///   depth are preserved. Written with deterministic pretty serialization so
+///   repeat reinstalls are byte-idempotent. Recorded as `preserved`.
+/// - **Destination exists but is invalid JSON (or not an object)** → the
+///   previous contents are first copied aside to `.loom/config.json.bak`, then
+///   the template replaces the file, with a loud `warn!`; the install does not
+///   abort. Recorded as `updated`.
+///
+/// Byte-exact preservation of consumer formatting/comments is explicitly out of
+/// scope — deterministic re-serialization is acceptable as long as keys/values
+/// survive and repeat runs are stable.
+///
+/// # Observability (issue #4641)
+///
+/// Every call emits exactly one branch line through the `log` facade, tagged
+/// with a greppable branch name — `fresh-write`, `merge-preserved`,
+/// `template-invalid-skip`, or `invalid-JSON-fallback-overwrite` — prefixed
+/// `init: config.json:`. `merge-preserved` additionally carries a leaf-level
+/// diff of every key whose effective value changed, and the fallback branch
+/// logs at `warn!` naming the keys it discarded plus the rescue-copy path.
+///
+/// This exists because `loom-daemon init` is invoked unattended from
+/// provisioning scripts (`fleet::add_worker`, `install.sh` reinstalls), where a
+/// bare `eprintln!` disappears into a log nobody reads: an operator-tuned
+/// `autonomous.workFinder.maxConcurrent` was silently reverted on a fleet
+/// worker with no trace of which process rewrote the file. `warn!`/`info!` land
+/// in `daemon.log` and are greppable after the fact.
+/// # Session mode (issue #8884)
+///
+/// When `mode` is [`InstallMode::Session`] — or the existing consumer file
+/// already carries the persisted `"mode": "session"` marker — the value this
+/// function is about to write is run through
+/// [`session_mode::apply_session_mode`] first, on EVERY branch that writes at
+/// all. That re-assertion is what makes the marker survive `loom update`: the
+/// deep merge below would preserve an existing `terminals: []` on its own, but
+/// re-applying the key set means a future template change cannot hand an
+/// unattended-agent capability back to a session-mode repo either.
+///
+/// The one branch that cannot honour the request is a `defaults/config.json`
+/// that is not parseable JSON. Rather than silently install an
+/// unattended-capable config for an operator who explicitly asked for session
+/// mode, that combination is a hard error.
+fn merge_config_file(
+    defaults: &Path,
+    loom_path: &Path,
+    mode: InstallMode,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let src = defaults.join("config.json");
+    let dst = loom_path.join("config.json");
+    let report_name = ".loom/config.json";
+
+    // No template shipped — nothing to do (mirrors copy_single_file's guard).
+    if !src.exists() {
+        return Ok(());
+    }
+
+    let template_str = fs::read_to_string(&src)
+        .map_err(|e| format!("Failed to read defaults config.json: {e}"))?;
+
+    // Fresh install: no existing consumer file → write the template through the
+    // SAME canonical serialize path the reinstall merge uses (issue #3619). A
+    // bare `fs::copy` of the hand-formatted template produced bytes that a later
+    // merge's `to_string_pretty` output could never match, leaving config.json
+    // permanently dirty after the first reinstall. Serializing here makes the
+    // on-disk file canonical from the very first install, so any later merge
+    // re-emits byte-identical output. With serde_json's `preserve_order`
+    // feature, template key order is retained (keys are not alphabetized).
+    if !dst.exists() {
+        match serde_json::from_str::<Value>(&template_str) {
+            Ok(mut template_val) => {
+                if mode.is_session() && !session_mode::apply_session_mode(&mut template_val) {
+                    return Err("--mode session requires defaults/config.json to be a JSON object"
+                        .to_string());
+                }
+                session_mode::write_pretty_json(&dst, &template_val)?;
+                log::info!(
+                    "init: config.json: fresh-write {} — no existing file; wrote {} key(s) from the shipped template (mode: {mode:?})",
+                    dst.display(),
+                    top_level_key_count(&template_val)
+                );
+            }
+            Err(e) => {
+                // Template is invalid JSON — fall back to a raw copy rather than
+                // dropping the install. (The reinstall branch handles this too.)
+                // EXCEPT under --mode session: a safety flag that silently fails
+                // open is worse than an aborted install (#8884).
+                if mode.is_session() {
+                    return Err(format!(
+                        "--mode session cannot be honoured: defaults/config.json is not valid JSON ({e})"
+                    ));
+                }
+                eprintln!(
+                    "Warning: defaults/config.json is not valid JSON ({e}); \
+                     copying it verbatim to .loom/config.json"
+                );
+                log::warn!(
+                    "init: config.json: fresh-write {} — defaults/config.json is not valid JSON ({e}); copied verbatim",
+                    dst.display()
+                );
+                fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+            }
+        }
+        report.added.push(report_name.to_string());
+        return Ok(());
+    }
+
+    let existing_str = fs::read_to_string(&dst)
+        .map_err(|e| format!("Failed to read existing config.json: {e}"))?;
+
+    // If the shipped template is somehow invalid JSON, do NOT clobber the
+    // consumer's file — leave it exactly as-is and record it as preserved.
+    let template_val: Value = match serde_json::from_str(&template_str) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "Warning: defaults/config.json is not valid JSON ({e}); \
+                 leaving existing .loom/config.json untouched"
+            );
+            log::warn!(
+                "init: config.json: template-invalid-skip {} — defaults/config.json is not valid JSON ({e}); existing file left untouched",
+                dst.display()
+            );
+            report.preserved.push(report_name.to_string());
+            return Ok(());
+        }
+    };
+
+    // If the consumer file is missing/invalid/non-object, fall back to the
+    // template copy with a loud warning. This must not abort the install.
+    //
+    // This is the ONE branch that can silently discard operator-tuned keys
+    // wholesale (#4641), so before overwriting we (a) copy the unparseable
+    // bytes aside to `.loom/config.json.bak` so nothing is truly lost, and (b)
+    // `warn!` with a best-effort list of the key names visible in the discarded
+    // text. A torn read caused by a concurrent writer is exactly the scenario
+    // this needs to leave evidence for.
+    let existing_val: Value = match serde_json::from_str::<Value>(&existing_str) {
+        Ok(v) if v.is_object() => v,
+        parsed => {
+            let reason = match parsed {
+                Ok(_) => "valid JSON but not an object".to_string(),
+                Err(e) => format!("not valid JSON: {e}"),
+            };
+            let discarded = salvage_key_names(&existing_str);
+            let discarded_desc = if discarded.is_empty() {
+                "none recoverable from the unparseable text".to_string()
+            } else {
+                summarize_list(&discarded)
+            };
+            let backup = dst.with_extension("json.bak");
+            let backup_desc = match fs::write(&backup, &existing_str) {
+                Ok(()) => format!("previous contents saved to {}", backup.display()),
+                Err(e) => format!("FAILED to save previous contents to {}: {e}", backup.display()),
+            };
+
+            eprintln!(
+                "Warning: existing .loom/config.json is not valid JSON; overwriting \
+                 with the shipped template (previous contents were not preserved)"
+            );
+            log::warn!(
+                "init: config.json: invalid-JSON-fallback-overwrite {} — existing file is {reason}; \
+                 overwriting with the shipped template. Discarded keys: {discarded_desc}. {backup_desc}",
+                dst.display()
+            );
+
+            // #8884: the marker (if there ever was one) is unreadable along with
+            // the rest of the file, so only an explicit `--mode session` can
+            // re-establish session mode here. When it is set, write the
+            // session-applied template instead of copying the stock one.
+            if mode.is_session() {
+                let mut fallback = template_val.clone();
+                session_mode::apply_session_mode(&mut fallback);
+                session_mode::write_pretty_json(&dst, &fallback)?;
+            } else {
+                fs::copy(&src, &dst).map_err(|e| format!("Failed to copy config.json: {e}"))?;
+            }
+            report.updated.push(report_name.to_string());
+            return Ok(());
+        }
+    };
+
+    // Deep-merge: template is the base, existing consumer values win on conflict.
+    let mut merged = template_val;
+    deep_merge_existing_wins(&mut merged, &existing_val);
+
+    // #8884: re-assert session mode when the operator asked for it OR the file on
+    // disk already carries the marker. This is the branch `loom update` and every
+    // other reinstall takes, so it is the one that has to hold the guarantee.
+    if session_mode::session_mode_applies(mode, Some(&existing_val)) {
+        session_mode::apply_session_mode(&mut merged);
+    }
+
+    // Diff BEFORE writing, so the log describes the effective config change this
+    // call is about to make. With existing-wins semantics the expected shape is
+    // additions only (new template keys); a `~` or `-` entry here means a
+    // consumer value was overwritten or dropped and is worth investigating.
+    let changes = describe_config_changes(&existing_val, &merged);
+
+    let mut serialized = serde_json::to_string_pretty(&merged)
+        .map_err(|e| format!("Failed to serialize merged config.json: {e}"))?;
+    serialized.push('\n');
+    fs::write(&dst, serialized).map_err(|e| format!("Failed to write merged config.json: {e}"))?;
+
+    if changes.is_empty() {
+        log::info!(
+            "init: config.json: merge-preserved {} — no effective config change",
+            dst.display()
+        );
+    } else {
+        log::info!(
+            "init: config.json: merge-preserved {} — {} key(s) changed: {}",
+            dst.display(),
+            changes.len(),
+            summarize_list(&changes)
+        );
+    }
+
+    report.preserved.push(report_name.to_string());
+    Ok(())
+}
+
+/// Maximum number of individual entries spelled out in one log line before the
+/// remainder is elided as `… and N more`. Keeps a pathological config (or a
+/// fresh install merging a large template) from emitting a multi-kilobyte line.
+const MAX_LOGGED_ENTRIES: usize = 20;
+
+/// Number of top-level keys in a JSON value (0 for non-objects).
+fn top_level_key_count(value: &Value) -> usize {
+    value.as_object().map_or(0, |m| m.len())
+}
+
+/// Join `entries` for a log line, eliding past [`MAX_LOGGED_ENTRIES`].
+fn summarize_list(entries: &[String]) -> String {
+    if entries.len() <= MAX_LOGGED_ENTRIES {
+        entries.join("; ")
+    } else {
+        format!(
+            "{}; … and {} more",
+            entries[..MAX_LOGGED_ENTRIES].join("; "),
+            entries.len() - MAX_LOGGED_ENTRIES
+        )
+    }
+}
+
+/// Flatten a JSON value into `(dotted.path, compact-json-value)` leaf pairs.
+///
+/// Arrays are treated as leaves (compared wholesale), matching
+/// [`deep_merge_existing_wins`], which also replaces arrays wholesale rather
+/// than merging element-by-element.
+fn flatten_json_leaves(value: &Value, prefix: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_json_leaves(child, &path, out);
+            }
+        }
+        leaf => out.push((prefix.to_string(), leaf.to_string())),
+    }
+}
+
+/// Describe the leaf-level differences between two configs as log-ready lines.
+///
+/// `+ path = value` (added), `- path (was value)` (dropped), and
+/// `~ path: old -> new` (changed). An empty result means the write is a no-op in
+/// effective-config terms.
+fn describe_config_changes(before: &Value, after: &Value) -> Vec<String> {
+    let mut before_leaves = Vec::new();
+    flatten_json_leaves(before, "", &mut before_leaves);
+    let mut after_leaves = Vec::new();
+    flatten_json_leaves(after, "", &mut after_leaves);
+
+    let before_map: std::collections::BTreeMap<&str, &str> = before_leaves
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let after_map: std::collections::BTreeMap<&str, &str> = after_leaves
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut changes = Vec::new();
+    for (path, new_val) in &after_leaves {
+        match before_map.get(path.as_str()) {
+            Some(old_val) if *old_val == new_val.as_str() => {}
+            Some(old_val) => changes.push(format!("~ {path}: {old_val} -> {new_val}")),
+            None => changes.push(format!("+ {path} = {new_val}")),
+        }
+    }
+    for (path, old_val) in &before_leaves {
+        if !after_map.contains_key(path.as_str()) {
+            changes.push(format!("- {path} (was {old_val})"));
+        }
+    }
+    changes
+}
+
+/// Best-effort recovery of key names from text that failed to parse as JSON.
+///
+/// Used only on the invalid-JSON fallback path, where `serde_json` gives us
+/// nothing to enumerate but the operator still needs to know *what* was
+/// discarded. Scans for `"…"` immediately followed (modulo whitespace) by `:`,
+/// deduplicating while preserving first-seen order. Deliberately naive: a key
+/// name appearing inside a string *value* may be reported too. Over-reporting a
+/// name in a warning is far cheaper than reporting nothing.
+fn salvage_key_names(raw: &str) -> Vec<String> {
+    let bytes = raw.as_bytes();
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        // Walk to the closing quote, honoring backslash escapes. Only ASCII
+        // bytes are inspected, so multi-byte UTF-8 inside the string is safe.
+        let start = i + 1;
+        let mut end = start;
+        let mut escaped = false;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'\\' if !escaped => escaped = true,
+                b'"' if !escaped => break,
+                _ => escaped = false,
+            }
+            end += 1;
+        }
+        if end >= bytes.len() {
+            break; // unterminated string — nothing more to salvage
+        }
+        let mut after = end + 1;
+        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+            after += 1;
+        }
+        if after < bytes.len() && bytes[after] == b':' {
+            if let Ok(name) = std::str::from_utf8(&bytes[start..end]) {
+                if seen.insert(name.to_string()) {
+                    keys.push(name.to_string());
+                }
+            }
+        }
+        i = end + 1;
+    }
+    keys
+}
+
+/// Deep-merge `overlay` into `base` with **overlay values winning** on conflict.
+///
+/// Used by [`merge_config_file`] with `base` = shipped template and `overlay` =
+/// existing consumer config, so consumer edits are never lost while new
+/// template keys are still delivered:
+///
+/// - Two objects are merged key-by-key, recursing into nested objects.
+/// - Any non-object `overlay` value (array, scalar, null) replaces the
+///   corresponding `base` value wholesale.
+/// - Keys present only in `base` (new template keys) are retained.
+/// - Keys present only in `overlay` (unknown consumer keys) are preserved.
+///
+/// `pub(crate)` (not just `fn`, issue #4390): [`crate::calibrate`] reuses this
+/// same generic "overlay wins, base's untouched keys survive, recurse into
+/// objects" merge for its `--write` path, with the roles inverted from this
+/// module's own usage — there `overlay` is the existing consumer config
+/// (wins over the shipped template); in calibrate `overlay` is the new
+/// recommended knob values (wins over whatever `.loom/config.json` already
+/// has at those two leaf paths). See `calibrate::merge_workfinder_values`'s
+/// doc comment for the full rationale.
+pub(crate) fn deep_merge_existing_wins(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, overlay_val) in overlay_map {
+                match base_map.get_mut(key) {
+                    Some(base_val) => deep_merge_existing_wins(base_val, overlay_val),
+                    None => {
+                        base_map.insert(key.clone(), overlay_val.clone());
+                    }
+                }
+            }
+        }
+        (base_slot, overlay_val) => {
+            *base_slot = overlay_val.clone();
+        }
+    }
+}
+
+/// Files under `defaults/.loom/` that `setup_repository_scaffolding` writes
+/// itself, with template substitution, later in the same init run.
+///
+/// The verbatim walk in [`sync_loom_payload_tree`] must not also copy these —
+/// doing so would install the raw `{{LOOM_VERSION}}`-carrying source only for
+/// scaffolding to overwrite it moments later, and would double-report the same
+/// path as both `added` and `updated`.
+///
+/// This is an **alternate-handler** list, never an exclusion list: every name
+/// in it is still required on disk by
+/// [`assert_loom_payload_tree_complete`], which runs after scaffolding. Adding
+/// a name here therefore cannot drop a file from the install — it can only
+/// move responsibility for writing it.
+///
+/// One qualifier on "cannot drop a file": that post-condition is
+/// existence-only ([`collect_missing_files`] tests `dst.exists()`), so it is
+/// exactly true for a FRESH install. On a reinstall over a populated
+/// `.loom/`, a top-level file named here with no handler behind it is
+/// satisfied by the copy the previous install left — `sync_managed_dir`'s
+/// ownership-gated clean covers subdirectories, not top-level `.loom/` files —
+/// so the failure mode there is content frozen at the old version rather than
+/// a missing file. That is deliberate rather than a gap: this assertion
+/// mirrors the installer's own metadata-vs-disk check, which is
+/// existence-only too, and a fresh install still fails loudly.
+const LOOM_TREE_SCAFFOLDED_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
+
+/// Whether a `defaults/` entry is a transient local artifact — an editor or
+/// runtime leftover the install must SKIP — rather than shipped payload.
+///
+/// Named for what it returns `true` for (`.DS_Store`, `*.log`, `*.sock`); the
+/// callers are all `if is_transient_artifact(&name) { continue; }`.
+///
+/// Mirrors the `find -not -name ...` filters in
+/// `scripts/install/manifest.sh::_emit_installed_files_manifest`. Keeping the
+/// two in step is what lets the copy walk and the manifest walk be compared as
+/// sets (issue #9123); a name excluded here must be excluded there.
+fn is_transient_artifact(name: &str) -> bool {
+    name == ".DS_Store" || name.ends_with(".log") || name.ends_with(".sock")
+}
+
+/// Materialize `defaults/.loom/` into `<workspace>/.loom/` by walking the
+/// source tree rather than by naming its members (issue #9123).
+///
+/// Before this existed, the `defaults/.loom/` subtree was materialized by a
+/// hand-written list of call sites — one `copy_single_file` for
+/// `.loom/biome.jsonc`, one `sync_managed_dir` for `.loom/bin/`, and the
+/// template-substituted `CLAUDE.md`/`AGENTS.md` writes inside
+/// `setup_repository_scaffolding`. The manifest generator
+/// (`scripts/install/manifest.sh`) has always *walked* `defaults/.loom/` and
+/// registered every file it finds. A file added to `defaults/.loom/` was
+/// therefore recorded in `install-metadata.json` and never copied:
+/// `defaults/.loom/credentials.md.example` shipped that way, failing
+/// `install.sh --full`'s post-install metadata-vs-disk check and passing
+/// silently under `--quick`, which does not run that check.
+///
+/// Both surfaces are now plain walks of the same directory, so the set they
+/// produce is the same set by construction.
+///
+/// Subdirectories go through [`sync_managed_dir`] (ownership-gated clean on
+/// reinstall, plus its own post-copy completeness assertion); top-level files
+/// are copied verbatim, except the [`LOOM_TREE_SCAFFOLDED_FILES`] handled by
+/// `setup_repository_scaffolding`.
+fn sync_loom_payload_tree(
+    defaults: &Path,
+    loom_path: &Path,
+    is_reinstall: bool,
+    ownership: &OwnershipBoundary,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    sync_loom_payload_tree_with(
+        defaults,
+        loom_path,
+        is_reinstall,
+        ownership,
+        report,
+        LOOM_TREE_SCAFFOLDED_FILES,
+    )
+}
+
+/// [`sync_loom_payload_tree`] with the alternate-handler list injected.
+///
+/// The seam exists for one test: the safety argument for
+/// [`LOOM_TREE_SCAFFOLDED_FILES`] is that a name on it can move responsibility
+/// for writing a file but can never drop one, and demonstrating that needs a
+/// listed name that NO handler writes — a state the shipped list cannot be put
+/// in without editing the const, because both of its current members are
+/// written unconditionally by `setup_repository_scaffolding` whenever their
+/// source exists. Production has exactly one caller, immediately above.
+fn sync_loom_payload_tree_with(
+    defaults: &Path,
+    loom_path: &Path,
+    is_reinstall: bool,
+    ownership: &OwnershipBoundary,
+    report: &mut InitReport,
+    scaffolded: &[&str],
+) -> Result<(), String> {
+    let src_root = defaults.join(".loom");
+    if !src_root.is_dir() {
+        return Ok(());
+    }
+
+    // Two residual differences from the `manifest.sh` walk this one is meant to
+    // match, recorded here so the next reader does not have to re-derive that
+    // they are safe (#9130 review):
+    //
+    // 1. `manifest.sh` also consults `defaults/.loom-internal.list` and skips
+    //    exact matches; this walk does not. That list has no `.loom/*` entry
+    //    today, so the two sets agree. If one were ever added, the divergence
+    //    would be in the BENIGN direction — the copy would ship a file the
+    //    manifest never records, i.e. a leaked file that `uninstall` will not
+    //    remove, rather than a file recorded as installed that never reached
+    //    disk, which is the #9123 failure that rolls an install back. The
+    //    dangerous direction stays impossible as long as the exclusion is
+    //    one-sided like this: the manifest's set remains a subset of this one's.
+    // 2. `find -L` follows symlinks; `fs::read_dir` + `file_type()` does not.
+    //    `defaults/.loom/` contains no symlinks. A symlinked directory added
+    //    there would be descended into by the manifest and would reach
+    //    `copy_single_file` -> `fs::copy` on a directory here — a hard error
+    //    that fails the init, not a silent drop.
+    //
+    // Deterministic order so a report/diff is stable across filesystems.
+    let mut entries: Vec<fs::DirEntry> = fs::read_dir(&src_root)
+        .map_err(|e| format!("Failed to read {}: {e}", src_root.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read {}: {e}", src_root.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    for entry in entries {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().into_owned();
+        if is_transient_artifact(&name) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to stat {}: {e}", entry.path().display()))?;
+
+        if file_type.is_dir() {
+            // `defaults/.loom` is passed as the helper's `defaults` arg so
+            // src=`defaults/.loom/<name>` and dst=`.loom/<name>`.
+            sync_managed_dir(&src_root, loom_path, &name, is_reinstall, ownership, report)?;
+        } else if !scaffolded.contains(&name.as_str()) {
+            let rel = format!(".loom/{name}");
+            copy_single_file(defaults, loom_path, &rel, &rel, report)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Assert every file `defaults/.loom/` ships reached `<workspace>/.loom/`.
+///
+/// The copy-side post-condition for [`sync_loom_payload_tree`], and the reason
+/// [`LOOM_TREE_SCAFFOLDED_FILES`] is safe: a name on that list is skipped by
+/// the verbatim walk but still required here, so the only way to omit a file
+/// from the install is to delete it from `defaults/.loom/` — which also drops
+/// it from `install-metadata.json`, keeping the two enumerations in agreement
+/// (issue #9123).
+///
+/// Fails the init rather than warning: an incomplete `.loom/` is exactly the
+/// state `install.sh --full` rolls back and `--quick` used to ship.
+fn assert_loom_payload_tree_complete(defaults: &Path, loom_path: &Path) -> Result<(), String> {
+    let src_root = defaults.join(".loom");
+    if !src_root.is_dir() {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    collect_missing_files(&src_root, loom_path, "", &mut missing);
+    missing.retain(|rel| !rel.rsplit('/').next().is_some_and(is_transient_artifact));
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    missing.sort();
+    Err(format!(
+        "Install incomplete: {} file(s) shipped in defaults/.loom/ never reached .loom/ \
+         (these ARE recorded in install-metadata.json, so the install would fail its own \
+         completeness check): {}",
+        missing.len(),
+        missing
+            .iter()
+            .map(|rel| format!(".loom/{rel}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// Sync a managed directory: clean stale **Loom-owned** files on reinstall,
+/// then copy fresh from defaults.
+///
+/// The clean step is ownership-gated (issue #5971) — see
+/// [`file_ops::clean_managed_dir`]. Repo-owned content living inside a managed
+/// directory (`.loom/hooks/` above all, which Loom invokes but never claims in
+/// the installed-files manifest) survives the reinstall and is reported.
+///
+/// After copying, this function performs a fail-fast assertion that every file
+/// (including those in subdirectories) present in `defaults/<dir_name>/` exists
+/// in the destination. This guards against silent omissions like the regression
+/// reported in issue #3220, where `scripts/lib/forge-helpers.sh` was missing
+/// from installs even though `lib/loom-tools.sh` was verified by name.
+fn sync_managed_dir(
+    defaults: &Path,
+    loom_path: &Path,
+    dir_name: &str,
+    is_reinstall: bool,
+    ownership: &OwnershipBoundary,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let src = defaults.join(dir_name);
+    let dst = loom_path.join(dir_name);
+    let report_prefix = format!(".loom/{dir_name}");
+    if src.exists() {
+        if is_reinstall {
+            clean_managed_dir(&src, &dst, &report_prefix, ownership, report)
+                .map_err(|e| format!("Failed to clean {dir_name} directory: {e}"))?;
+        }
+        copy_dir_with_report(&src, &dst, &report_prefix, report)
+            .map_err(|e| format!("Failed to copy {dir_name} directory: {e}"))?;
+
+        // Fail-fast: ensure every source file (including subdirectories) reached
+        // the destination. This catches bugs in copy_dir_with_report and
+        // unexpected filesystem failures (permission denied on a subdir, etc.)
+        // before they propagate to a broken install.
+        let missing = find_missing_files(&src, &dst);
+        if !missing.is_empty() {
+            return Err(format!(
+                "Sync of {dir_name} directory completed but {} file(s) are missing from \
+                 destination (likely a copy bug or filesystem error): {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Recursively find files present in `src` but missing from `dst`.
+///
+/// Returns relative paths (from `src`) for each missing file. Used as a
+/// post-copy assertion to detect partial copies. Subdirectories are walked
+/// recursively so that nested files (e.g., `scripts/lib/*.sh`) are checked.
+fn find_missing_files(src: &Path, dst: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    collect_missing_files(src, dst, "", &mut missing);
+    missing
+}
+
+fn collect_missing_files(src: &Path, dst: &Path, prefix: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+        let rel_path = if prefix.is_empty() {
+            file_name_str.to_string()
+        } else {
+            format!("{prefix}/{file_name_str}")
+        };
+        let src_child = entry.path();
+        let dst_child = dst.join(&file_name);
+        if file_type.is_dir() {
+            collect_missing_files(&src_child, &dst_child, &rel_path, out);
+        } else if !dst_child.exists() {
+            out.push(rel_path);
+        }
+    }
+}
+
+/// Ensure all `.sh` files in a directory (and subdirectories) are executable.
+///
+/// This is applied to both hooks/ and scripts/ after copying from defaults.
+/// While `fs::copy` preserves permissions on Unix, some git configurations
+/// or filesystem operations may strip the execute bit. This ensures all
+/// shell scripts remain executable regardless of how they were copied.
+fn make_shell_scripts_executable(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                make_shell_scripts_executable(&path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("sh") {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&path) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(perms.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&path, perms);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Verify all copied files and scaffolding directories match their sources.
+fn verify_all_copied_files(
+    workspace: &Path,
+    defaults: &Path,
+    loom_path: &Path,
+    report: &mut InitReport,
+) {
+    // Verify .loom managed directories (no template substitution needed)
+    for dir_name in &["roles", "scripts", "hooks", "docs", "runtimes"] {
+        let src = defaults.join(dir_name);
+        let dst = loom_path.join(dir_name);
+        let prefix = format!(".loom/{dir_name}");
+        verify_copied_files(&src, &dst, &prefix, report, None);
+    }
+
+    // Verify scaffolding directories with template context for variable substitution
+    let repo_info = git::extract_repo_info(workspace);
+    let template_ctx = TemplateContext {
+        repo_owner: repo_info.as_ref().map(|(o, _)| o.clone()),
+        repo_name: repo_info.map(|(_, n)| n),
+        loom_metadata: templates::LoomMetadata::from_env(),
+    };
+    let ctx = Some(&template_ctx);
+
+    for dir_name in &[".claude", ".codex", ".github"] {
+        let src = defaults.join(dir_name);
+        let dst = workspace.join(dir_name);
+        verify_copied_files(&src, &dst, dir_name, report, ctx);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests;
+
+#[cfg(test)]
+mod credential_class_tests;
+
+// #9345: keeps resync-installed.sh's surface classification and
+// land-resync-commit.sh's allowlist from silently re-diverging. Its own file
+// rather than credential_class_tests.rs: that module's subject is the
+// credential class, not the resync surface set.
+#[cfg(test)]
+mod resync_surface_parity_tests;
+
+// #9123 tests live in their own file rather than in `tests.rs`: that module is
+// over the `scripts/check-file-size-budget.sh` threshold and frozen at its
+// recorded size, so additions go to a sibling module.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod loom_payload_tree_tests;
+// Session-mode init tests live in their own file rather than in `tests.rs`:
+// that file is frozen at its current size by the file-size ratchet
+// (.loom/docs/file-size-policy.md), and a sibling module is the remedy the
+// policy names first.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod session_mode_init_tests;
+// #10717: the resync payload's diff/apply tests.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod payload_tests;

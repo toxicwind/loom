@@ -1,0 +1,1514 @@
+//! Worktree removal safety checks.
+//!
+//! Rust port of `loom_tools.common.worktree_safety` (the process-detection
+//! piece `clean.py` needs — `find_processes_using_directory`) plus the small
+//! git-status helpers `clean.py` inlines (`check_uncommitted_changes`). This
+//! is the load-bearing safety layer the epic body calls out: "same tier as
+//! the `.loom-managed` sentinel" — a worktree with an active process must
+//! never be torn down even when every other gate says "stale".
+//!
+//! `common/worktree_safety.py` + its test file are deleted by this issue
+//! (`clean.py` was its sole importer); this module is the Rust replacement
+//! for the one function `clean.py` actually used.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// A live process whose **executable image** lives inside some directory — the
+/// evidence [`find_processes_executing_within`] returns (issue #6127).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveExecutable {
+    /// The process id.
+    pub pid: u32,
+    /// The executable path exactly as the OS reports it. On Linux a program
+    /// whose backing file has already been unlinked reports with a trailing
+    /// ` (deleted)`; that suffix is kept verbatim, because it is precisely the
+    /// evidence an operator needs to see.
+    pub exe: PathBuf,
+}
+
+impl std::fmt::Display for LiveExecutable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid {} → {}", self.pid, self.exe.display())
+    }
+}
+
+/// Find live processes whose executable lives inside `directory` (at any
+/// depth) — the gate that stops a build-artifact sweep from unlinking the
+/// backing file of a **running** program (issue #6127).
+///
+/// # Why a process-table scan rather than a supervisor query
+///
+/// The alternatives considered were (a) asking the service manager
+/// (`launchctl print` / `systemctl show -p ExecStart`), and (b) an opt-in
+/// exclusion list a repo declares in `.loom/config.json`. This picks the
+/// process table because it is the only option that is *evidence-based*: it
+/// reports what is executing right now, needs no per-repo configuration to be
+/// correct on a host nobody has configured, and covers programs started
+/// outside any supervisor (a `nohup`'d binary, a tmux-hosted daemon) that a
+/// supervisor query would miss entirely. Supervisor enumeration is also
+/// per-platform, per-manager, and answers a subtly different question (what is
+/// *registered*, not what is *running*).
+///
+/// # Its one blind spot, stated plainly
+///
+/// A service that is **stopped** at the moment the sweep runs is not detected —
+/// its `program` path is deleted and the next start fails, which is the same
+/// failure this guard exists to prevent, just reached from a different
+/// direction. Nothing in a process table can see that; only a supervisor query
+/// or a declared exclusion could. The operator-side rule therefore still
+/// stands, and both the CLI help and the docs say so: **do not point a
+/// launchd/systemd unit at a path under a build-output directory.**
+///
+/// # Platform behavior
+///
+/// - **Linux**: reads every `/proc/<pid>/exe` symlink. No subprocess, and the
+///   kernel's answer is authoritative (it is the same link whose `(deleted)`
+///   marker confirmed the incident in #6127).
+/// - **macOS/BSD/other**: shells out to `ps -A -o pid=,comm=`, where `comm` is
+///   the executable path; entries that are not absolute paths (kernel threads,
+///   platforms whose `comm` is a bare name) are ignored.
+///
+/// Detection failures (no `/proc`, missing `ps`, a process owned by another
+/// user whose `exe` link is unreadable) degrade to "not found" rather than an
+/// error — consistent with [`find_processes_using_directory`] above. That is a
+/// fail-*open* direction for a safety check, and deliberately so: this is one
+/// layer of defense, and a probe that cannot run is not evidence of danger. It
+/// does mean detection is effectively scoped to processes the caller can see,
+/// which on a Loom host is the same user that owns the repo.
+#[must_use]
+pub fn find_processes_executing_within(directory: &Path) -> Vec<LiveExecutable> {
+    let mut running = running_executables_proc();
+    if running.is_empty() {
+        running = running_executables_ps();
+    }
+    match_processes_executing_within(directory, running)
+}
+
+/// The matching core of [`find_processes_executing_within`], split out so
+/// tests can inject a deterministic process list instead of depending on the
+/// real process table (which cannot be made to report a literal,
+/// symlink-traversing `exe` path on Linux, where `/proc/<pid>/exe` is always
+/// kernel-resolved — see the `directory_reaching_here_already_canonical_*`
+/// tests below).
+fn match_processes_executing_within(
+    directory: &Path,
+    mut running: Vec<LiveExecutable>,
+) -> Vec<LiveExecutable> {
+    // Match against both the literal and the resolved form of `directory`.
+    // In practice both production callers (`resolve_repo_root` /
+    // `find_repo_root`, see `repo_root.rs`) already canonicalize their input
+    // before it reaches here, so `directory.canonicalize()` below is
+    // typically a no-op and this list is effectively canonical-only — that
+    // is fine as long as the *process* side is also normalized to canonical
+    // before comparing (see below). This literal-form push is kept for any
+    // caller that does still pass a non-canonical `directory`.
+    let mut prefixes = vec![directory.to_path_buf()];
+    if let Ok(canonical) = directory.canonicalize() {
+        if canonical != prefixes[0] {
+            prefixes.push(canonical);
+        }
+    }
+
+    // Match each live executable in both its literal form (as the OS
+    // reported it — `/proc/<pid>/exe` is already fully resolved on Linux,
+    // but a macOS/BSD `ps comm` or a Linux `(deleted)` marker may not be) and
+    // its canonicalized form. Relying on the literal form alone regressed
+    // #6127's fix (#6465): both production callers hand `directory` in
+    // already-canonical form, so a process reporting its *literal*
+    // (symlink-traversing) exe path never matched a `prefixes` list that, in
+    // practice, only ever contained the canonical form.
+    running.retain(|live| {
+        prefixes.iter().any(|prefix| live.exe.starts_with(prefix))
+            || canonicalize_exe(&live.exe).is_some_and(|canonical_exe| {
+                prefixes
+                    .iter()
+                    .any(|prefix| canonical_exe.starts_with(prefix))
+            })
+    });
+    running.sort_by_key(|live| live.pid);
+    running.dedup_by_key(|live| live.pid);
+    running
+}
+
+/// Best-effort canonicalization of a live process's executable path.
+///
+/// A plain [`Path::canonicalize`] fails outright once the backing file is
+/// unlinked (the Linux `(deleted)`-suffixed case #6127 exists to catch), and
+/// dropping such an entry from matching would silently defeat the very
+/// safety check the suffix is evidence for. So: strip the suffix if present,
+/// canonicalize the (still-existing) parent directory, and rejoin the file
+/// name — this resolves any symlinks in the directory portion of the path
+/// without requiring the deleted file itself to still exist.
+fn canonicalize_exe(exe: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = exe.canonicalize() {
+        return Some(canonical);
+    }
+    let raw = exe.to_string_lossy();
+    let literal = raw.strip_suffix(" (deleted)").map(Path::new).unwrap_or(exe);
+    let parent = literal.parent()?;
+    let file_name = literal.file_name()?;
+    Some(parent.canonicalize().ok()?.join(file_name))
+}
+
+/// Every process whose `/proc/<pid>/exe` link is readable. Empty on non-Linux.
+#[cfg(target_os = "linux")]
+fn running_executables_proc() -> Vec<LiveExecutable> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut running = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // Unreadable (another user's process, or one that exited mid-scan) is
+        // skipped, never treated as an error.
+        if let Ok(exe) = std::fs::read_link(entry.path().join("exe")) {
+            running.push(LiveExecutable { pid, exe });
+        }
+    }
+    running
+}
+
+#[cfg(not(target_os = "linux"))]
+fn running_executables_proc() -> Vec<LiveExecutable> {
+    Vec::new()
+}
+
+/// Every process `ps` reports with an absolute executable path — the
+/// macOS/BSD path, where `comm` is the program's full path.
+fn running_executables_ps() -> Vec<LiveExecutable> {
+    // `-w -w` disables column truncation, so a long path is never clipped into
+    // a prefix that silently stops matching.
+    let Ok(output) = Command::new("ps")
+        .args(["-A", "-w", "-w", "-o", "pid=,comm="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_ps_exe_line)
+        .collect()
+}
+
+/// Parse one `ps -o pid=,comm=` line into a [`LiveExecutable`], keeping only
+/// absolute executable paths. Split out from the `ps` call so the parsing is
+/// unit-testable on every platform, including the Linux CI that never takes
+/// the `ps` branch.
+fn parse_ps_exe_line(line: &str) -> Option<LiveExecutable> {
+    let (pid, exe) = line.trim_start().split_once(char::is_whitespace)?;
+    let pid = pid.parse::<u32>().ok()?;
+    let exe = exe.trim();
+    // Linux `comm` is a bare 15-char process name, and macOS reports kernel
+    // threads without a path; neither can be matched against a directory.
+    if !exe.starts_with('/') {
+        return None;
+    }
+    Some(LiveExecutable {
+        pid,
+        exe: PathBuf::from(exe),
+    })
+}
+
+/// Find PIDs with a live claim on `directory` (recursively — the directory
+/// itself or any descendant): either their current working directory is
+/// inside it, **or** they hold any open file descriptor pointing at a path
+/// inside it (issue #7466).
+///
+/// # Detection approach (issue #7466)
+///
+/// The original implementation only matched a process's cwd. That misses two
+/// confirmed evasion shapes: (1) an absolute-path writer whose cwd is
+/// elsewhere but which opens/writes a file via an absolute path inside the
+/// directory, never `chdir()`ing into it; and (2) a subprocess launched with
+/// its own, different cwd than its parent, which keeps writing into the
+/// directory even after the parent (whose cwd *was* inside it) exits.
+///
+/// Both are closed the same way, by widening the scan from "cwd only" to
+/// "any open file descriptor under the directory": on Linux that means also
+/// walking `/proc/<pid>/fd/*` (not just `/proc/<pid>/cwd`), and on macOS/BSD
+/// it means keeping every PID `lsof +D <dir>` reports rather than filtering
+/// down to just the FD-field-`cwd` entries. `lsof +D <dir>` already scopes
+/// its own output to processes with *something* open under `<dir>` (cwd,
+/// executable image, memory-mapped file, or a regular fd), so once the
+/// FD-field filter is removed, every PID it reports is exactly the same
+/// "any open FD under here" signal Linux gets from `/proc/<pid>/fd`. This
+/// was chosen over the alternative (walking the process tree from a known
+/// sweep-owned PID) because it needs no prior knowledge of which PID
+/// belongs to the sweep — the whole point is that the writer may be a
+/// detached process the registry never recorded.
+///
+/// This intentionally trades some false-positive risk for eliminating the
+/// missed-detection risk: a process with only a **read-only** file open
+/// under the directory (e.g. a concurrent `git status`'s or `tail -f`'s
+/// short-lived read handle) now also counts as "in use", even though it is
+/// not writing anything. For this safety gate — the one thing standing
+/// between a mid-build-death recovery and an irreversible
+/// `git reset --hard` + `git clean -fd` (#4449) — an occasional deferred
+/// reset (retried on the next tick) is a far cheaper mistake than silently
+/// destroying a live writer's in-progress output, so the trade is taken
+/// deliberately in the fail-safe direction. cwd-only matching (the original,
+/// narrower signal) is retained and still separately tested below — it is
+/// strictly a subset of the widened scan, kept so the pre-#7466 regression
+/// coverage (#7252's FD-field-parsing tests) continues to exercise real
+/// production code, not dead code.
+///
+/// macOS/BSD: shells out to `lsof +D <dir> -F pf` — the **recursive** form
+/// (`+D`, uppercase); the non-recursive `+d` (lowercase) only matches direct
+/// children of `<dir>` and misses a process whose cwd/open-fd path is two or
+/// more levels below it (issue #7468). Linux: scans `/proc/*/cwd` and
+/// `/proc/*/fd/*` symlinks, which are inherently recursive (no directory-depth
+/// flag involved). Any other platform falls back to the `lsof`
+/// path. Detection failures (missing tool, permission errors) degrade to an
+/// empty list rather than propagating an error — the caller treats "unknown"
+/// the same as "no active processes", matching the Python original's
+/// fail-open-to-empty behavior (the marker file + issue state checks are the
+/// primary gates; this is defense in depth).
+#[must_use]
+pub fn find_processes_using_directory(directory: &Path) -> Vec<u32> {
+    let directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| directory.to_path_buf());
+    let mut pids = if cfg!(target_os = "linux") {
+        find_processes_proc(&directory, false)
+    } else {
+        find_processes_lsof(&directory, false)
+    };
+    let current_pid = std::process::id();
+    pids.retain(|p| *p != current_pid);
+    pids
+}
+
+/// The answer [`find_processes_with_cwd_in_directory`] gives, which has three
+/// states rather than two: a host with neither probe available cannot say
+/// "nobody is in there", only "I could not look".
+///
+/// The shell twin this exists for — `lib/worktree-race-rescue.sh`'s
+/// `loom_worktree_has_live_process` — collapsed the third state into "no
+/// holder found" at its single call site but printed a stderr line first, so
+/// the distinction was observable and has to survive the port (#8195 slice 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CwdProbe {
+    /// The probe ran. Every PID whose cwd is `directory` or a descendant of it,
+    /// excluding this process.
+    Pids(Vec<u32>),
+    /// Neither `/proc` nor `lsof` is available, so nothing was examined. NOT
+    /// the same as `Pids(vec![])` — see the enum docs.
+    Unprobable,
+}
+
+/// Find PIDs whose **current working directory** is `directory` or a
+/// descendant of it — the narrower, pre-#7466 signal, deliberately kept
+/// distinct from [`find_processes_using_directory`]'s widened
+/// "any open file descriptor under here" scan.
+///
+/// # Why both exist, and why this one is not the wider one
+///
+/// [`find_processes_using_directory`] gates the watchdog's
+/// `git reset --hard` + `git clean -fd` mid-build recovery, where a
+/// false negative destroys a live writer's untracked build output; it takes
+/// false positives deliberately to eliminate missed detection (#7466).
+///
+/// This one is the veto in front of `worktree.sh`'s stale-worktree
+/// `git reset --hard` (#7463), which never runs `git clean`, and whose
+/// refusal costs something real: a worktree that cannot be reset is handed to
+/// the next Builder still carrying drift (the #6291 class). The shell it
+/// replaces matched cwd only, and a port is not the place to widen a guard's
+/// trigger — that is a behaviour change with its own evidence to gather.
+///
+/// **Decided in #9043: stays cwd-only, not widened.** The #7466 widening's
+/// entire justification is protecting a live writer's *untracked* output from
+/// `git clean -fd` — a false negative there is unrecoverable, because nothing
+/// short of the process itself ever wrote those bytes to git. This call site
+/// never runs `git clean`, so that specific justification does not transfer:
+/// any *tracked* content a concurrent writer is holding open is already
+/// captured by the reset path's own rung 3 (`reset.rs`'s foreign-uncommitted-
+/// changes snapshot), taken before the reset runs, regardless of which of
+/// these two probes gated rung 1. Widening would therefore trade a real,
+/// recorded cost (the #6291-class refusal, denying the next Builder a clean
+/// worktree over e.g. a concurrent `git status`'s or `tail -f`'s read-only
+/// handle) for a protection this path's own rescue mechanism already provides
+/// by a different route. No incident record was found of the narrower,
+/// cwd-only signal here missing a genuine foreign writer since #7463 shipped.
+/// If that changes — a real miss is observed — reopen the question with that
+/// evidence; until then this stays the narrower signal. Both probes share
+/// this module's one `/proc` walk and one `lsof` parse; the difference is a
+/// single flag, so there is no second implementation to drift.
+#[must_use]
+pub fn find_processes_with_cwd_in_directory(directory: &Path) -> CwdProbe {
+    // `worktree_real="$(cd "$worktree_path" && pwd -P)" || return 1` — an
+    // unenterable directory has nothing to protect, and the caller's own
+    // `git -C` reports the real problem.
+    let Ok(directory) = directory.canonicalize() else {
+        return CwdProbe::Pids(Vec::new());
+    };
+    // The shell's probe order, verbatim: Linux `/proc` first (so a hermetic CI
+    // runner with no `lsof` still gets a real answer), then `lsof`, then
+    // neither.
+    let mut pids = if cfg!(target_os = "linux") && Path::new("/proc/self").is_dir() {
+        find_processes_proc(&directory, true)
+    } else if lsof_is_available() {
+        find_processes_lsof(&directory, true)
+    } else {
+        return CwdProbe::Unprobable;
+    };
+    let current_pid = std::process::id();
+    pids.retain(|p| *p != current_pid);
+    CwdProbe::Pids(pids)
+}
+
+/// `command -v lsof >/dev/null 2>&1`, as the shell asked it.
+fn lsof_is_available() -> bool {
+    Command::new("lsof")
+        .arg("-v")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// `cwd_only` restricts the scan to the FD-field-`cwd` entries — the
+/// pre-#7466 signal [`find_processes_with_cwd_in_directory`] needs. The
+/// widened caller passes `false` and keeps every PID `lsof +D` reports.
+fn find_processes_lsof(directory: &Path, cwd_only: bool) -> Vec<u32> {
+    let output = match Command::new("lsof")
+        // `+D` (uppercase) is lsof's *recursive* directory scan — it matches
+        // `<dir>` itself and any descendant at any depth. The lowercase `+d`
+        // only matches direct children of `<dir>`, silently missing a
+        // process whose cwd/open-fd path is nested two or more levels below
+        // it (issue #7468) — an entirely ordinary depth for a worktree.
+        .arg("+D")
+        .arg(directory)
+        .arg("-F")
+        .arg("pf")
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    // Deliberately NOT gated on `output.status.success()` (issue #7488): on
+    // macOS, `lsof +D <dir> -F pf` exits 1 — not 0 — whenever its only match
+    // is a plain open file descriptor rather than a `cwd` hit, even though
+    // stdout correctly reports the matching pid. Discarding stdout on any
+    // nonzero exit silently dropped exactly the FD-only evasion case #7466
+    // widened this scan to catch. The parsers below already treat missing or
+    // garbled stdout as "no matches" (an empty `Vec`), so trusting stdout
+    // unconditionally here is safe and matches the fail-open-to-empty
+    // contract for a genuine `lsof` failure (no output to parse either way).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if cwd_only {
+        return parse_lsof_cwd_pids(&stdout);
+    }
+    // The widened, issue #7466 scan: every PID `lsof +D <dir>` reports at
+    // all, not just the ones whose FD field is `cwd`.
+    let mut pids = parse_lsof_open_fd_pids(&stdout);
+    // Belt-and-suspenders union with the narrower, pre-#7466 cwd-only parser
+    // (strictly a subset of the above already, since a `cwd`-field line is
+    // itself a `p<pid>` line the widened parser already counted) — kept so
+    // the #7252 regression parser stays exercised by production code, not
+    // just by its own unit tests.
+    for pid in parse_lsof_cwd_pids(&stdout) {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Parse `lsof -F pf` output into every PID reported at all — i.e. any
+/// process with **any** open file descriptor under the scanned directory
+/// (issue #7466), not just the ones whose FD field is `cwd`.
+///
+/// `lsof +D <dir>` already restricts its output to files opened under
+/// `<dir>` (of any FD type — `cwd`, `txt`, `mem`, `rtd`, or a regular
+/// numeric descriptor), so every `p<pid>` header line here is already
+/// evidence that pid holds *something* open there.
+fn parse_lsof_open_fd_pids(stdout: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            if let Ok(pid) = rest.parse::<u32>() {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    pids
+}
+
+/// Parse `lsof -F pf` output into the PIDs whose FD (file descriptor) field is
+/// `cwd` — the pure core of the pre-#7466, cwd-only signal, split out so it is
+/// unit-testable on Linux CI even though the production code path only runs
+/// on non-Linux hosts (Linux uses [`find_processes_proc`] instead, via the
+/// `cfg!(target_os = "linux")` dispatch in [`find_processes_using_directory`]).
+///
+/// lsof's `-F` field-identifier vocabulary reserves `p` for the PID and `f`
+/// for the FD field, whose values include `cwd`, `txt`, `mem`, `rtd`, and
+/// numeric descriptors (`0`, `1`, `2`, …). `cwd` never appears in the `t`
+/// (file TYPE) field — that field carries values like `REG`, `DIR`, `VREG`,
+/// `CHR` — which is the bug this function's introduction fixes (issue #7252).
+fn parse_lsof_cwd_pids(stdout: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+    let mut current_pid: Option<u32> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            current_pid = rest.parse().ok();
+        } else if let Some(rest) = line.strip_prefix('f') {
+            if rest == "cwd" {
+                if let Some(pid) = current_pid {
+                    if !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids
+}
+
+/// True if `path` is `directory` itself or a descendant of it (component-wise
+/// prefix match on the string form both already share, both being resolved
+/// against the same `/proc`-reported representation).
+#[cfg(target_os = "linux")]
+fn is_directory_or_descendant(path: &str, directory: &str) -> bool {
+    path == directory || path.starts_with(&format!("{directory}/"))
+}
+
+/// `cwd_only` skips signal 2 below, restricting the walk to
+/// `/proc/<pid>/cwd` — see [`find_processes_with_cwd_in_directory`] for which
+/// caller wants which, and why the narrower one was not widened.
+#[cfg(target_os = "linux")]
+fn find_processes_proc(directory: &Path, cwd_only: bool) -> Vec<u32> {
+    let proc = Path::new("/proc");
+    if !proc.is_dir() {
+        return Vec::new();
+    }
+    let dir_str = directory.to_string_lossy().to_string();
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        let pid_path = entry.path();
+
+        // Signal 1 (original): cwd inside `directory`.
+        let cwd_hit = std::fs::read_link(pid_path.join("cwd"))
+            .ok()
+            .is_some_and(|cwd| is_directory_or_descendant(&cwd.to_string_lossy(), &dir_str));
+
+        // Signal 2 (issue #7466): ANY open file descriptor pointing at a path
+        // inside `directory`, regardless of the process's own cwd. This is
+        // what catches an absolute-path writer that never `chdir()`s into
+        // the worktree, and a subprocess whose cwd differs from its
+        // (possibly already-exited) parent's. A process whose `/proc/<pid>/fd`
+        // is unreadable (another user's process, or one that exited mid-scan)
+        // simply contributes no fd-based hits — consistent with this
+        // function's overall fail-open-to-"not found" behavior.
+        let fd_hit = !cwd_only
+            && std::fs::read_dir(pid_path.join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd_entry| {
+                    std::fs::read_link(fd_entry.path())
+                        .ok()
+                        .is_some_and(|target| {
+                            is_directory_or_descendant(&target.to_string_lossy(), &dir_str)
+                        })
+                });
+
+        if cwd_hit || fd_hit {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+fn find_processes_proc(_directory: &Path, _cwd_only: bool) -> Vec<u32> {
+    Vec::new()
+}
+
+/// True if `worktree_path` has any uncommitted changes (staged or unstaged).
+/// Mirrors `clean.py::check_uncommitted_changes`: a non-directory path is
+/// treated as "no changes" (nothing to lose), and any git invocation failure
+/// is treated the same way (fail toward "safe to proceed", matching the
+/// Python original — the caller layers other gates on top of this one).
+#[must_use]
+pub fn check_uncommitted_changes(worktree_path: &Path) -> bool {
+    if !worktree_path.is_dir() {
+        return false;
+    }
+    let unstaged = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", "--quiet"])
+        .status();
+    let staged = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", "--cached", "--quiet"])
+        .status();
+    let unstaged_dirty = unstaged.map(|s| !s.success()).unwrap_or(false);
+    let staged_dirty = staged.map(|s| !s.success()).unwrap_or(false);
+    unstaged_dirty || staged_dirty
+}
+
+/// Untracked files Loom writes into a managed worktree itself. These are
+/// bookkeeping, not user work, so they must never make a worktree look dirty
+/// to [`has_untracked_files`] — most repos gitignore them (the `loom-managed`
+/// block in `.gitignore`), but a repo that predates or has edited that block
+/// would otherwise see every managed worktree as permanently unreclaimable.
+///
+/// This list used to have a TWIN in shell: `_worktree_dirty_lines` in
+/// `defaults/scripts/worktree.sh`, the same guard for the same reason on the
+/// `worktree.sh remove` path. The two disagreed (#8195): this side listed two
+/// markers and the shell listed four, so in a repo with a stale `.gitignore`
+/// the daemon saw `.loom-checkpoint` and `.no-changes-needed` as user work
+/// and declined to reclaim a worktree the shell would have removed. #8195
+/// slice 3 ported `worktree.sh remove` onto this predicate directly and
+/// deleted the shell twin, so `all_loom_own_markers_are_recognised_as_bookkeeping`
+/// now pins this constant on its own rather than comparing two implementations.
+///
+/// `.loom-cargo-target-dir` joined the list with #8458: `worktree.sh`'s create
+/// path writes it into every worktree that gets its own Cargo target dir, so it
+/// is Loom's own bookkeeping in exactly the sense the other four are. It is
+/// gitignored by the same `loom-managed` block (see
+/// `init::post_init::EPHEMERAL_PATTERNS`), and this predicate is what keeps a
+/// stale `.gitignore` from turning it into "user work" that pins every
+/// provisioned worktree dirty — the guard the now-deleted shell twin held for
+/// the other four.
+pub const LOOM_OWN_UNTRACKED_FILES: [&str; 5] = [
+    ".loom-managed",
+    ".loom-in-use",
+    ".loom-checkpoint",
+    ".no-changes-needed",
+    ".loom-cargo-target-dir",
+];
+
+/// Is this `git ls-files --others` path one of Loom's own runtime markers?
+///
+/// The predicate, rather than the constant, is what callers should ask — the
+/// #8279 drift happened because two places re-encoded the *list* instead of
+/// sharing the *test*, and the WIP-shelving verbs ported in #8195 need the
+/// same answer for a stronger reason than this module's original caller does:
+/// `stash-push --include-untracked` MOVES every unfiltered file out of the
+/// worktree, so a marker this predicate fails to recognise is a marker that
+/// gets carried away. Losing `.loom-managed` that way makes every cleanup path
+/// refuse the worktree afterwards (#3548).
+///
+/// Anchoring matches the now-removed shell twin's `(^|/)\.loom-managed$|…`
+/// regex that used to live in `worktree.sh`'s `_worktree_dirty_lines`: the
+/// final path component decides, so a marker in a subdirectory is recognised
+/// too. That is a superset of the whole-path equality this module used
+/// before, and it can only ever filter MORE of Loom's own bookkeeping — never
+/// a user's file, since the four names are Loom's alone.
+#[must_use]
+pub fn is_loom_own_untracked_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    LOOM_OWN_UNTRACKED_FILES.contains(&name)
+}
+
+/// True if `worktree_path` contains untracked, non-gitignored files that are
+/// not Loom's own sentinels (issue #5939).
+///
+/// [`check_uncommitted_changes`] deliberately only asks `git diff` /
+/// `git diff --cached`, which are both blind to untracked files — and
+/// `git worktree remove --force` deletes those. For an `issue-<N>` worktree
+/// that gap is bounded by the closed-issue gate; for a `pr-<N>` worktree,
+/// whose branch and contents come from outside Loom, it is not, so the PR path
+/// layers this on top (see [`super::clean::classify_pr_worktree`]).
+///
+/// A `git` failure (including "not a git worktree at all", the #5177 orphaned
+/// directory case the removal path exists to clean up) reports `false` — the
+/// same fail-toward-proceed convention as [`check_uncommitted_changes`], and
+/// the reason the sentinel/containment gates still bound that path.
+#[must_use]
+pub fn has_untracked_files(worktree_path: &Path) -> bool {
+    if !worktree_path.is_dir() {
+        return false;
+    }
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .any(|l| !is_loom_own_untracked_path(l))
+}
+
+/// [`check_uncommitted_changes`] widened to also catch untracked files
+/// ([`has_untracked_files`]) — the `uncommitted` probe the `pr-<N>` path wires
+/// in (issue #5939).
+///
+/// Kept as a separate function rather than folded into
+/// [`check_uncommitted_changes`] on purpose: the `issue-<N>` gate chain was
+/// reviewed and shipped with the narrower definition, and widening it there is
+/// a behavior change to a path this work does not touch.
+#[must_use]
+pub fn check_uncommitted_or_untracked_changes(worktree_path: &Path) -> bool {
+    check_uncommitted_changes(worktree_path) || has_untracked_files(worktree_path)
+}
+
+/// Parsed `.loom-in-use` marker contents (best-effort; unknown/missing
+/// fields render as `"unknown"`, matching `clean.py::clean_worktrees`'s
+/// `marker_data.get(..., "unknown")` reads).
+#[derive(Debug, Default, Clone)]
+pub struct InUseMarker {
+    pub task_id: String,
+    pub pid: String,
+}
+
+/// Read a worktree's `.loom-in-use` marker file, if present.
+#[must_use]
+pub fn read_in_use_marker(worktree_path: &Path) -> Option<InUseMarker> {
+    let marker_path = worktree_path.join(".loom-in-use");
+    if !marker_path.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&marker_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let obj = value.as_object();
+    Some(InUseMarker {
+        task_id: obj
+            .and_then(|o| o.get("shepherd_task_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        pid: obj
+            .and_then(|o| o.get("pid"))
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    /// Every entry in [`LOOM_OWN_UNTRACKED_FILES`] must be recognised as
+    /// bookkeeping, not user work — and a real file must still count as dirt.
+    ///
+    /// This used to drive the real `worktree.sh`'s `_worktree_dirty_lines`
+    /// shell helper to keep this Rust filter from drifting apart from its
+    /// shell twin (#8195: this side filtered two markers, the shell filtered
+    /// four). `#8195` slice 3 removed that shell helper entirely —
+    /// `worktree.sh remove` is now a thin stub over `loom-daemon
+    /// worktree-remove`, which drives this same predicate
+    /// ([`is_loom_own_untracked_path`]) directly rather than through a
+    /// separate shell-side filter — so there is no second implementation
+    /// left to compare against. Pin the full constant list directly instead.
+    #[test]
+    fn all_loom_own_markers_are_recognised_as_bookkeeping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git runs");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("real.txt"), "x\n").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        // Deliberately NO .gitignore: the guard only matters in a repo whose
+        // .gitignore predates (or has edited away) the loom-managed block.
+        for m in LOOM_OWN_UNTRACKED_FILES {
+            std::fs::write(dir.path().join(m), "").expect("write marker");
+        }
+        assert!(
+            !has_untracked_files(dir.path()),
+            "every LOOM_OWN_UNTRACKED_FILES entry must be treated as bookkeeping"
+        );
+
+        // And real user work is still caught.
+        std::fs::write(dir.path().join("work.txt"), "mine\n").expect("write");
+        assert!(has_untracked_files(dir.path()), "a real untracked file is dirt");
+    }
+
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn missing_directory_has_no_uncommitted_changes() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(!check_uncommitted_changes(&missing));
+    }
+
+    // ------------------------------------------------------------------
+    // parse_lsof_cwd_pids (#7252) — `find_processes_lsof`'s non-Linux
+    // `lsof -F pf` parser, tested here with synthetic input since the
+    // production code path is `cfg!(target_os = "linux")`-gated and never
+    // runs on Linux CI.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn matches_only_the_pid_holding_the_directory_as_cwd() {
+        // Two processes: 1234 has the directory open as `txt` (its own
+        // executable image, not its cwd) and as fd 3; 5678 has it as `cwd`.
+        // Only 5678 must be reported.
+        let stdout = "p1234\nftxt\np5678\nfcwd\np1234\nf3\n";
+        assert_eq!(parse_lsof_cwd_pids(stdout), vec![5678]);
+    }
+
+    #[test]
+    fn a_type_field_value_of_cwd_would_never_occur_but_is_not_relied_upon() {
+        // Regression guard for the original bug: a line whose field
+        // identifier is `t` (TYPE), even if its value happened to be the
+        // literal string "cwd", must not be treated as a match — only `f`
+        // (FD) lines count.
+        let stdout = "p999\ntcwd\n";
+        assert!(parse_lsof_cwd_pids(stdout).is_empty());
+    }
+
+    #[test]
+    fn no_processes_holding_the_directory_returns_empty() {
+        assert!(parse_lsof_cwd_pids("").is_empty());
+        assert!(parse_lsof_cwd_pids("p111\nftxt\np222\nf0\n").is_empty());
+    }
+
+    #[test]
+    fn a_pid_reported_multiple_times_as_cwd_is_deduplicated() {
+        // e.g. multiple threads under the same pid, or lsof re-listing.
+        let stdout = "p42\nfcwd\np42\nfcwd\n";
+        assert_eq!(parse_lsof_cwd_pids(stdout), vec![42]);
+    }
+
+    #[test]
+    fn a_cwd_line_before_any_pid_line_is_ignored() {
+        let stdout = "fcwd\np42\nf0\n";
+        assert!(parse_lsof_cwd_pids(stdout).is_empty());
+    }
+
+    #[test]
+    fn find_processes_excludes_current_pid() {
+        // Whatever `find_processes_using_directory` reports for a scratch
+        // dir, it must never include our own pid (we're "using" our own
+        // cwd trivially, and the Python original explicitly filters it).
+        let dir = tempdir().unwrap();
+        let pids = find_processes_using_directory(dir.path());
+        assert!(!pids.contains(&std::process::id()));
+    }
+
+    // ------------------------------------------------------------------
+    // parse_lsof_open_fd_pids (#7466) — the widened, any-open-FD lsof
+    // parser. Unlike `parse_lsof_cwd_pids` above (kept unmodified, still
+    // cwd-only), this counts every PID `lsof +D <dir>` reports at all.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_lsof_open_fd_pids_matches_any_fd_type_not_just_cwd() {
+        // pid 1234 has the directory open as `txt` (its own executable
+        // image) and as numeric fd 3 — NEITHER is `cwd` — while pid 5678
+        // has it as `cwd`. The widened (#7466) parser must report BOTH: an
+        // absolute-path writer never has its cwd there, so a `cwd`-only
+        // filter is exactly the gap this issue closes.
+        let stdout = "p1234\nftxt\np5678\nfcwd\np1234\nf3\n";
+        let mut pids = parse_lsof_open_fd_pids(stdout);
+        pids.sort_unstable();
+        assert_eq!(pids, vec![1234, 5678]);
+    }
+
+    #[test]
+    fn parse_lsof_open_fd_pids_dedups_repeated_pid_lines() {
+        let stdout = "p42\nf3\np42\nf4\np42\nfcwd\n";
+        assert_eq!(parse_lsof_open_fd_pids(stdout), vec![42]);
+    }
+
+    #[test]
+    fn parse_lsof_open_fd_pids_empty_for_no_output() {
+        assert!(parse_lsof_open_fd_pids("").is_empty());
+    }
+
+    #[test]
+    fn find_processes_lsof_result_is_a_superset_of_the_cwd_only_parser() {
+        // Direct pin of the "extend, don't replace" contract this issue
+        // requires: every pid the old, narrower parser reports must still be
+        // reported by the new one, for the same input.
+        let stdout = "p1234\nftxt\np5678\nfcwd\np1234\nf3\np9999\nfmem\n";
+        let widened = parse_lsof_open_fd_pids(stdout);
+        for pid in parse_lsof_cwd_pids(stdout) {
+            assert!(
+                widened.contains(&pid),
+                "widened scan must be a superset of the cwd-only one; missing {pid}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Real-process evasion-case coverage (#7466): an absolute-path writer
+    // whose cwd is outside the worktree, and a subprocess whose cwd differs
+    // from its (already-exited) parent's.
+    // ------------------------------------------------------------------
+
+    /// A `sh` one-liner is used (rather than a compiled helper binary) so the
+    /// scenario is expressed exactly as the issue describes it: a process
+    /// that opens a file via an absolute path and holds it open, without
+    /// ever `chdir()`ing there.
+    #[test]
+    fn detects_an_absolute_path_writer_whose_cwd_is_outside_the_worktree() {
+        let worktree = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let target_file = worktree.path().join("output.txt");
+
+        // cwd is `elsewhere` — never inside the worktree at all — but an
+        // absolute path into the worktree is opened and held open.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3>'{}' && sleep 300", target_file.display()))
+            .current_dir(elsewhere.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn an absolute-path writer");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_using_directory(worktree.path());
+            if found.contains(&child.id()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if found.is_empty() && !cfg!(target_os = "linux") && which_missing("lsof") {
+            // Probe unavailable on this host (no lsof) — nothing to assert.
+            return;
+        }
+        assert!(
+            found.contains(&child.id()),
+            "an absolute-path writer with cwd outside the worktree must be \
+             detected (issue #7466 evasion case 1): {found:?}"
+        );
+    }
+
+    /// Evasion case 2: a subprocess whose cwd differs from its parent's,
+    /// still writing into the worktree after the parent has already exited
+    /// (the parent's cwd — the thing signal 1 alone would have relied on —
+    /// is gone by the time the probe runs).
+    #[test]
+    fn detects_a_detached_subprocess_with_a_different_cwd_than_its_exited_parent() {
+        let worktree = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let target_file = worktree.path().join("output.txt");
+
+        // The parent's own cwd IS inside the worktree (the signal-1 case),
+        // but it backgrounds a child with a DIFFERENT cwd (`elsewhere`) that
+        // holds the actual write handle, then the parent exits immediately —
+        // simulating the detach the issue describes. `echo $!` reports the
+        // detached child's pid before the parent exits.
+        let script = format!(
+            "( cd '{elsewhere}' && exec 3>'{target}' && sleep 300 ) >/dev/null 2>&1 & echo $!",
+            elsewhere = elsewhere.path().display(),
+            target = target_file.display(),
+        );
+        let parent = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(worktree.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the detaching parent");
+        let output = parent
+            .wait_with_output()
+            .expect("the parent shell exits immediately after backgrounding");
+        let grandchild_pid: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("the backgrounded pid is printed before the parent exits");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_using_directory(worktree.path());
+            if found.contains(&grandchild_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(grandchild_pid.to_string())
+            .status();
+
+        if found.is_empty() && !cfg!(target_os = "linux") && which_missing("lsof") {
+            return;
+        }
+        assert!(
+            found.contains(&grandchild_pid),
+            "a detached subprocess with a different cwd than its exited parent \
+             must be detected (issue #7466 evasion case 2): {found:?}"
+        );
+    }
+
+    /// Edge case called out in the issue's own Test Plan: a process with
+    /// only a *read-only* fd open inside the worktree also counts as
+    /// "in use" under the chosen (any-open-FD) approach — the documented
+    /// false-positive trade-off, not an oversight.
+    #[test]
+    fn a_read_only_open_file_inside_the_worktree_still_counts_as_in_use() {
+        let worktree = tempdir().unwrap();
+        let target_file = worktree.path().join("readme.txt");
+        std::fs::write(&target_file, "hello").unwrap();
+        let elsewhere = tempdir().unwrap();
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3<'{}' && sleep 300", target_file.display()))
+            .current_dir(elsewhere.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a read-only holder");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_using_directory(worktree.path());
+            if found.contains(&child.id()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if found.is_empty() && !cfg!(target_os = "linux") && which_missing("lsof") {
+            return;
+        }
+        assert!(
+            found.contains(&child.id()),
+            "a read-only open file under the worktree is a deliberate \
+             false-positive per the chosen (any-open-FD) approach: {found:?}"
+        );
+    }
+
+    /// Issue #7468 regression: `find_processes_lsof` must use the recursive
+    /// `+D` scan, not the non-recursive `+d`. A process whose cwd is nested
+    /// **two or more levels** below the scanned directory is invisible to
+    /// `+d` (it only matches direct children) but must still be detected —
+    /// this is exactly the depth an ordinary worktree subdirectory (e.g.
+    /// `loom-daemon/src/worktree_ops/`) has relative to the worktree root.
+    ///
+    /// Calls `find_processes_lsof` directly (bypassing the
+    /// `find_processes_using_directory` Linux/`+proc` dispatch) so this test
+    /// exercises the real `lsof` invocation on every platform that has
+    /// `lsof` installed, not just macOS/BSD.
+    #[test]
+    fn find_processes_lsof_detects_a_process_nested_two_levels_below_the_scanned_directory() {
+        if which_missing("lsof") || lsof_exit_status_unreliable_on_this_host() {
+            return;
+        }
+        let worktree = tempdir().unwrap();
+        let nested = worktree.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let canonical_worktree = worktree.path().canonicalize().unwrap();
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300")
+            .current_dir(&nested)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a process with cwd two levels below the worktree root");
+
+        let mut found = Vec::new();
+        for _ in 0..40 {
+            found = find_processes_lsof(&canonical_worktree, false);
+            if found.contains(&child.id()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found.contains(&child.id()),
+            "a process whose cwd is nested two levels below the scanned \
+             directory must be detected by the recursive `+D` scan \
+             (issue #7468): {found:?}"
+        );
+    }
+
+    /// Whether `lsof` is absent on this host — used only to skip the lsof-only
+    /// test assertions gracefully rather than fail on a host that cannot
+    /// probe at all (mirrors this module's own fail-open-to-empty contract).
+    fn which_missing(binary: &str) -> bool {
+        !Command::new("which")
+            .arg(binary)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// True if `lsof`'s own exit status is unreliable on this host for even a
+    /// trivial, unrelated query — e.g. a container running Docker-in-Docker
+    /// networking whose overlay/nsfs mounts `lsof` cannot `stat()`, which
+    /// makes it exit non-zero on every invocation regardless of directory.
+    /// `find_processes_lsof` itself no longer cares about exit status at all
+    /// (issue #7488 — it parses stdout unconditionally), but a host this
+    /// broken is also the kind where `lsof`'s output can't be trusted, so a
+    /// direct test of its invocation would spuriously fail for a reason
+    /// unrelated to what it is testing. Used only to skip that one test
+    /// gracefully.
+    fn lsof_exit_status_unreliable_on_this_host() -> bool {
+        // A fresh, empty tempdir (not the whole system temp root) — scoping
+        // the probe this tightly keeps it fast even on a host whose /tmp
+        // itself is slow for `lsof` to walk (e.g. many unrelated Docker
+        // overlay/nsfs mounts elsewhere on the filesystem).
+        let probe_dir = tempdir().unwrap();
+        Command::new("lsof")
+            .arg("+D")
+            .arg(probe_dir.path())
+            .arg("-F")
+            .arg("pf")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+    }
+
+    // ------------------------------------------------------------------
+    // find_processes_executing_within (#6127) — the guard that keeps a
+    // build-artifact sweep from unlinking a running program's binary.
+    // ------------------------------------------------------------------
+
+    /// Copy the host's `sleep` into `dir/<name>` and run it, so a live process
+    /// is executing an image inside `dir`.
+    ///
+    /// The spawn is retried on `ETXTBSY`: a *concurrent* test thread forking
+    /// while our write fd is briefly open leaves the child holding that fd, and
+    /// Linux then refuses to exec the file. Nothing to do with the code under
+    /// test — just the standard fork/exec race in a multi-threaded harness.
+    fn spawn_from(dir: &Path, name: &str) -> std::process::Child {
+        let source = ["/bin/sleep", "/usr/bin/sleep"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+            .expect("a `sleep` binary is needed to stand in for a service");
+        let program = dir.join(name);
+        std::fs::copy(source, &program).unwrap();
+        // Re-sign the relocated copy on macOS: a plain `fs::copy` of a system binary
+        // carries over the original embedded code signature (bound to the source
+        // path's identity), so Gatekeeper SIGKILLs the exec'd copy asynchronously —
+        // `Command::spawn()` still returns `Ok`, so the "live" process can already
+        // be dead by the time this test asserts on it. Same mitigation this repo
+        // already applies to its own compiled test binaries via
+        // `.cargo/macos-test-runner.sh` (#2298). Test-only; not a production fix.
+        // See #6430 / #6343.
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("codesign")
+                .args(["-f", "-s", "-", program.to_str().unwrap()])
+                .status()
+                .expect("failed to ad-hoc codesign test binary");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut last_err = None;
+        for _ in 0..100 {
+            match Command::new(&program)
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    // Let the kernel publish the exec'd image (/proc/<pid>/exe).
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    return child;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("stand-in service must spawn: {e}"),
+            }
+        }
+        panic!("stand-in service never became executable: {last_err:?}");
+    }
+
+    #[test]
+    fn a_binary_running_from_the_directory_is_reported() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("target/release");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let mut child = spawn_from(&artifacts, "loom-unit-service");
+
+        // The whole artifact root must report the holder, not just the exact
+        // directory the binary sits in — that is the granularity the sweep
+        // deletes at.
+        let found = find_processes_executing_within(&dir.path().join("target"));
+        let deeper = find_processes_executing_within(&artifacts);
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found.iter().any(|live| live.pid == child.id()),
+            "the spawned service must be detected under target/: {found:?}"
+        );
+        assert!(
+            deeper.iter().any(|live| live.pid == child.id()),
+            "and under the exact directory holding it: {deeper:?}"
+        );
+        assert!(found
+            .iter()
+            .all(|live| live.exe.to_string_lossy().contains("loom-unit-service")));
+    }
+
+    #[test]
+    fn a_directory_with_nothing_executing_inside_it_is_unprotected() {
+        let dir = tempdir().unwrap();
+        let artifacts = dir.path().join("target");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        // A binary that merely *exists* is not a running process.
+        std::fs::write(artifacts.join("not-running"), "#!/bin/sh\n").unwrap();
+        assert!(
+            find_processes_executing_within(&artifacts).is_empty(),
+            "the normal reclaim path must not be blocked by inert files"
+        );
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_a_name_prefix_is_not_a_match() {
+        // Component-wise matching, not string-prefix: `/x/target-old` must not
+        // count as being inside `/x/target`.
+        let dir = tempdir().unwrap();
+        let decoy = dir.path().join("target-old");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        let mut child = spawn_from(&decoy, "loom-unit-decoy");
+
+        let found = find_processes_executing_within(&dir.path().join("target"));
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found.is_empty(),
+            "a name-prefix sibling must not protect the real artifact dir: {found:?}"
+        );
+    }
+
+    #[test]
+    fn ps_lines_parse_into_absolute_executables_only() {
+        let parsed = parse_ps_exe_line("  1234 /Users/x/repo/target/release/safehoused").unwrap();
+        assert_eq!(parsed.pid, 1234);
+        assert_eq!(parsed.exe, PathBuf::from("/Users/x/repo/target/release/safehoused"));
+        // Linux `comm` (a bare name) and kernel threads carry no path to match.
+        assert!(parse_ps_exe_line("  1234 safehoused").is_none());
+        assert!(parse_ps_exe_line("").is_none());
+        assert!(parse_ps_exe_line("not-a-pid /bin/sh").is_none());
+    }
+
+    #[test]
+    fn a_deleted_backing_file_still_reports_its_directory() {
+        // Linux appends " (deleted)" to /proc/<pid>/exe once the file is
+        // unlinked — exactly the state #6127's repro host was found in. The
+        // suffix must not defeat containment matching.
+        let live = LiveExecutable {
+            pid: 7,
+            exe: PathBuf::from("/home/u/GitHub/safehouse/target/release/safehoused (deleted)"),
+        };
+        assert!(live
+            .exe
+            .starts_with(Path::new("/home/u/GitHub/safehouse/target")));
+        assert!(live.to_string().contains("pid 7"));
+    }
+
+    // ------------------------------------------------------------------
+    // #6465 regression: both production callers of
+    // `find_processes_executing_within` (the CLI `--deep` path and the
+    // scheduled sweep) hand it an *already-canonical* `directory` — the
+    // normal case, not an edge case. A live process reporting its executable
+    // in the corresponding *literal* (symlink-traversing) form must still be
+    // detected. `/proc/<pid>/exe` on Linux is always kernel-resolved, so a
+    // real spawned process cannot be made to reproduce the literal-exe half
+    // of this on Linux CI — these tests go through
+    // `match_processes_executing_within` directly with an injected process
+    // list instead, so the fix is verified on whatever platform CI runs.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_literal_exe_path_is_matched_against_an_already_canonical_directory() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real-repo");
+        std::fs::create_dir_all(real.join("target/release")).unwrap();
+        let symlinked_root = dir.path().join("symlinked-repo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &symlinked_root).unwrap();
+        #[cfg(not(unix))]
+        panic!("this test requires symlink support");
+
+        // The directory argument arrives already canonical (mirrors
+        // `resolve_repo_root` / `find_repo_root`), so it resolves straight
+        // through the symlink to `real-repo/target`.
+        let canonical_directory = symlinked_root.join("target").canonicalize().unwrap();
+        // `real` itself must be canonicalized before comparing: on macOS,
+        // `/var` is itself a symlink to `/private/var`, so a tempdir-derived
+        // path (under `/var/folders/...`) diverges from its own canonical
+        // form even with no repo-specific symlink involved. Canonicalizing
+        // both sides keeps this a check of the `symlinked_root` -> `real`
+        // resolution only, matching the pattern the production callers
+        // (`resolve_repo_root` / `find_repo_root`) already rely on.
+        assert_eq!(canonical_directory, real.canonicalize().unwrap().join("target"));
+
+        // The live process reports its executable via the literal,
+        // symlink-traversing path — e.g. a service unit invoked with
+        // `/tmp/repo/...` when `/tmp` -> `/private/tmp`.
+        let literal_exe = symlinked_root.join("target/release/loom-test-service");
+        let running = vec![LiveExecutable {
+            pid: 4242,
+            exe: literal_exe.clone(),
+        }];
+
+        let found = match_processes_executing_within(&canonical_directory, running);
+
+        assert!(
+            found.iter().any(|live| live.pid == 4242),
+            "a live process reporting a literal (symlinked) exe path must still be \
+             detected when `directory` arrives already canonical — the #6465 regression; \
+             found: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_literal_exe_path_is_still_matched_against_a_canonical_directory() {
+        // Combines both #6127 (deleted-file detection) and #6465 (canonical
+        // `directory` vs. literal `exe`): the parent directory still exists
+        // (only the binary itself was unlinked), so canonicalizing it and
+        // rejoining the file name must still succeed.
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real-repo");
+        std::fs::create_dir_all(real.join("target/release")).unwrap();
+        let symlinked_root = dir.path().join("symlinked-repo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &symlinked_root).unwrap();
+        #[cfg(not(unix))]
+        panic!("this test requires symlink support");
+
+        let canonical_directory = symlinked_root.join("target").canonicalize().unwrap();
+        let literal_exe = symlinked_root.join("target/release/loom-test-service (deleted)");
+        let running = vec![LiveExecutable {
+            pid: 4343,
+            exe: literal_exe,
+        }];
+
+        let found = match_processes_executing_within(&canonical_directory, running);
+
+        assert!(
+            found.iter().any(|live| live.pid == 4343),
+            "a deleted, literal (symlinked) exe path must still be detected against a \
+             canonical directory; found: {found:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_literal_exe_path_is_still_not_matched() {
+        // No-regression half: a literal path that genuinely is not inside the
+        // (canonicalized) directory must not be swept up by the new
+        // canonicalize-and-retry fallback.
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real-repo");
+        std::fs::create_dir_all(real.join("target/release")).unwrap();
+        std::fs::create_dir_all(real.join("elsewhere")).unwrap();
+        let symlinked_root = dir.path().join("symlinked-repo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &symlinked_root).unwrap();
+        #[cfg(not(unix))]
+        panic!("this test requires symlink support");
+
+        let canonical_directory = symlinked_root.join("target").canonicalize().unwrap();
+        let literal_exe = symlinked_root.join("elsewhere/not-a-service");
+        let running = vec![LiveExecutable {
+            pid: 4444,
+            exe: literal_exe,
+        }];
+
+        let found = match_processes_executing_within(&canonical_directory, running);
+
+        assert!(
+            found.is_empty(),
+            "a process outside the artifact directory must not be reported: {found:?}"
+        );
+    }
+
+    #[test]
+    fn reads_in_use_marker_with_defaults() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".loom-in-use"), r#"{"pid": 123}"#).unwrap();
+        let marker = read_in_use_marker(dir.path()).unwrap();
+        assert_eq!(marker.pid, "123");
+        assert_eq!(marker.task_id, "unknown");
+    }
+
+    #[test]
+    fn missing_marker_is_none() {
+        let dir = tempdir().unwrap();
+        assert!(read_in_use_marker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn corrupt_marker_falls_back_to_unknown_defaults() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".loom-in-use"), "not json").unwrap();
+        let marker = read_in_use_marker(dir.path()).unwrap();
+        assert_eq!(marker.pid, "unknown");
+        assert_eq!(marker.task_id, "unknown");
+    }
+
+    // ------------------------------------------------------------------
+    // Untracked-file gate (#5939 review): `git diff` is blind to untracked
+    // files, and `git worktree remove --force` deletes them.
+    // ------------------------------------------------------------------
+
+    fn init_repo_with_commit(dir: &Path) {
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(dir.join("tracked.txt"), "x").unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-q", "-m", "init"])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn a_clean_worktree_has_no_untracked_files() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        assert!(!has_untracked_files(dir.path()));
+        assert!(!check_uncommitted_or_untracked_changes(dir.path()));
+    }
+
+    #[test]
+    fn an_untracked_file_is_work_that_would_be_lost() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        std::fs::write(dir.path().join("scratch-notes.md"), "unsaved").unwrap();
+        assert!(has_untracked_files(dir.path()));
+        // The narrower legacy probe cannot see it — the exact gap this closes.
+        assert!(!check_uncommitted_changes(dir.path()));
+        assert!(check_uncommitted_or_untracked_changes(dir.path()));
+    }
+
+    #[test]
+    fn looms_own_sentinels_are_not_untracked_user_work() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        std::fs::write(dir.path().join(".loom-managed"), "").unwrap();
+        std::fs::write(dir.path().join(".loom-in-use"), "{}").unwrap();
+        assert!(
+            !has_untracked_files(dir.path()),
+            "every managed worktree carries these; counting them would make the pr-<N> \
+             reaper a permanent no-op in a repo without the loom .gitignore block"
+        );
+    }
+
+    #[test]
+    fn gitignored_build_artifacts_are_not_untracked_user_work() {
+        let dir = tempdir().unwrap();
+        init_repo_with_commit(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/big.bin"), "0").unwrap();
+        // `.gitignore` itself is untracked here, so commit it before asserting.
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["add", ".gitignore"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["commit", "-q", "-m", "ignore"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!has_untracked_files(dir.path()));
+    }
+
+    #[test]
+    fn a_non_git_directory_reports_no_untracked_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("loose.txt"), "x").unwrap();
+        assert!(
+            !has_untracked_files(dir.path()),
+            "the #5177 orphaned-directory path must stay reclaimable"
+        );
+    }
+}

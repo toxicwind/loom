@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Start the daemon in the background and store PID
+
+set -e
+
+DAEMON_PID_FILE=".loom/.daemon.pid"
+DAEMON_LOG_FILE=".loom/.daemon.log"
+
+# Check if daemon is already running
+if [ -f "$DAEMON_PID_FILE" ]; then
+  PID=$(cat "$DAEMON_PID_FILE")
+  if kill -0 "$PID" 2>/dev/null; then
+    echo "Daemon already running (PID: $PID)"
+    exit 0
+  else
+    echo "Removing stale PID file"
+    rm -f "$DAEMON_PID_FILE"
+  fi
+fi
+
+# Ensure .loom directory exists
+mkdir -p .loom
+
+# Start daemon in background
+echo "Starting daemon..."
+(RUST_LOG=info cargo run --manifest-path=loom-daemon/Cargo.toml > "$DAEMON_LOG_FILE" 2>&1) &
+CARGO_PID=$!
+
+# Wait for the actual daemon process to spawn (cargo spawns it as a child)
+sleep 2
+
+# Find the actual loom-daemon process (not cargo). The first branch is
+# scoped to CARGO_PID's own children, so it cannot match an unrelated
+# process regardless of matcher. The bare fallback (used if `cargo run`
+# already reparented the daemon away from CARGO_PID by the time we look) used
+# to be `pgrep -f "target/debug/loom-daemon"` -- a full-command-line
+# substring match that any leaked test fixture path containing that string
+# would satisfy forever. `pgrep -x` matches the kernel-reported process
+# *name* (comm) exactly instead: a leaked bash script is invoked as `bash
+# /path/to/loom-daemon` and reports comm "bash", not "loom-daemon", so it can
+# never satisfy this check (#5548). The real compiled binary's comm is
+# "loom-daemon", so this narrowing does not change behavior for the real
+# target.
+DAEMON_PID=$(pgrep -P "$CARGO_PID" -f "target/debug/loom-daemon" || pgrep -x "loom-daemon" | head -1)
+
+if [ -z "$DAEMON_PID" ]; then
+  echo "ERROR: Daemon process not found"
+  kill "$CARGO_PID" 2>/dev/null || true
+  rm -f "$DAEMON_PID_FILE"
+  exit 1
+fi
+
+# Store PID
+echo "$DAEMON_PID" > "$DAEMON_PID_FILE"
+
+# Verify it started
+if kill -0 "$DAEMON_PID" 2>/dev/null; then
+  echo "Daemon started successfully (PID: $DAEMON_PID)"
+  echo "Logs: tail -f $DAEMON_LOG_FILE"
+else
+  echo "ERROR: Daemon failed to start"
+  rm -f "$DAEMON_PID_FILE"
+  exit 1
+fi

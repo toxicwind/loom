@@ -1,0 +1,254 @@
+# Dependencies
+node_modules/
+target/
+
+# Build outputs
+dist/
+dist-ssr/
+
+# Test outputs
+coverage/
+
+# Tool caches (regenerable)
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# aider session artifacts (#7746). Named individually rather than as `.aider*`
+# so `.aider.conf.yml` -- which teams legitimately commit to share aider
+# config -- stays committable. .aider.chat.history.md is a verbatim transcript
+# of the session, and this repo's agents run `git add -A` as a documented
+# Builder step against a public remote.
+
+# Env files
+.env
+.env.local
+
+# MCP configuration (generated locally by setup-mcp.sh)
+.mcp.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# >>> loom-managed (do not edit) >>>
+# Loom runtime state (don't commit these)
+.loom-in-use
+.loom-checkpoint
+.loom-managed
+.loom-cargo-target-dir
+.no-changes-needed
+.snapshots/
+.loom/.daemon.pid
+.loom/.daemon.log
+.loom/daemon.sock
+.loom/daemon-loop.pid
+.loom/daemon-metrics.json
+.loom/loom-source-path
+.loom/spawn-loop-state.json
+.loom/spawn-loop.pid
+.loom/stop-spawn-loop
+.loom/issue-failures.json
+.loom/interventions/
+.loom/worktrees/
+.loom/worktrees-local/
+.claude/worktrees/
+.loom/state.json
+.loom/mcp-command.json
+.loom/activity.db
+.loom/claims/
+.loom/locks/
+.loom/signals/
+.loom/status/
+.loom/retry-state/
+.loom/exit-codes/
+.loom/sweep-checkpoint/
+.loom/sweep-run/
+.loom/targets/
+.loom/target*/
+.cargo-target*/
+.loom/state/*
+!.loom/state/detect-unlabeled-epics-dismissed
+.loom/concierge/
+.loom/stats/
+.loom/diagnostics/
+.loom/guide-docs-state.json
+.loom/metrics_state.json
+.loom/manifest.json
+.loom/stuck-config.json
+.loom/metrics/
+.loom/usage-cache.json
+.loom/claude-config/
+.loom/claude-config.*/
+.loom/claude-config-*/
+.loom/native-tools/
+.loom/tokens/
+.loom/tokens.*/
+.loom/tokens-*/
+.loom/accounts.env
+.loom/accounts.env.*
+.loom/accounts.env-*
+.loom/api-keys/
+.loom/api-keys.*/
+.loom/api-keys-*/
+.loom/account-health.json
+.loom/account-health.lock
+.loom/CANARY
+.loom/*.log
+.loom/*.sock
+.loom/*.tmp
+.loom/*.bak
+.loom/.install.lock
+.loom/logs/
+.loom/.resync-in-progress
+.loom/gh-config/
+.loom/gh-config.*/
+.loom/gh-config-*/
+.loom/gh-config-by-owner/
+.loom/gh-config-by-owner.*/
+.loom/gh-config-by-owner-*/
+.loom-local/
+# <<< loom-managed <<<
+.loom-test-failure-context.json
+.loom/.daemon.flags
+.loom/daemon-state.json
+.loom/[0-9][0-9]-daemon-state.json
+.loom/stuck-history.json
+.loom/alerts.json
+.loom/health-metrics.json
+.loom/progress/
+# Local, opt-in semantic search index (#4339) — repo-local SQLite DB. Never
+# committed; runtime code also refuses to write here if this entry is ever
+# removed (see loom_tools.semantic_search.guard_index_dest_not_tracked).
+.loom/search-index/
+
+# NOTE (#7818): `.loom/gh-config/` and `.loom/gh-config-by-owner/` — the
+# daemon-owned GH_CONFIG_DIR trees holding live GitHub App installation
+# tokens (#4458/#5401) — used to be declared here by hand, which protected
+# THIS repo only. They now live in EPHEMERAL_PATTERNS
+# (loom-daemon/src/init/post_init.rs) and are emitted into the loom-managed
+# block above, so every managed repo gets the rule. Do not re-add them here:
+# one declaration site, enforced by scripts/check-gitignore-convergence.sh.
+
+# Loom workspace config (DO commit for team sharing)
+# - config.json: Persistent terminal configurations (roles, themes, intervals)
+# - roles/: Custom role definitions
+
+# One-off hand-made backups of config.json (e.g. `cp config.json
+# config.json.bak-$(date +%Y%m%dT%H%M%SZ)`) — pure noise in git, which
+# already keeps the full history; a leaked absolute host path in one such
+# backup was an identity-class finding at HEAD (#6649). Never commit these.
+.loom/config.json.bak-*
+
+# Claude Code settings
+# - settings.json: Team-wide permissions (DO commit)
+# - settings.local.json: Personal preferences (gitignored)
+.claude/settings.local.json
+
+# Dogfood symlink (issue #3311):
+# When loom is installed *on* the loom source repo, `.claude/agents` is a
+# symlink to `defaults/.claude/agents/` so the in-repo agent definitions
+# always reflect the committed source-of-truth (no copy = no drift).
+# Created by `./scripts/install-loom.sh --dogfood .` or auto-detected when
+# installing into the loom repo itself.
+.claude/agents
+
+# Dogfood scoped symlink (issue #3682, supersedes the #3565 copy):
+# When loom is installed *on* the loom source repo, `.claude/commands/` is a
+# real directory whose `loom/` subdir is a SYMLINK into the shipped source of
+# truth: `.claude/commands/loom -> ../../defaults/.claude/commands/loom`.
+# A symlink cannot go stale; the earlier materialized COPY (#3565) drifted
+# whenever `defaults/.claude/commands/loom/*.md` changed and caused a false bug
+# report (#3665) when agents loaded outdated guidance.
+# Scoping the link to the `loom/` subdir (not the whole `.claude/commands`
+# directory) avoids #3565's failure mode: `.claude/commands/` itself stays a
+# real dir, so a co-installed tool writing a SIBLING namespace
+# (`.claude/commands/<ns>/foo.md`, e.g. the `repo` tool) writes into a real
+# dir and never redirects through a symlink into loom's `defaults/` artifact.
+# No tool other than loom's own installer/daemon writes the `loom/` namespace.
+# Established by `link_dogfood_commands` in scripts/install/dogfood-commands.sh
+# (mirrors the `.claude/agents` handling, scoped one level deeper).
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore.
+# Consumer repos keep `.claude/commands/loom/` TRACKED (real files, not a
+# symlink), so it must NOT be added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs.
+# Anchored with a leading `/`: an unanchored `.agents` also matches
+# `defaults/.agents/`, silently ignoring every NEW shipped skill file.
+.claude/commands
+
+# Co-install hygiene (issue #3578, sibling of #3565):
+# Loom ships no skills of its own (`defaults/.claude/skills/` does not exist),
+# so `.claude/skills/` in the live tree is a pure destination for co-installed
+# tools that write `.claude/skills/<ns>/…` (e.g. `repo` writes
+# `.claude/skills/repo/SKILL.md`). Ignoring it keeps a foreign tool's files
+# from being accidentally staged into loom's tree by `git add -A`.
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore. It must
+# NOT be added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs, so consumer repos keep any skills they author TRACKED.
+# If loom ever ships its own skills, materialize/dogfood them like
+# `.claude/commands/loom/` (out of scope here).
+.claude/skills
+
+# Co-install hygiene, sibling of `.claude/skills` above:
+# `/repo:handoff` (Repo Skills, a co-installed foreign tool) writes
+# `.claude/handoff.md` — one-shot session state carrying in-flight work,
+# settled decisions and empirically-found traps across a CLI restart. Its
+# contract is that the NEXT session reads it and then deletes it, so it is
+# never a commit; without this entry `git add -A` can stage a note that was
+# meant to live for one session, and `git status` stays dirty until it is
+# absorbed (which is what stalls an installed-surface resync gating on a
+# clean tree).
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore. It
+# must NOT be added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs — Repo Skills' own `/repo:handoff`
+# ensures the entry in each consumer repo it is installed into, and that is
+# the tool that owns the file.
+.claude/handoff.md
+
+# Dogfood scoped symlink (issue #8947, fourth member of the #3311 /
+# #3565+#3682 / #3578 family):
+# `.agents/skills/` is the cross-vendor skill-discovery surface (#8673 contract
+# point 5) that Codex, Kimi Code, Mistral Vibe and Grok read natively. When
+# loom is installed *on* the loom source repo, `.agents/skills` is a SYMLINK to
+# `../defaults/.agents/skills` — the shipped source of truth — so it cannot go
+# stale the way #3565's materialized copy did before #3682 replaced it.
+# Established by `link_dogfood_agent_skills` in
+# loom-daemon/src/init/scaffolding.rs.
+# IMPORTANT: this ignore lives ONLY in loom's own committed .gitignore.
+# Consumer repos keep `.agents/skills/` TRACKED (real generated files, not a
+# symlink — that is the whole point of shipping the surface), so it must NOT be
+# added to the daemon's `update_gitignore` list in
+# loom-daemon/src/init/post_init.rs.
+# Anchored with a leading `/`: an unanchored `.agents` also matches
+# `defaults/.agents/`, silently ignoring every NEW shipped skill file.
+/.agents
+
+# Skill routing local overrides (untracked, user-specific)
+.loom/config/skill-routes.local.json
+
+# Co-install hygiene, sibling of `.claude/skills` above: `.squad/` is a FOREIGN
+# tool's runtime state directory (a SQLite database — `squad.db` plus its `-wal`
+# / `-shm` companions). Loom neither writes nor reads it; it simply materializes
+# in the checkout when that tool runs here. Left unignored it sits untracked and
+# visible to this repo's documented `git add -A` Builder step, so a binary DB
+# holding another tool's session state can be staged into a public remote.
+# IMPORTANT: like `.claude/skills`, this lives ONLY in loom's own committed
+# .gitignore — it must NOT be added to EPHEMERAL_PATTERNS in
+# loom-daemon/src/init/post_init.rs, since consumer repos have no reason to
+# inherit a rule for a tool they may not use.
+.squad/
+
+# NOTE (#8075): the host-local config override tier `.loom-local/` used to be
+# ignored HERE, outside the managed block, which is precisely why consumer
+# repos never got it — the installer-managed block is generated from
+# EPHEMERAL_PATTERNS in loom-daemon/src/init/post_init.rs, not from this file.
+# It now lives in that list (and therefore in the block above), with the
+# rationale for ignoring it recorded alongside the pattern there.

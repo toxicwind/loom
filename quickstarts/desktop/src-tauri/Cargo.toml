@@ -1,0 +1,23 @@
+[package]
+name = "loom-quickstart-desktop"
+version = "0.1.0"
+description = "A Loom Quickstart Desktop App"
+authors = ["you"]
+license = "MIT"
+repository = ""
+default-run = "loom-quickstart-desktop"
+edition = "2021"
+rust-version = "1.70"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

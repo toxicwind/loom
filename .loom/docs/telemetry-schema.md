@@ -1,0 +1,1 @@
+../../defaults/docs/telemetry-schema.md

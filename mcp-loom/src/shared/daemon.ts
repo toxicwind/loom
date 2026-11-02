@@ -1,0 +1,362 @@
+/**
+ * Daemon socket communication for Loom MCP server
+ *
+ * Handles direct socket communication with the Loom daemon process.
+ */
+
+import { Socket } from "node:net";
+import { SOCKET_PATH } from "./config.js";
+
+/**
+ * Options for the streaming subscribe path (Issue #3455, Phase C).
+ */
+export interface StreamSubscribeOptions {
+  /**
+   * Optional duration after which the subscription closes automatically.
+   * Used by `tail_event_bus --since <duration>` to cap the streaming
+   * window. When undefined the connection stays open until the daemon
+   * closes it or `abort()` is called.
+   */
+  durationMs?: number;
+  /**
+   * Optional per-line callback invoked once per JSON frame from the
+   * daemon. Each frame is a `Response::EventStream { events: [...] }`
+   * payload. Implementations should treat the JSON as opaque and let
+   * the caller decode.
+   */
+  onLine?: (line: string) => void;
+  /**
+   * Maximum number of frames to collect before resolving. When set,
+   * acts as an upper bound on the returned array.
+   */
+  maxLines?: number;
+}
+
+/**
+ * Result of a streaming subscribe call.
+ */
+export interface StreamSubscribeResult {
+  /** Line-delimited JSON frames the daemon emitted during the window. */
+  lines: string[];
+  /** True when the duration window elapsed; false when the daemon closed first. */
+  closedByTimeout: boolean;
+  /** Total time the connection stayed open (ms). */
+  elapsedMs: number;
+}
+
+/**
+ * Default bound (ms) for a unary daemon request when neither a per-call
+ * override nor the `LOOM_DAEMON_IPC_TIMEOUT_MS` env override is supplied.
+ *
+ * Kept intentionally small (a couple of seconds) so a fire-and-forget ack
+ * like `publish_event` fails fast instead of hanging until the outer ~1800s
+ * MCP idle timeout aborts the whole tool call (issue #3945). Callers whose
+ * request genuinely takes longer than an immediate ack — `dispatch_sweep`
+ * (spawns a child under the registry mutex) and `cancel_sweep` (blocks for
+ * the SIGTERM→grace→SIGKILL window) — pass an explicit wider `timeoutMs`
+ * rather than raising this global default.
+ */
+export const DEFAULT_DAEMON_IPC_TIMEOUT_MS = 2000;
+
+/**
+ * Resolve the default unary-request timeout (ms).
+ *
+ * Reads the `LOOM_DAEMON_IPC_TIMEOUT_MS` env override — a positive integer
+ * number of milliseconds — and falls back to {@link DEFAULT_DAEMON_IPC_TIMEOUT_MS}
+ * for an absent, non-numeric, zero, or negative value.
+ */
+export function resolveDaemonIpcTimeoutMs(): number {
+  const raw = process.env.LOOM_DAEMON_IPC_TIMEOUT_MS;
+  if (raw !== undefined && raw.trim().length > 0) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_DAEMON_IPC_TIMEOUT_MS;
+}
+
+/**
+ * Extract a `DispatchSweep` request's own `payload.idempotency_key`, if the
+ * caller supplied one (Issue #6592). Returns `undefined` for every other
+ * request type, or when the field is absent/not a string — never throws on
+ * an unexpected shape, since this only feeds an advisory error message.
+ */
+function extractDispatchSweepIdempotencyKey(
+  request: unknown,
+  requestType: string
+): string | undefined {
+  if (requestType !== "DispatchSweep") return undefined;
+  if (!request || typeof request !== "object" || !("payload" in request)) return undefined;
+  const payload = (request as { payload: unknown }).payload;
+  if (!payload || typeof payload !== "object" || !("idempotency_key" in payload)) return undefined;
+  const key = (payload as { idempotency_key: unknown }).idempotency_key;
+  return typeof key === "string" && key.length > 0 ? key : undefined;
+}
+
+/**
+ * The trailing clause appended to the ack-timeout error (Issue #6592).
+ *
+ * A timeout no longer implies the daemon is unreachable for `DispatchSweep`
+ * specifically: the daemon-side fix (`dispatch_sweep_nonblocking`, see
+ * `loom-daemon/src/ipc.rs`) means a slow ack is far more likely to be a
+ * dispatch that is still queued/executing than a dead bridge. Every OTHER
+ * request type keeps the original "daemon may be unreachable" wording
+ * unchanged — this is a `DispatchSweep`-specific carve-out, not a rewrite of
+ * the shared message's default meaning.
+ */
+function timeoutOutcomeNote(requestType: string, dispatchSweepIdempotencyKey: string | undefined): string {
+  if (requestType !== "DispatchSweep") {
+    return " — daemon may be unreachable or its MCP/IPC bridge is not answering";
+  }
+  if (dispatchSweepIdempotencyKey) {
+    return (
+      ` — the dispatch may still be queued or executing rather than failed (Issue #6592); ` +
+      `retry with the SAME idempotency_key ("${dispatchSweepIdempotencyKey}") to safely get ` +
+      `back the already-dispatched sweep instead of double-spawning`
+    );
+  }
+  return (
+    ` — the dispatch may still be queued or executing rather than failed (Issue #6592); ` +
+    `re-dispatching WITHOUT an idempotency_key risks a duplicate spawn — pass an ` +
+    `idempotency_key next time, or check list_sweeps for a sweep that already started ` +
+    `before retrying`
+  );
+}
+
+/**
+ * Send a request to the Loom daemon and get the response
+ *
+ * Uses Unix domain socket to communicate with the running daemon.
+ * The daemon expects JSON-encoded requests and returns JSON-encoded responses.
+ *
+ * A bounded timeout (issue #3945) guarantees this Promise always settles: if
+ * the daemon accepts the connection but never writes a response frame and
+ * never closes the socket (bridge/protocol skew, a blocked accept loop under
+ * multi-repo load, or a request-variant mismatch), the timer fires and the
+ * Promise rejects with a clear, greppable error instead of hanging until the
+ * outer ~1800s MCP idle timeout. The reject surfaces through each caller's
+ * existing try/catch as a returned `{ success: false, error }`, preserving the
+ * sweep skill's soft-failure path (a dead bus never blocks a sweep).
+ *
+ * @param request - The request object to send
+ * @param timeoutMs - Optional per-call timeout override (ms). When omitted,
+ *   falls back to {@link resolveDaemonIpcTimeoutMs} (env override or the small
+ *   default). A non-positive / non-finite value is ignored.
+ * @returns The parsed response from the daemon
+ * @throws Error if connection fails, the response cannot be parsed, or the
+ *   daemon does not respond within the timeout.
+ */
+export async function sendDaemonRequest(
+  request: unknown,
+  timeoutMs?: number
+): Promise<unknown> {
+  const effectiveTimeout =
+    typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : resolveDaemonIpcTimeoutMs();
+  const requestType =
+    request && typeof request === "object" && "type" in request
+      ? String((request as { type: unknown }).type)
+      : "unknown";
+  // Issue #6592: `DispatchSweep`'s guard chain + child spawn + account-
+  // selection poll no longer holds the daemon's shared registry mutex for
+  // its WHOLE duration (see `loom-daemon/src/ipc.rs::dispatch_sweep_nonblocking`),
+  // so a burst of concurrent dispatches acks far sooner — but a genuinely
+  // large burst, host distress, or a slow forge round trip can still exceed
+  // this client-side deadline. When that happens the dispatch is very
+  // likely still QUEUED OR EXECUTING, not failed, so the timeout message
+  // below must not read as "the daemon is down." Read the caller's own
+  // `idempotency_key` (if any) so the message can name the concretely safe
+  // retry instead of a generic warning.
+  const dispatchSweepIdempotencyKey = extractDispatchSweepIdempotencyKey(request, requestType);
+
+  return new Promise((resolve, reject) => {
+    const socket = new Socket();
+    let buffer = "";
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+
+    const clearTimer = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    // Guard against double-settle: a late `end`/`error` after a timeout
+    // reject (or vice-versa) must not call resolve/reject twice.
+    const settleResolve = (value: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimer();
+      // Close the socket once we have our answer. The real daemon holds the
+      // connection open by design (a persistent per-connection read loop, see
+      // loom-daemon/src/ipc.rs `handle_client`), so we must send EOF ourselves
+      // for the daemon's `next_line()` to reap the connection — otherwise a
+      // half-open connection accumulates on the daemon per unary call.
+      if (!socket.destroyed) socket.destroy();
+      resolve(value);
+    };
+    const settleReject = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimer();
+      if (!socket.destroyed) socket.destroy();
+      reject(error);
+    };
+
+    // Settle on the FIRST complete newline-delimited response frame, mirroring
+    // the framing `sendDaemonStreamRequest` and the Rust CLI (main.rs:1477)
+    // already use. The daemon writes one `\n`-terminated JSON response per
+    // request line and then keeps the socket open for reuse — it never closes
+    // after answering — so waiting for `end` here would hang forever against
+    // the real daemon even though the response is already in `buffer` (#4043).
+    socket.on("data", (data) => {
+      if (settled) return;
+      buffer += data.toString();
+      const nl = buffer.indexOf("\n");
+      if (nl === -1) return; // frame not complete yet
+      const line = buffer.slice(0, nl);
+      try {
+        const response = JSON.parse(line);
+        settleResolve(response);
+      } catch (error) {
+        settleReject(new Error(`Failed to parse daemon response: ${error}`));
+      }
+    });
+
+    // Fallback for a peer that closes after responding without a trailing
+    // newline (e.g. a close-after-respond stub server). The real daemon never
+    // reaches here; the `data` handler settles first.
+    socket.on("end", () => {
+      if (settled) return;
+      try {
+        const response = JSON.parse(buffer);
+        settleResolve(response);
+      } catch (error) {
+        settleReject(new Error(`Failed to parse daemon response: ${error}`));
+      }
+    });
+
+    socket.on("error", (error) => {
+      settleReject(
+        new Error(`Failed to connect to Loom daemon at ${SOCKET_PATH}: ${error.message}`)
+      );
+    });
+
+    // Arm the timer up front so it bounds the entire operation — connect,
+    // write, and the wait for the response frame.
+    timer = setTimeout(() => {
+      settleReject(
+        new Error(
+          `Loom daemon did not respond within ${effectiveTimeout}ms at ${SOCKET_PATH} ` +
+            `(request type ${requestType})` +
+            timeoutOutcomeNote(requestType, dispatchSweepIdempotencyKey)
+        )
+      );
+    }, effectiveTimeout);
+
+    socket.connect(SOCKET_PATH, () => {
+      socket.write(JSON.stringify(request));
+      socket.write("\n");
+    });
+  });
+}
+
+/**
+ * Send a streaming request (e.g. `SubscribeEvents`) and collect frames
+ * until the duration window elapses, the line cap is hit, or the daemon
+ * closes the connection.
+ *
+ * The daemon writes line-delimited JSON frames; this helper buffers
+ * partial reads and emits one entry per newline.
+ *
+ * Used by Phase C's `subscribe_to_events` and `tail_event_bus` tools.
+ */
+export async function sendDaemonStreamRequest(
+  request: unknown,
+  options: StreamSubscribeOptions = {}
+): Promise<StreamSubscribeResult> {
+  return new Promise((resolve, reject) => {
+    const socket = new Socket();
+    const lines: string[] = [];
+    let buffer = "";
+    let closedByTimeout = false;
+    let timer: NodeJS.Timeout | null = null;
+    const startedAt = Date.now();
+
+    const finish = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (!socket.destroyed) {
+        socket.end();
+        socket.destroy();
+      }
+      resolve({
+        lines,
+        closedByTimeout,
+        elapsedMs: Date.now() - startedAt,
+      });
+    };
+
+    const consumeLine = (line: string) => {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) return;
+      lines.push(trimmed);
+      if (options.onLine) {
+        try {
+          options.onLine(trimmed);
+        } catch {
+          // Swallow user-callback errors — they shouldn't tear down
+          // the stream collection path.
+        }
+      }
+      if (options.maxLines !== undefined && lines.length >= options.maxLines) {
+        finish();
+      }
+    };
+
+    socket.on("data", (data) => {
+      buffer += data.toString();
+      let nl = buffer.indexOf("\n");
+      while (nl !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        consumeLine(line);
+        nl = buffer.indexOf("\n");
+      }
+    });
+
+    socket.on("end", () => {
+      // Flush any trailing partial line.
+      if (buffer.length > 0) {
+        consumeLine(buffer);
+        buffer = "";
+      }
+      finish();
+    });
+
+    socket.on("close", () => {
+      finish();
+    });
+
+    socket.on("error", (error) => {
+      if (timer) clearTimeout(timer);
+      reject(new Error(`Failed to stream from Loom daemon at ${SOCKET_PATH}: ${error.message}`));
+    });
+
+    socket.connect(SOCKET_PATH, () => {
+      socket.write(JSON.stringify(request));
+      socket.write("\n");
+      if (options.durationMs !== undefined && options.durationMs > 0) {
+        timer = setTimeout(() => {
+          closedByTimeout = true;
+          finish();
+        }, options.durationMs);
+      }
+    });
+  });
+}

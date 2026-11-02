@@ -1,0 +1,183 @@
+{
+  "zai-flash": {
+    "billing": "subscription",
+    "model": "glm-5.3-flash",
+    "providers": {
+      "pi": "zai",
+      "opencode": "zai-coding-plan"
+    },
+    "credentialEnv": "ZAI_API_KEY",
+    "credentialPool": "zai",
+    "effort": "max",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ],
+    "credentialTargets": {
+      "pi": "ZAI_API_KEY",
+      "opencode": "ZHIPU_API_KEY"
+    }
+  },
+  "quick-cerebras": {
+    "billing": "api",
+    "model": "gpt-oss-120b",
+    "providers": {
+      "pi": "cerebras"
+    },
+    "credentialEnv": "CEREBRAS_API_KEY",
+    "credentialPool": "cerebras",
+    "credentialTargets": {
+      "pi": "CEREBRAS_API_KEY"
+    }
+  },
+  "quick-flash": {
+    "billing": "api",
+    "model": "gemini-3.5-flash",
+    "providers": {
+      "pi": "google",
+      "opencode": "google"
+    },
+    "credentialEnv": "GEMINI_API_KEY",
+    "credentialPool": "gemini",
+    "credentialTargets": {
+      "pi": "GEMINI_API_KEY",
+      "opencode": "GEMINI_API_KEY"
+    }
+  },
+  "example-bedrock": {
+    "model": "REPLACE_WITH_BEDROCK_MODEL_ID",
+    "providers": {
+      "opencode": "amazon-bedrock"
+    },
+    "credentialEnv": [
+      "AWS_PROFILE"
+    ],
+    "credentialTargets": {
+      "opencode": {
+        "AWS_PROFILE": "AWS_PROFILE"
+      }
+    },
+    "providerOptions": {
+      "opencode": {
+        "region": "REPLACE_WITH_AWS_REGION"
+      }
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ]
+  },
+  "example-vertex": {
+    "model": "REPLACE_WITH_VERTEX_MODEL_ID",
+    "providers": {
+      "opencode": "google-vertex"
+    },
+    "credentialEnv": [
+      "GOOGLE_APPLICATION_CREDENTIALS",
+      "GOOGLE_CLOUD_PROJECT",
+      "VERTEX_LOCATION"
+    ],
+    "credentialTargets": {
+      "opencode": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT": "GOOGLE_CLOUD_PROJECT",
+        "VERTEX_LOCATION": "VERTEX_LOCATION"
+      }
+    }
+  },
+  "example-kimi-subscription": {
+    "model": "REPLACE_WITH_KIMI_CONFIG_ALIAS",
+    "providers": {
+      "kimi": "REPLACE_WITH_KIMI_CONFIG_ALIAS"
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
+  },
+  "example-kimi-moonshot-api": {
+    "model": "REPLACE_WITH_MOONSHOT_MODEL_ID",
+    "providers": {
+      "kimi": "moonshot"
+    },
+    "credentialEnv": "KIMI_API_KEY",
+    "credentialPool": "kimi",
+    "credentialTargets": {
+      "kimi": "KIMI_MODEL_API_KEY"
+    },
+    "providerOptions": {
+      "kimi": {
+        "providerType": "kimi",
+        "baseUrl": "https://api.moonshot.ai/v1"
+      }
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ]
+  },
+  "example-proxied-anthropic": {
+    "model": "REPLACE_WITH_ANTHROPIC_MODEL_ID",
+    "providers": {
+      "opencode": "anthropic"
+    },
+    "credentialEnv": "ANTHROPIC_API_KEY",
+    "credentialPool": "anthropic",
+    "credentialTargets": {
+      "opencode": "ANTHROPIC_AUTH_TOKEN"
+    },
+    "credentialProxy": {
+      "upstream": "https://api.anthropic.com",
+      "header": "authorization-bearer",
+      "baseUrlEnv": [
+        "ANTHROPIC_BASE_URL"
+      ]
+    },
+    "effort": "high",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ]
+  },
+  "example-openai-compatible": {
+    "model": "REPLACE_WITH_MODEL_ID",
+    "providers": {
+      "opencode": "loom-openweights"
+    },
+    "credentialEnv": [
+      "LOOM_OPENWEIGHTS_API_KEY",
+      "LOOM_OPENWEIGHTS_BASE_URL"
+    ],
+    "credentialTargets": {
+      "opencode": {
+        "LOOM_OPENWEIGHTS_API_KEY": "LOOM_OPENWEIGHTS_API_KEY",
+        "LOOM_OPENWEIGHTS_BASE_URL": "LOOM_OPENWEIGHTS_BASE_URL"
+      }
+    },
+    "providerDefinition": {
+      "opencode": {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "Loom open-weights endpoint",
+        "options": {
+          "baseURL": "{env:LOOM_OPENWEIGHTS_BASE_URL}",
+          "apiKey": "{env:LOOM_OPENWEIGHTS_API_KEY}"
+        },
+        "models": {
+          "REPLACE_WITH_MODEL_ID": {}
+        }
+      }
+    }
+  }
+}

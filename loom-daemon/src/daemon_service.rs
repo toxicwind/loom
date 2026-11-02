@@ -1,0 +1,2388 @@
+//! The daemon's own service bootstrap and IPC accept-loop body (Issue
+//! #4712 — split out of `main.rs` so `main.rs` stays a thin clap surface).
+//! `main()` (in `main.rs`) is the real entry point; it delegates here for
+//! everything past CLI-command dispatch: logging setup, tmux/loom-dir
+//! resolution, every autonomous subsystem's startup wiring, and the IPC
+//! accept loop that only returns on a startup failure.
+
+mod observer_tasks;
+
+use loom_daemon::activity::{self, ActivityDb};
+use loom_daemon::admission_brake;
+use loom_daemon::auto_update;
+use loom_daemon::autonomy_marker;
+use loom_daemon::claim_reconciliation;
+use loom_daemon::config_resolver;
+use loom_daemon::credential_preflight;
+use loom_daemon::daemon_heartbeat;
+use loom_daemon::daemon_startup_reconciliation;
+use loom_daemon::epic_supervisor;
+use loom_daemon::event_bus::EventBus;
+use loom_daemon::forge_egress::publication as egress;
+use loom_daemon::health_monitor;
+use loom_daemon::host_breaker;
+use loom_daemon::hyperparams;
+use loom_daemon::idle_exit;
+use loom_daemon::install_self_check;
+use loom_daemon::ipc::IpcServer;
+use loom_daemon::main_health_gate;
+use loom_daemon::metrics_collector;
+use loom_daemon::orphan_process_reaper;
+use loom_daemon::primary_checkout_reaper;
+use loom_daemon::quarantine_stash_status;
+use loom_daemon::rate_limit_breaker;
+use loom_daemon::role_collision;
+use loom_daemon::role_runner;
+use loom_daemon::sweep_registry::{self, SweepRegistry, SweepRegistryConfig};
+use loom_daemon::terminal::TerminalManager;
+use loom_daemon::token_ranking_refresh;
+use loom_daemon::watch_registry;
+use loom_daemon::watchdog_provisioning_guard;
+use loom_daemon::work_finder;
+use loom_daemon::workspace_pool::WorkspacePool;
+use loom_daemon::worktree_reaper;
+use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
+
+use anyhow::{anyhow, Result};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use crate::cli;
+use crate::{handle_cli_command, Cli, Commands, FleetAction};
+use clap::Parser;
+
+use cli::dispatch::handle_dispatch_command;
+use cli::dispatch_backoff::handle_dispatch_backoff_command;
+use cli::noop_cooldown::handle_noop_cooldown_command;
+use cli::quarantine::handle_quarantine_command;
+use cli::restart::handle_restart_command;
+use cli::serve_cmd::handle_serve_command;
+use cli::status::{handle_fleet_roll_command, handle_fleet_status_command, handle_status_command};
+use cli::watch::handle_watch_command;
+
+/// Decide whether a freshly minted/cached `GH_TOKEN` value warrants a
+/// `std::env::set_var` write, given the value currently exported in the process
+/// environment (#4456).
+///
+/// The `github-app` refresh tick fires every `GITHUB_APP_REFRESH_INTERVAL`
+/// (~5min), but the shell helper only re-mints when the cached token is close
+/// to expiry (~hourly). A cache hit still reports [`GithubAppOutcome::Minted`]
+/// with the *unchanged* token, so writing unconditionally rewrites `GH_TOKEN`
+/// ~10 of every ~11 ticks with an identical value. Each redundant `set_var`
+/// under the multithreaded tokio runtime opens a (tiny) `environ`
+/// use-after-free window against the `gh`/`git` children the daemon constantly
+/// spawns, for no benefit.
+///
+/// Returns `true` only when the minted value actually differs from `current`
+/// (including the case where nothing is exported yet, `current == None`). This
+/// is a pure seam so the guard can be unit-tested without mutating the
+/// process-global environment (which would add to the test-race hazard tracked
+/// by #4385).
+fn gh_token_needs_update(current: Option<&str>, minted: &str) -> bool {
+    current != Some(minted)
+}
+
+// Extracted to a sibling file (#9596) rather than left inline: this file is a
+// frozen over-threshold ratchet entry, and `.loom/docs/file-size-policy.md`
+// names extracting a test module as the sanctioned way to make room — "the
+// parent shrinks, and the extracted file is measured on its own terms". Moved
+// verbatim; the tests themselves are unchanged.
+#[cfg(test)]
+#[path = "daemon_service/gh_token_guard_tests.rs"]
+mod gh_token_guard_tests;
+
+/// The daemon's real entry point: CLI dispatch, then full daemon startup ending
+/// in the IPC accept loop (which only returns on a startup failure — a running
+/// daemon leaves via one of the `std::process::exit` paths instead).
+pub(crate) async fn run_daemon() -> Result<()> {
+    // #10331: started as `gh`, or `loom-daemon gh|gh-shim …` — before clap.
+    loom_daemon::agent_gh::dispatch_if_front();
+    let cli = Cli::parse();
+
+    // Handle CLI commands (init mode)
+    if let Some(command) = cli.command {
+        return match command {
+            // `status` connects to the running daemon over its Unix socket, so
+            // it needs the async runtime (unlike the other sync subcommands).
+            Commands::Status(args) => handle_status_command(args).await,
+            // `health` (#4761) needs the async runtime for the same reason
+            // `status` does — one IPC round-trip — plus a bounded forge fan-out
+            // for the queue-depth/throughput sections.
+            Commands::Health { since, json } => {
+                cli::health::handle_health_command(since, json).await
+            }
+            // `peer-claims` connects to the running daemon over its Unix
+            // socket for the same `DaemonStatus` round-trip `status` performs
+            // (Issue #5921), so it needs the async runtime for the same
+            // reason.
+            Commands::PeerClaims { json } => {
+                cli::peer_claims_cmd::handle_peer_claims_command(json).await
+            }
+            // `queue` (#8852) reads the same `DaemonStatus` round-trip.
+            Commands::Queue { json } => cli::ready_queue_cmd::handle_queue_command(json).await,
+            // `jev-merge-risk` POSTs to an external HTTP endpoint (Jev,
+            // TypeSafe, issue #8545), so it needs the async runtime for the
+            // same reason `status`/`health` do.
+            Commands::JevMergeRisk { pr } => loom_daemon::jev_merge_risk::run(pr).await,
+            // `jev-tier` POSTs to the same external Jev endpoint as
+            // `jev-merge-risk` (issue #8543), so it needs the async runtime
+            // for the same reason.
+            Commands::JevTier { issue } => loom_daemon::jev_tier::run(issue).await,
+            // `concierge` connects to safehoused over its Unix socket to read
+            // the room and to relay a vetted command (Issue #7947), so it needs
+            // the async runtime for the same reason `quarantine` does.
+            Commands::Concierge(args) => args.action.run().await,
+            // `hyperparams` prints the resolved hyperparameter vector
+            // (Issue #9683) — pure config resolution, no live daemon, so it
+            // needs neither the socket nor the async runtime.
+            Commands::Hyperparams(args) => args.run(),
+            // `quarantine` connects to the running daemon over its Unix socket
+            // (the quarantine state is in-memory), so it needs the async runtime.
+            Commands::Quarantine { action } => handle_quarantine_command(action).await,
+            // `dispatch-backoff` connects to the running daemon over its Unix
+            // socket (the per-issue backoff state is in-memory, Issue
+            // #4485/#6192), so it needs the async runtime for the same reason
+            // `quarantine` does.
+            Commands::DispatchBackoff { action } => handle_dispatch_backoff_command(action).await,
+            // `noop-cooldown` connects to the running daemon over its Unix
+            // socket (the per-issue cooldown state is in-memory, Issue
+            // #6670), so it needs the async runtime for the same reason
+            // `dispatch-backoff` does.
+            Commands::NoopCooldown { action } => handle_noop_cooldown_command(action).await,
+            // `dispatch` connects to the running daemon over its Unix socket to
+            // enqueue a sweep (Issue #3952), so it needs the async runtime.
+            Commands::Dispatch {
+                issue,
+                workspace,
+                model,
+                effort,
+                depends_on,
+                force,
+                ignore_host_constraint,
+                allow_local,
+            } => {
+                handle_dispatch_command(
+                    issue,
+                    workspace,
+                    model,
+                    effort,
+                    depends_on,
+                    force,
+                    ignore_host_constraint,
+                    allow_local,
+                )
+                .await
+            }
+            // `cancel` connects to the running daemon over its Unix socket to
+            // terminate a sweep (Issue #4980) — the `dispatch` sibling, same
+            // socket, same reason it needs the async runtime.
+            Commands::Cancel {
+                sweep_id,
+                issue,
+                grace,
+                workspace,
+            } => cli::cancel::handle_cancel_command(sweep_id, issue, grace, workspace).await,
+            // `watch` connects to the running daemon over its Unix socket to
+            // register/list/remove durable watches (Issue #3971).
+            Commands::Watch { action } => handle_watch_command(action).await,
+            // `serve` binds a local HTTP listener and, per request, connects to
+            // the running daemon over its Unix socket for a fresh `DaemonStatus`
+            // snapshot (Issue #4391), so it needs the async runtime.
+            Commands::Serve {
+                port,
+                bind,
+                allow_non_loopback,
+                peers,
+            } => handle_serve_command(port, &bind, allow_non_loopback, &peers).await,
+            // `restart` connects to the running daemon over its Unix socket to
+            // trigger the supervised restart primitive (Issue #4054), or a
+            // scheduled drain-and-restart (Issue #4090).
+            Commands::Restart(args) => handle_restart_command(args).await,
+            // `fleet status` collects the local host's own status over the
+            // daemon's Unix socket (issue #4342), so — unlike `fleet
+            // add-worker`, which is pure ssh/filesystem and stays on the sync
+            // `handle_cli_command` path — it needs the async runtime too.
+            Commands::Fleet {
+                action: FleetAction::Status { json, timeout_secs },
+            } => handle_fleet_status_command(json, timeout_secs).await,
+            // `fleet roll` fans out concurrently across hosts (issue #5504),
+            // bounding each host with a `tokio::time::timeout` the same way
+            // `fleet status` does, so it needs the async runtime too.
+            Commands::Fleet {
+                action:
+                    FleetAction::Roll {
+                        host,
+                        all,
+                        timeout,
+                        json,
+                    },
+            } => handle_fleet_roll_command(host, all, timeout, json).await,
+            // `resolve-model --tier` IS the Tier-2.5 dispatch step — the one
+            // place the Curator's `<!-- loom:complexity=<tier> -->` marker
+            // becomes a model — so it is where a calibrated second opinion
+            // about the SAME issue is worth recording (issue #8543), and the
+            // only reason this otherwise-sync command is routed through the
+            // async runtime. Strictly telemetry: the resolution itself is
+            // `handle_cli_command`'s, below, byte-for-byte unchanged and
+            // unable to observe either the sample or whether it ran. A
+            // two-env-var no-op unless BOTH `LOOM_JEV_SHADOW_ISSUE` (exported
+            // by `resolve-tier-model.sh`) and `TYPESAFE_API_KEY` are set —
+            // i.e. nothing happens on a keyless host, which is the default.
+            cmd @ Commands::ResolveModel { tier: Some(_), .. } => {
+                loom_daemon::jev_tier::shadow_sample_from_env().await;
+                handle_cli_command(cmd).await
+            }
+            other => handle_cli_command(other).await,
+        };
+    }
+
+    // Setup logging to ~/.loom/daemon.log
+    setup_logging()?;
+
+    // Check tmux
+    check_tmux_installed()?;
+
+    // Setup loom directory and socket path
+    // For testing, allow override via LOOM_SOCKET_PATH env var
+    let (loom_dir, socket_path) = if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        // For testing, use the parent directory of the provided socket path
+        let socket_path = std::path::PathBuf::from(path);
+        let loom_dir = resolve_loom_dir()?;
+        (loom_dir, socket_path)
+    } else {
+        let loom_dir = resolve_loom_dir()?;
+        fs::create_dir_all(&loom_dir)?;
+        let socket_path = loom_dir.join("loom-daemon.sock");
+        (loom_dir, socket_path)
+    };
+
+    // Initialize activity database
+    let db_path = loom_dir.join("activity.db");
+    let activity_db = ActivityDb::new(db_path.clone())?;
+    log::info!("Activity database initialized");
+
+    // Crash recovery: Release stale claims on startup (Issue #1159)
+    // Claims older than 1 hour without heartbeat are considered stale
+    let stale_threshold_secs = std::env::var("LOOM_CLAIM_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600); // Default: 1 hour
+
+    match activity_db.release_stale_claims(stale_threshold_secs) {
+        Ok(count) if count > 0 => {
+            log::warn!(
+                "Crash recovery: Released {count} stale claims (older than {stale_threshold_secs}s)"
+            );
+        }
+        Ok(_) => {
+            log::debug!("No stale claims to release on startup");
+        }
+        Err(e) => {
+            log::warn!("Failed to release stale claims on startup: {e}");
+        }
+    }
+
+    let activity_db = Arc::new(Mutex::new(activity_db));
+
+    // Load configured terminal IDs for config-based session filtering (Issue #1952)
+    // This prevents importing stale sessions from crashed daemons or other instances
+    let workspace_from_env = std::env::var("LOOM_WORKSPACE").ok();
+    let configured_ids = workspace_from_env
+        .as_ref()
+        .and_then(|workspace| extract_configured_terminal_ids(Path::new(workspace)));
+
+    // Initialize terminal manager and clean up stale sessions
+    let mut tm = TerminalManager::new();
+
+    // Restore surviving tmux sessions and sweep stale ones — both skipped
+    // together when LOOM_NO_RESTORE=1, which this startup path used to ignore
+    // (issue #8463). Lives in `terminal_restore` rather than inline here
+    // because both this file and `terminal.rs` are frozen at their current
+    // size by the File Size Ratchet; see that module's docs for the full
+    // rationale of the gate and of why the cleanup sweep must be skipped too.
+    loom_daemon::terminal_restore::restore_and_clean_at_startup(&mut tm, configured_ids.as_ref())?;
+
+    let tm = Arc::new(Mutex::new(tm));
+
+    // Start health monitoring (enabled by default)
+    if let Some(interval) = health_monitor::check_env_enabled() {
+        let (_health_handle, _health_state) = health_monitor::start_tmux_health_monitor(interval);
+        log::info!("tmux health monitoring enabled (interval: {interval}s)");
+        // Note: health_handle is dropped here, but the thread keeps running
+        // health_state could be stored for querying crash status if needed
+    }
+
+    // Start GitHub metrics collection (if workspace is set)
+    // Workspace can be set via LOOM_WORKSPACE environment variable (reuse variable from above)
+    let db_str = db_path.to_str().map(std::string::ToString::to_string);
+
+    if let (Some(workspace), Some(db)) = (workspace_from_env.as_deref(), db_str) {
+        let _metrics_handle = metrics_collector::try_init_metrics_collector(Some(workspace), &db);
+        // Note: metrics_handle is dropped here, but the thread keeps running if enabled
+    }
+
+    // Initialize the sweep registry (Issue #3452 — Phase A of #3449).
+    // The registry tracks `/loom:sweep` children dispatched via the
+    // `DispatchSweep` IPC request. It writes no daemon-side state file;
+    // recovery on restart relies on lock dirs + sweep checkpoints + the
+    // forge (labels). The reaper task polls live PIDs on a configurable
+    // interval (`LOOM_SWEEP_REAPER_INTERVAL_SECS`, default 30s).
+    //
+    // `sweep_workspace` seeds the *default* registry only. As of #4299, an
+    // explicit-`workspace_root`-absent `DispatchSweep`/`dispatch_sweep`
+    // request no longer blindly trusts this cwd-derived value as its target:
+    // `ipc::resolve_dispatch_registry` consults the on-disk workspace
+    // registry first and only falls back to this default when the registry
+    // is empty or this root is itself registered. See that function's doc
+    // comment for the full precedence.
+    let sweep_workspace = workspace_from_env
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Start the background maintenance threads the activity module owns:
+    // (1) transcript token ingestion (Issue #8059; on by default since #8477
+    // — see that module's doc for why). This is the only writer
+    // `resource_usage` has on a dispatch-driven host — the IPC
+    // `GetTerminalOutput` path a `claude -p` sweep never traverses is the
+    // other one; (2) since #8758, the scheduled raw-transcript archive pass
+    // (opt-in via `autonomous.transcriptArchive`). For both, `sweep_workspace`
+    // is read only to resolve the `autonomous.*` config block — the passes
+    // themselves are workspace-independent, reading every project's
+    // transcripts under `${CLAUDE_CONFIG_DIR:-~/.claude}/projects`. Handles
+    // dropped, threads run on.
+    let (_ingest_handle, _transcript_archive_handle) =
+        activity::start_maintenance_threads(&db_path, &sweep_workspace);
+
+    // #6499: a loud, top-of-boot-block diagnosis of the legacy
+    // `.loom/config.json` tier — every existing repo's sole populated config
+    // tier, and the one a host-local patch (safehouse/observability paths,
+    // `daemon.delegatedTo`, …) lives in ahead of #5457's durable fix. A parse
+    // failure here (most commonly an abandoned `git stash pop` conflict
+    // leaving live `<<<<<<<`/`=======`/`>>>>>>>` markers in the tracked file)
+    // makes `resolve_effective_config` silently fall back to `{}` for this
+    // tier on every one of its dozens of call sites, each logging only a
+    // `WARN` — easy to miss in normal boot volume, and the exact failure mode
+    // that left observability/safehouse/roleRunner silently disabled on two
+    // fleet hosts for ~70 minutes before anyone noticed. This check runs once
+    // at boot (not once per resolve) and names the consequence explicitly.
+    if let Some(diagnosis) = config_resolver::diagnose_legacy_config(&sweep_workspace) {
+        log::error!(
+            "config_resolver: {} is unreadable/malformed ({diagnosis}) — \
+             observability/safehouse/roleRunner config lost, running on defaults for the \
+             remainder of this process's life. Run `jq . {}` to see the parse error; if it \
+             shows literal conflict markers, resolve them manually (keep this host's own \
+             paths) and restart the daemon. See .loom/docs/troubleshooting.md for the full \
+             recovery procedure.",
+            sweep_workspace
+                .join(config_resolver::LEGACY_CONFIG_REL)
+                .display(),
+            sweep_workspace
+                .join(config_resolver::LEGACY_CONFIG_REL)
+                .display(),
+        );
+    }
+
+    // Unified operational hyperparameters (Issue #9683): resolve the vector
+    // down its tier chain (single-knob env > $LOOM_HYPERPARAMS vector >
+    // "hyperparameters" config block > legacy autonomous.* keys > defaults),
+    // fail fast on any out-of-range/unknown/contradictory value on the
+    // hyperparameters surface, and capture the resolved vector + digest into
+    // the process globals the per-knob resolvers and the span provenance
+    // stamper read. Runs before any span exists so every span of this run
+    // records `loom.hyperparams.digest` for the vector it started under.
+    hyperparams::startup_init(&sweep_workspace)?;
+
+    let sweep_config = SweepRegistryConfig::new(sweep_workspace.clone());
+
+    // Phase B (#3453): construct the in-memory pub/sub event bus *before*
+    // the sweep registry so we can wire it in at construction time. The
+    // bus is shared between the registry (publisher for reaper + dispatch
+    // events) and the IPC server (publisher for `PublishEvent` requests
+    // from sweep children, plus consumer for `SubscribeEvents` streams).
+    let event_bus = Arc::new(EventBus::new());
+    log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
+
+    // #10832: a live pause manifest must hold restart recovery off its paused
+    // agents BEFORE the first registry is reconstructed (design §7 H5).
+    let h5 = auto_update::pause_resume::arm_at_startup();
+    let mut sweep = SweepRegistry::with_event_bus(sweep_config, event_bus.clone());
+    match sweep.reconstruct() {
+        Ok(0) => log::debug!("sweep_registry: no sweeps to reconstruct"),
+        Ok(n) => log::info!(
+            "sweep_registry: reconstructed {n} sweep entr{}",
+            if n == 1 { "y" } else { "ies" }
+        ),
+        Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
+    }
+
+    // #6171: record the daemon's own primary workspace root once, before any
+    // forge call that could trigger a forced per-owner credential refresh
+    // (`credential_preflight::force_refresh_owner_credential`) — that helper
+    // anchors `.loom/scripts/lib/github-app-token.sh` and
+    // `.loom/gh-config-by-owner/*` here regardless of which managed repo's
+    // checkout root the refresh was triggered from.
+    credential_preflight::register_primary_workspace_root(&sweep_workspace);
+
+    // Startup forge-credential preflight (Issue #4005; GitHub App identity
+    // mechanism added by #4430). Resolved once, here — immediately before the
+    // claim-reconciliation pass below, the daemon's first `gh` consumer — so
+    // a headless/SSH-only start with neither an exported GH_TOKEN/GITHUB_TOKEN
+    // nor an unlockable GUI login keychain is diagnosed loudly at boot
+    // instead of surfacing as silent per-tick 401s for the life of the
+    // process. Non-fatal and bounded (same posture as the reconciliation pass
+    // itself): a `gh` hiccup here never blocks startup.
+    //
+    // #4430: when a GitHub App id + private key are configured (env or
+    // `forge.githubApp.*` config — see `defaults/scripts/lib/github-app-token.sh`),
+    // this mints a short-lived installation token and exports it as this
+    // process's own `GH_TOKEN`, so every `gh`/`git` child the daemon spawns
+    // from this point on inherits it. Absent that config, `owner_repo`
+    // resolves fine but the shell helper reports "not_configured" and
+    // `run_with_github_app` falls through to the byte-identical pre-#4430
+    // `run(...)` path below — no behavior change for any host that hasn't
+    // opted in.
+    let credential_preflight_probe = credential_preflight::RealGhAuthProbe {
+        gh_bin: "gh".to_string(),
+        cwd: sweep_workspace.clone(),
+    };
+    let github_app_script = credential_preflight::resolve_github_app_script(&sweep_workspace);
+    let github_app_owner_repo = credential_preflight::nwo_from_git_remote(&sweep_workspace);
+    // #9986: `required` egress host: the gateway owns the GitHub credential.
+    let github_credential_forbidden = egress::github_credential_forbidden(Some(&sweep_workspace));
+    let github_app_preflight = match &github_app_script {
+        _ if github_credential_forbidden => credential_preflight::gateway_owned_preflight(),
+        Some(script_path) => {
+            let minter = credential_preflight::RealGithubAppMinter {
+                script_path: script_path.clone(),
+                cwd: sweep_workspace.clone(),
+            };
+            credential_preflight::run_with_github_app(
+                &credential_preflight_probe,
+                &minter,
+                github_app_owner_repo.as_deref(),
+            )
+        }
+        // No `github-app-token.sh` on disk at all (stale install predating
+        // #4430, or a workspace root with no `.loom`/`defaults` tree) —
+        // exactly the pre-#4430 path, with zero extra subprocess overhead.
+        None => credential_preflight::GithubAppPreflight {
+            report: credential_preflight::run(&credential_preflight_probe),
+            minted: None,
+        },
+    };
+    // #4458: deliver the minted installation token via a daemon-owned
+    // `GH_CONFIG_DIR` (`credential_preflight::publish_minted`, #10571 sidecar)
+    // instead of exporting it as this process's `GH_TOKEN`. Every `gh` child
+    // this daemon spawns (`Command::new("gh")` without `env_clear`, ~76
+    // call sites — see the issue body's census) re-reads
+    // `$GH_CONFIG_DIR/hosts.yml` fresh on each invocation, so the refresh
+    // tick below becomes a pure file rewrite with **zero** recurring
+    // `std::env::set_var` calls — the UB race (concurrent `setenv` vs. the
+    // `environ` reads inside every concurrently spawned `Command`) this issue
+    // eliminates. `github_app_gh_config_dir_active` tracks whether the
+    // one-time env activation below has happened yet, so it fires **at most
+    // once** for the life of the process (see the tick closure further down
+    // for the rare case where activation happens there instead of here).
+    //
+    // The one remaining `std::env::set_var` (`GH_CONFIG_DIR` itself, plus the
+    // paired `remove_var` calls) is that single activation: it runs here,
+    // before the refresh-tick task (or any other tokio task that spawns
+    // `gh`/`git`) has been created, so there is no concurrent `Command::spawn`
+    // in this process yet to race the `environ` write — the residual window
+    // this issue's acceptance criteria allow a startup site to keep, given a
+    // comment naming the race and the rationale for accepting it. Clearing
+    // `GH_TOKEN`/`GITHUB_TOKEN` here (not just setting `GH_CONFIG_DIR`)
+    // matters too: `gh` checks the env vars *before* `GH_CONFIG_DIR`'s
+    // `hosts.yml`, so an operator-exported ambient token would otherwise
+    // silently outrank the just-minted app token — the pre-#4458 code
+    // achieved the same override by unconditionally overwriting `GH_TOKEN`.
+    let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
+    // #9986: a `required` host activates a token-less profile instead. Its
+    // preflight is `gateway_owned_preflight` (no minted token), so the
+    // publication branch below never runs there.
+    let mut github_app_gh_config_dir_active =
+        github_credential_forbidden && egress::activate_tokenless_profile(&github_app_config_dir);
+    if let Some(minted) = &github_app_preflight.minted {
+        match credential_preflight::publish_minted(&github_app_config_dir, minted) {
+            Ok(()) => {
+                std::env::remove_var("GH_TOKEN");
+                std::env::remove_var("GITHUB_TOKEN");
+                std::env::set_var("GH_CONFIG_DIR", &github_app_config_dir);
+                github_app_gh_config_dir_active = true;
+            }
+            Err(e) => {
+                // Fail open, matching the mint-failure posture elsewhere in
+                // this preflight: never block startup, never leave the
+                // daemon worse off than the pre-#4430 ambient path.
+                log::warn!(
+                    "credential_preflight: failed to publish github-app token to {} ({e}); \
+                     falling back to ambient gh auth — #4458",
+                    github_app_config_dir.display()
+                );
+            }
+        }
+    }
+    // #9872: name the rate-limit pool the credential spends (WARN on a
+    // personal one: shared with every PAT/OAuth/`gh` login of that user).
+    let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
+
+    // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
+    // above mints exactly ONE installation token, keyed on this daemon's
+    // *workspace root* owner (`github_app_owner_repo`) and delivered via the
+    // process-global `GH_CONFIG_DIR`. An installation token is scoped to its
+    // own installation's repos, so every managed repo owned by a DIFFERENT
+    // account/org (the reporter's fleet spans `rjwalters/*` and `2AMLogic/*`)
+    // is unreachable for private data under it — public reads succeed
+    // anonymously while private reads and writes silently 404, which is what
+    // made a wrong-owner fleet look uniformly healthy (#5401's evidence).
+    //
+    // The fix: mint a SECOND (third, …) installation token — one per distinct
+    // owner among the managed repos — and publish each into its own per-owner
+    // `GH_CONFIG_DIR` (reusing #4458's tested delivery path), registering
+    // every cross-owner checkout root against it so the daemon's per-repo
+    // `gh`/`git` call sites (`credential_preflight::apply_gh_config_for_root`)
+    // select the right credential per child. The `mint(owner_repo)` machinery
+    // already resolves the correct installation per owner/repo; it was simply
+    // never called per owner before now.
+    //
+    // Only runs when the App mechanism is actually the active credential this
+    // run (`minted.is_some()`) — an ambient `gh` auth / PAT host is
+    // not subject to the single-installation limit. A single-owner fleet
+    // yields no plans, registers nothing, and is byte-identical to pre-#5401.
+    // Each established plan is registered into
+    // `credential_preflight::register_owner_refresh_source` (#6171), the
+    // shared registry the refresh task below re-reads every tick — rather
+    // than a `Vec` captured once here — so an owner discovered dynamically
+    // after startup (via `force_refresh_owner_credential`'s 404-recovery
+    // path) is picked up by the SAME periodic freshness tick as one
+    // established here, with no separate task to spawn or track.
+    if let (Some(root_owner_repo), Some(script_path), true) = (
+        &github_app_owner_repo,
+        &github_app_script,
+        github_app_preflight.minted.is_some(),
+    ) {
+        let root_owner = credential_preflight::owner_of_nwo(root_owner_repo).to_string();
+        let cross_owner_registry =
+            loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+        let managed: Vec<(std::path::PathBuf, String)> = cross_owner_registry
+            .effective_roots(&sweep_workspace)
+            .into_iter()
+            .filter_map(|root| {
+                credential_preflight::nwo_from_git_remote(&root).map(|nwo| (root, nwo))
+            })
+            .collect();
+        let plans = credential_preflight::plan_cross_owner_credentials(&root_owner, &managed);
+        if !plans.is_empty() {
+            let minter = credential_preflight::RealGithubAppMinter {
+                script_path: script_path.clone(),
+                cwd: sweep_workspace.clone(),
+            };
+            for plan in plans {
+                let owner_dir = credential_preflight::github_app_gh_config_dir_for_owner(
+                    &sweep_workspace,
+                    &plan.owner,
+                );
+                let repo = &plan.representative_owner_repo;
+                match credential_preflight::GithubAppMinter::mint(&minter, repo) {
+                    ref outcome @ credential_preflight::GithubAppOutcome::Minted {
+                        ref installation_id,
+                        ref app_id,
+                        ..
+                    } => match credential_preflight::publish_outcome(&owner_dir, outcome, repo) {
+                        Ok(()) => {
+                            for root in &plan.roots {
+                                credential_preflight::register_root_gh_config_dir(root, &owner_dir);
+                            }
+                            // #5431: also register the owner slug so call sites
+                            // that target the repo by `--repo <owner/repo>`
+                            // (fleet::drain) or an `owner/repo`-in-path `gh api`
+                            // (telemetry::visibility) — with no checkout-root
+                            // `current_dir` to key off — select this owner's
+                            // credential too.
+                            credential_preflight::register_owner_gh_config_dir(
+                                &plan.owner,
+                                &owner_dir,
+                            );
+                            // #6171: also register this owner as a periodic
+                            // refresh source — see the comment on the
+                            // registration loop above.
+                            credential_preflight::register_owner_refresh_source(
+                                &plan.representative_owner_repo,
+                                &owner_dir,
+                            );
+                            log::info!(
+                                "credential_preflight: per-owner github-app credential established \
+                                 for {} ({} managed repo(s), app {app_id} installation \
+                                 {installation_id}) — those cross-owner repos are now reachable \
+                                 (#5401)",
+                                plan.owner,
+                                plan.roots.len()
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "credential_preflight: minted a per-owner github-app token for {} \
+                                 but could not publish it to {} ({e}); its {} managed repo(s) \
+                                 remain unreachable — #5401",
+                                plan.owner,
+                                owner_dir.display(),
+                                plan.roots.len()
+                            );
+                        }
+                    },
+                    credential_preflight::GithubAppOutcome::Error(reason) => {
+                        log::warn!(
+                            "credential_preflight: could not mint a per-owner github-app token for \
+                             {} ({reason}); its {} managed repo(s) ({:?}) remain unreachable — the \
+                             app may not be installed on {}'s account/org (public reads may still \
+                             work; private reads and writes will 404) — #5401",
+                            plan.owner,
+                            plan.roots.len(),
+                            plan.roots,
+                            plan.owner
+                        );
+                    }
+                    credential_preflight::GithubAppOutcome::NotConfigured => {
+                        // Unreachable in practice: `minted.is_some()`
+                        // above already proved the app is configured. Treat as
+                        // a no-op rather than a failure.
+                    }
+                }
+            }
+        }
+    }
+
+    // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
+    // ordering reasons: the store is read through `gh` under the credentials
+    // the preflight above just resolved, and every `read_*_config` call that
+    // gates a loop below must see the config the store renders — so this is
+    // the one point that is after the former and before all of the latter. It
+    // awaits the startup render (bounded; an unreachable forge falls back to
+    // the last good cached snapshot and never blocks boot) and then leaves a
+    // `fleet.syncIntervalSecs` timer task behind for drift detection. A host
+    // with no `fleet.repo` — every host that has not opted in — does nothing
+    // at all here. See `loom_daemon::fleet_sync`.
+    //
+    // #9598: the startup pass also resolves this host's *desired run state*
+    // from `fleet/state.yml`. A `stopped` state is acted on INSIDE this call —
+    // it exits `EXIT_FLEET_STOPPED` here, before any dispatch producer, IPC
+    // listener or role loop is constructed, so there is nothing to drain. A
+    // `paused` state cannot be: `DrainState` is built ~650 lines below, after
+    // the workspace pool, so the hold travels in `Started::hold_note` and is
+    // applied there by `fleet_state::wire`. `running`, an unreadable state and
+    // an unset `fleet.repo` all carry on untouched.
+    let fleet_started =
+        loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
+
+    // Forge egress doctor (#9984), after `GH_CONFIG_DIR` activation above so it
+    // validates the profile this daemon's `gh` children will actually read.
+    // A background loop (first pass now, then every
+    // LOOM_FORGE_EGRESS_DOCTOR_INTERVAL_SECS): logs each finding + its repair
+    // command, caches the report for `status`, publishes `forge.egress.drift`
+    // on change. It never blocks startup or exits the daemon — refusal under
+    // `enforcement.api=required` happens at dispatch/spawn admission, so
+    // local-only commands keep working. No policy configured ⇒ a no-op.
+    let _forge_egress_doctor =
+        loom_daemon::forge_egress::gate::start(&sweep_workspace, Some(event_bus.clone()));
+
+    // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
+    // minted installation token fresh across its ~1h lifetime for a
+    // long-running daemon. Ticks that don't rotate the token
+    // never *write* anything: the `NotConfigured` arm is a true no-op, and a
+    // cache-hit tick (the shell helper's own cache still has plenty of life —
+    // ~10 of every ~11 ticks) compares against `current_token` (a plain local
+    // captured by this task, never the process env — #4456's original
+    // intent, now trivially true since there is no shared `GH_TOKEN` env var
+    // left to read) and skips the write because the minted value is
+    // unchanged. Only a genuine rotation (value differs) rewrites
+    // `hosts.yml`; a mint failure is logged and the loop keeps whatever
+    // credential `GH_CONFIG_DIR` already has on disk (fail-open, matching the
+    // startup preflight's posture).
+    if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
+        let script_path = script_path.clone();
+        let cwd = sweep_workspace.clone();
+        let owner_repo = owner_repo.clone();
+        let config_dir = github_app_config_dir.clone();
+        let mut current_token = github_app_preflight.minted.map(|m| m.token);
+        let mut config_dir_active = github_app_gh_config_dir_active;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
+                let script_path = script_path.clone();
+                let cwd = cwd.clone();
+                let repo = owner_repo.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
+                    credential_preflight::GithubAppMinter::mint(&minter, &repo)
+                })
+                .await;
+                match outcome {
+                    Ok(
+                        ref minted @ credential_preflight::GithubAppOutcome::Minted {
+                            ref token,
+                            ref installation_id,
+                            ref app_id,
+                            ..
+                        },
+                    ) => {
+                        // #5630: a successful mint (fresh or cache hit) ends this
+                        // source's credential-failure streak, so the main-health
+                        // gate goes back to trusting its forge answers on the very
+                        // next tick. A publish failure below re-opens it — an
+                        // unpublished token is just as un-refreshed on disk.
+                        credential_preflight::record_forge_credential_success(
+                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                        );
+                        // #4456/#4458: only rewrite when the value actually
+                        // rotated, and do it as a pure file write — no
+                        // `std::env::set_var` anywhere in this arm once
+                        // `config_dir_active` is already true (the common
+                        // case: activation happened at startup above).
+                        if gh_token_needs_update(current_token.as_deref(), token) {
+                            // Rare edge case: the app becomes configured
+                            // *after* startup (e.g. the shell helper's own
+                            // config appears mid-run) without the daemon
+                            // restarting, so activation didn't happen above.
+                            // This is a second, still-bounded (at most once
+                            // per process) `std::env::set_var` window — the
+                            // recurring, steady-state race this issue targets
+                            // is the one eliminated; this cold-start
+                            // transition is unchanged in kind from the
+                            // pre-#4458 code's own equivalent one-time
+                            // `set_var` in this same arm.
+                            if !config_dir_active {
+                                std::env::remove_var("GH_TOKEN");
+                                std::env::remove_var("GITHUB_TOKEN");
+                                std::env::set_var("GH_CONFIG_DIR", &config_dir);
+                                config_dir_active = true;
+                            }
+                            match credential_preflight::publish_outcome(
+                                &config_dir,
+                                minted,
+                                &owner_repo,
+                            ) {
+                                Ok(()) => {
+                                    current_token = Some(token.clone());
+                                    log::debug!(
+                                        "credential_preflight: github-app refresh tick rotated \
+                                         GH_TOKEN (app {app_id} installation {installation_id}) \
+                                         — #4430"
+                                    );
+                                }
+                                Err(e) => {
+                                    // #5630: the mint succeeded but the token never
+                                    // reached disk, so `GH_CONFIG_DIR` still holds the
+                                    // aging one — same staleness as a failed mint.
+                                    credential_preflight::record_forge_credential_failure(
+                                        credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                                        &format!("could not publish the minted token: {e}"),
+                                    );
+                                    log::warn!(
+                                        "credential_preflight: github-app refresh tick failed to \
+                                         publish token to {} ({e}); GH_CONFIG_DIR left unchanged \
+                                         (app {app_id} installation {installation_id}) — #4458",
+                                        config_dir.display()
+                                    );
+                                }
+                            }
+                        } else {
+                            log::debug!(
+                                "credential_preflight: github-app refresh tick cache hit, \
+                                 GH_TOKEN unchanged (app {app_id} installation {installation_id}) \
+                                 — #4456"
+                            );
+                        }
+                    }
+                    Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
+                        // Cheap no-op tick -- nothing to refresh.
+                    }
+                    Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                        // #5630: the credential on disk is now aging with no
+                        // successful refresh behind it. Record the streak so the
+                        // main-health gate holds its previous verdicts instead of
+                        // reading the resulting forge failures as "every repo's
+                        // main just went red".
+                        credential_preflight::record_forge_credential_failure(
+                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                            &reason,
+                        );
+                        log::warn!(
+                            "credential_preflight: github-app refresh tick failed ({reason}); \
+                             GH_TOKEN left unchanged — main-health gate verdicts are held for up \
+                             to {}s while this persists — #4430/#5630",
+                            credential_preflight::resolve_forge_credential_stale_grace().as_secs()
+                        );
+                    }
+                    Err(e) => {
+                        // A join error means the mint never completed either, so
+                        // the credential is just as un-refreshed as an Error arm.
+                        credential_preflight::record_forge_credential_failure(
+                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
+                            &format!("github-app refresh task join error: {e}"),
+                        );
+                        log::warn!(
+                            "credential_preflight: github-app refresh task join error: {e} — #4430"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    // #5401: keep each per-owner credential fresh across its ~1h lifetime,
+    // ticking every `GITHUB_APP_REFRESH_INTERVAL` (~5min) — the same cadence
+    // as the workspace-root owner's tick above. Re-mint the
+    // owner's representative repo and republish into its `GH_CONFIG_DIR` — a
+    // pure file rewrite via #4458's delivery path; the root->dir registration
+    // is path-stable and never needs re-registering. A fail-open loop
+    // (matching the startup posture): a mint/publish miss logs and keeps
+    // whatever token that owner's dir already holds.
+    //
+    // #6171: spawned whenever the App mechanism itself is configured
+    // (`github_app_script.is_some()`), NOT only when a per-owner plan
+    // happened to exist at startup — the source list
+    // (`credential_preflight::owner_refresh_sources()`) is re-read from the
+    // shared registry on every tick, so an owner discovered later via
+    // `force_refresh_owner_credential`'s 404-recovery path (including a
+    // fleet that started single-owner and only later grew a cross-owner
+    // workspace) is picked up automatically, without a second task to spawn.
+    // An empty registry makes a tick a cheap no-op loop, same cost as the
+    // pre-#6171 early return.
+    if let Some(script_path) = &github_app_script {
+        let script_path = script_path.clone();
+        let cwd = sweep_workspace.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
+                let owners = credential_preflight::owner_refresh_sources();
+                for (owner_repo, config_dir) in &owners {
+                    let script_path = script_path.clone();
+                    let cwd = cwd.clone();
+                    let owner_repo_for_mint = owner_repo.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
+                        credential_preflight::GithubAppMinter::mint(&minter, &owner_repo_for_mint)
+                    })
+                    .await;
+                    // #5630: each owner's credential is its own refresh
+                    // source. A saturated host times these out alongside the
+                    // primary tick, and their repos' forge calls go just as
+                    // wrong — so they feed the same staleness tracker, keyed
+                    // separately so a healthy owner's success cannot clear a
+                    // failing owner's streak.
+                    let source = credential_preflight::credential_source_for_owner(owner_repo);
+                    match outcome {
+                        Ok(ref minted @ credential_preflight::GithubAppOutcome::Minted { .. }) => {
+                            if let Err(e) = credential_preflight::publish_outcome(
+                                config_dir, minted, owner_repo,
+                            ) {
+                                credential_preflight::record_forge_credential_failure(
+                                    &source,
+                                    &format!("could not publish the minted token: {e}"),
+                                );
+                                log::warn!(
+                                    "credential_preflight: per-owner github-app refresh could \
+                                         not publish the token for {owner_repo} to {} ({e}); its \
+                                         credential left unchanged — #5401",
+                                    config_dir.display()
+                                );
+                            } else {
+                                credential_preflight::record_forge_credential_success(&source);
+                            }
+                        }
+                        Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
+                            // Cheap no-op — nothing to refresh for this owner.
+                        }
+                        Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
+                            credential_preflight::record_forge_credential_failure(&source, &reason);
+                            log::warn!(
+                                "credential_preflight: per-owner github-app refresh for \
+                                     {owner_repo} failed ({reason}); its credential left \
+                                     unchanged — main-health gate verdicts are held for up to \
+                                     {}s while this persists — #5401/#5630",
+                                credential_preflight::resolve_forge_credential_stale_grace()
+                                    .as_secs()
+                            );
+                        }
+                        Err(e) => {
+                            credential_preflight::record_forge_credential_failure(
+                                &source,
+                                &format!("per-owner refresh task join error: {e}"),
+                            );
+                            log::warn!(
+                                "credential_preflight: per-owner github-app refresh task join \
+                                     error for {owner_repo}: {e} — #5401"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // #9537: keep each reader App's token fresh per managed owner (no-op when
+    // the roster has no readers), so forge reads can leave the writer's budget.
+    loom_daemon::forge_identity::spawn_reader_refresh(
+        sweep_workspace.clone(),
+        github_app_owner_repo.clone(),
+    );
+
+    // Declared-cadence liveness heartbeat (Issue #4011): the daemon touches
+    // `<loom_dir>/daemon.heartbeat` on a fixed cadence so a host-side watchdog
+    // (`loom-daemon-watchdog.sh`, a second StartInterval launchd job) can detect
+    // "a daemon should be running but isn't" WITHOUT talking to the daemon — a
+    // dead daemon cannot report its own death, so the reporter must live outside
+    // this process. Default-ON like the token-ranking refresh / watch-monitor
+    // loops (it only writes a small bookkeeping file with no dispatch side
+    // effect); opt out with `LOOM_DAEMON_HEARTBEAT=0` /
+    // `autonomous.heartbeat.enabled=false`. We deliberately do NOT reuse the
+    // token-ranking `.ranking` mtime as an accidental heartbeat: that is a
+    // config-disableable side effect, so a detector keyed to it would silently
+    // stop working when that loop is turned off.
+    //
+    // Spawned here — BEFORE the rate-limit breaker registration and the
+    // startup reconciliation passes just below, rather than after them like
+    // pre-#7974 — so a slow reconciliation pass (unbounded `gh` fan-out under
+    // rate limiting, #7974) never delays the first heartbeat write. The IPC
+    // socket bind / pidfile claim further below get the same treatment for
+    // the same reason.
+    let heartbeat_config = daemon_heartbeat::read_heartbeat_config(&sweep_workspace);
+    // Resolved once here so the healing marker below (#4331) and the running
+    // heartbeat loop agree on the cadence the watchdog derives its staleness
+    // threshold from — even if the loop itself is disabled.
+    let heartbeat_interval = daemon_heartbeat::resolve_interval(&heartbeat_config);
+    let _heartbeat_handle = if daemon_heartbeat::resolve_enabled(&heartbeat_config) {
+        log::info!("daemon_heartbeat: enabled (interval={}s)", heartbeat_interval.as_secs());
+        daemon_heartbeat::spawn_heartbeat_task(heartbeat_interval)
+    } else {
+        log::debug!(
+            "daemon_heartbeat: disabled (set LOOM_DAEMON_HEARTBEAT=1 or \
+             autonomous.heartbeat.enabled=true to opt in)"
+        );
+        None
+    };
+
+    // GitHub rate-limit circuit breaker (#4429). Registered here — before the
+    // startup reconciliation passes just below — because *every* gh-polling
+    // consumer (reconciliation, work-finder, epic supervisor, role runner)
+    // starts after this point and consults the global handle. Unlike the host
+    // breaker (registered inside the work-finder branch, which is its sole
+    // sampler), rate-limit failures can be observed by any of those loops, so
+    // the breaker exists whether or not the work-finder is enabled.
+    let rate_limit_config = rate_limit_breaker::resolve_config_for(&sweep_workspace);
+    rate_limit_breaker::register_global(std::sync::Arc::new(
+        rate_limit_breaker::SharedRateLimitBreaker::new(rate_limit_config),
+    ));
+    log::info!(
+        "rate_limit_breaker: enabled={} (fallback_cooldown_secs={}) — forge polling pauses \
+         until the API window resets when the shared rate limit is exhausted (#4429)",
+        rate_limit_config.enabled,
+        rate_limit_config.fallback_cooldown_secs,
+    );
+
+    // Stale-`loom:building`-claim reconciliation across every managed
+    // workspace (Issue #3953). `sweep.reconstruct()` above only recovers
+    // entries this registry itself owns evidence for (locks/checkpoints); it
+    // has nothing to say about a claim left behind by a sweep that died
+    // between the previous daemon's exit and this one's start (rate-limit
+    // kill, print-mode ceiling, an operator upgrade — the daemon-restart
+    // gap where `loom-recover-orphans` used to find *no* authoritative
+    // liveness source at all and refuse to reclaim anything, #3651).
+    //
+    // The machine-level sweep journal (`~/.loom/sweeps.json`, written by
+    // every `dispatch()` — see `sweep_journal`) is A liveness source, and it
+    // survives exactly the restart that wipes this in-memory registry — but
+    // it, like every other evidence source `claim_reconciliation::decide`/
+    // `plan` consult, is HOST-scoped: it can only prove a claim dead *on
+    // this host*, and is structurally blind to a still-running sweep on a
+    // *different* host. #3651's fail-safe ("absent evidence means treat
+    // every claim as ALIVE") was therefore only *syntactically* satisfied by
+    // this journal alone — a peer host's live claim always looks like "no
+    // evidence" to it. Epic #6165 Phase 2 (Issue #6286) closed that gap with
+    // a genuinely FLEET-scoped liveness source: the lease record (`<!--
+    // loom:lease host=... sweep=... -->`, Issue #6179/#6180), consulted as
+    // the final gate in `claim_reconciliation::forge::reconcile_workspace`
+    // before any reclaim actually fires (the SOLE fleet-scoped gate as of
+    // Epic #6165 Phase 4, Issue #6317, which removed an earlier,
+    // peer-claim-channel-health-based gate) — see that module's top doc
+    // comment for the full picture.
+    //
+    // Stated plainly (Epic #6165 Phase 4, Issue #6318): #3651's invariant is
+    // now upheld by the LEASE, not by this journal. The journal is
+    // INSUFFICIENT EVIDENCE for a peer host's claim — it was never designed
+    // to be fleet-scoped and remains exactly as useful as it always was for
+    // its original purpose, reconciling THIS host's own claims after a
+    // restart (the `DeadPid`/`DeadRunRegistry` branches above stay journal-
+    // driven and unchanged). What changed is only that a peer's claim no
+    // longer falls through to the age-based grace period on this journal's
+    // silence alone — the lease gate answers that question with fleet-wide,
+    // forge-timestamped evidence instead.
+    //
+    // This pass is a bounded, logged, best-effort sweep over every
+    // `effective_roots()` workspace (empty registry ⇒ just this one). It
+    // never blocks daemon startup — a `gh` hiccup in one repo is logged and
+    // skipped, and the remaining repos are still reconciled.
+    //
+    // Promoted from a startup-only pass to ALSO run on an interval (Issue
+    // #4348): a daemon restart is not the only way a `loom:building` claim's
+    // sweep can die. A manually/externally spawned detached sweep killed by
+    // an external `SIGKILL` (the incident that motivated #4348) never writes
+    // the journal entry above, but its checkpoint's `task_id` joined against
+    // `.loom/sweep-run/<task_id>.json` gives `claim_reconciliation` the same
+    // provable-death answer — see that module's doc comment for the full
+    // evidence-source precedence. The startup pass and the periodic task
+    // spawned just below share one implementation, so the startup and
+    // periodic behavior are identical EXCEPT for the `is_startup` flag (Issue
+    // #6615): only the startup pass passes `true`, which lets a
+    // `loom:building` claim with zero liveness evidence (no journal entry, no
+    // run-registry pid) be reclaimed immediately instead of waiting out the
+    // multi-hour age gate — total absence of evidence right after a restart
+    // is much stronger evidence of a claim orphaned by a crash between
+    // `begin_issue_dispatch`'s label flip and `finish_issue_dispatch`'s
+    // journal write than the identical absence is during steady-state
+    // operation (where the periodic pass below, passing `false`, still
+    // protects a manually-spawned `/loom:sweep` with no journal entry yet).
+    //
+    // Issue #7974: the startup pass (and the co-located stranded-quarantine
+    // pass below it) used to run as a plain blocking call right here — before
+    // the IPC socket was bound or the heartbeat started. Both now run on a
+    // blocking thread via `spawn_startup_passes`, which returns a
+    // `watch::Receiver<bool>` that flips to `true` once they finish. Nothing
+    // in `run_daemon` itself awaits it — the socket bind / pidfile claim
+    // further below proceed immediately regardless of pass duration — but the
+    // work finder (spawned further below still) DOES await it before its
+    // first admission, which is what keeps the reconcile-before-dispatch
+    // invariant (#6615) intact despite the passes no longer blocking startup.
+    let startup_reconciliation_ready =
+        daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
+    let _claim_reconciliation_handle = claim_reconciliation::spawn_periodic_reconciliation_task(
+        sweep_workspace.clone(),
+        event_bus.clone(),
+    );
+
+    // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
+    // watchdog knobs from `.loom/config.json → autonomous` with env override
+    // (precedence env > config > default). The stagger serializes back-to-back
+    // child startups so a burst dispatch does not trip the 0-HTTPS MCP-init
+    // race; the watchdog is the self-healing backstop for any hang that slips
+    // past it.
+    let startup_race_config = sweep_registry::read_startup_race_config(&sweep_workspace);
+    let dispatch_stagger = sweep_registry::resolve_dispatch_stagger(&startup_race_config);
+    sweep.set_dispatch_stagger(dispatch_stagger);
+    log::info!("sweep_registry: dispatch stagger = {}ms (#3887)", dispatch_stagger.as_millis());
+
+    // Startup-proof occupancy grace (Issue #4003): a freshly-dispatched sweep
+    // counts toward the work-finder's admission budget regardless of progress
+    // for this long; past it, a sweep with zero observed startup-proof signal
+    // (no worktree/checkpoint/log-past-header) stops consuming a slot, well
+    // before the (unchanged) 300s startup watchdog would cancel/re-dispatch it.
+    let startup_proof_grace = sweep_registry::resolve_startup_proof_grace(&startup_race_config);
+    sweep.set_startup_proof_grace(startup_proof_grace);
+    log::info!(
+        "sweep_registry: startup-proof occupancy grace = {}s (#4003)",
+        startup_proof_grace.as_secs()
+    );
+
+    // Insta-crash quarantine (#3939): resolve env > config > default for the
+    // default workspace so the reaper quarantines a repeatedly-insta-crashing
+    // issue instead of letting the work finder re-dispatch it every tick.
+    let quarantine_config = sweep_registry::resolve_quarantine_config(&sweep_workspace);
+    sweep.set_quarantine_config(quarantine_config);
+    log::info!(
+        "sweep_registry: insta-crash quarantine {} (threshold={}, ttl={}s, insta-crash<{}s) (#3939)",
+        if quarantine_config.enabled { "enabled" } else { "disabled" },
+        quarantine_config.threshold,
+        quarantine_config.ttl.as_secs(),
+        quarantine_config.insta_crash_secs
+    );
+
+    // Per-issue dispatch backoff (#4485): resolve env > config > default for the
+    // default workspace so a failing issue's re-dispatch cadence is bounded even
+    // when its deaths land in a quarantine carve-out (#4122 exhaustion, #4386
+    // pre-flight) and never reach the 3-strike quarantine threshold.
+    let dispatch_backoff_config = sweep_registry::resolve_dispatch_backoff_config(&sweep_workspace);
+    sweep.set_dispatch_backoff_config(dispatch_backoff_config);
+    log::info!(
+        "sweep_registry: per-issue dispatch backoff {} (base={}s, max={}s) (#4485)",
+        if dispatch_backoff_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        dispatch_backoff_config.base.as_secs(),
+        dispatch_backoff_config.max.as_secs()
+    );
+
+    // No-op re-dispatch cooldown (#6670): resolve env > config > default for
+    // the default workspace so a sweep's self-reported "no actionable delta
+    // this pass" holds its issue out of dispatch for a cooldown window,
+    // distinct from and independent of the insta-crash quarantine and
+    // dispatch backoff above.
+    let noop_cooldown_config = sweep_registry::resolve_noop_cooldown_config(&sweep_workspace);
+    sweep.set_noop_cooldown_config(noop_cooldown_config);
+    log::info!(
+        "sweep_registry: no-op re-dispatch cooldown {} (cooldown={}s) (#6670)",
+        if noop_cooldown_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        noop_cooldown_config.cooldown.as_secs()
+    );
+
+    // Hard-exclusion decline cooldown (#7528): resolve env > config > default
+    // for the default workspace so a sweep that declines because the issue
+    // carries a `crate::hard_exclusion` label (`external` today) is held out
+    // of dispatch for a cooldown window instead of being re-offered on the
+    // very next tick. Independent of all three brakes above.
+    let decline_cooldown_config = sweep_registry::resolve_decline_cooldown_config(&sweep_workspace);
+    sweep.set_decline_cooldown_config(decline_cooldown_config);
+    log::info!(
+        "sweep_registry: hard-exclusion decline cooldown {} (cooldown={}s, warn_threshold={}, \
+         labels={:?}) (#7528)",
+        if decline_cooldown_config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        decline_cooldown_config.cooldown.as_secs(),
+        decline_cooldown_config.warn_threshold,
+        loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS.as_slice()
+    );
+
+    // PR-less retry bound (#7972): resolve env > config > default for the
+    // default workspace so an issue whose dispatches keep ending without a
+    // pull request is spaced out and — at the threshold — held with
+    // `loom:blocked`, instead of being re-claimed forever. The only brake of
+    // the four keyed on "did the dispatch produce a PR" rather than on how the
+    // child died, which is why it catches the shape the others structurally
+    // cannot (a sweep that advances its checkpoint and still produces nothing).
+    // Resolve + set + log live in the module (`configure_prless_retry`), not
+    // inline here: `daemon_service.rs` is over the file-size ratchet's
+    // threshold and frozen at its current size (.loom/docs/file-size-policy.md).
+    sweep_registry::configure_prless_retry(&mut sweep, &sweep_workspace);
+
+    // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
+    // env > config > default for the default workspace so a fleet-wide,
+    // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible
+    // advisory instead of reading as an idle-healthy daemon.
+    let preflight_tripwire_config =
+        sweep_registry::resolve_preflight_tripwire_config(&sweep_workspace);
+    sweep.set_preflight_tripwire_config(preflight_tripwire_config);
+    log::info!(
+        "sweep_registry: pre-flight-death tripwire threshold={} (#4386)",
+        preflight_tripwire_config.threshold
+    );
+
+    // Cross-host collision detection + enforcement (#4085, upgraded from
+    // detection-only by #5789): resolve env > config > default(off) for the
+    // default workspace. When enabled, a confirmed pre-flip collision now
+    // backs off the dispatch instead of only recording it.
+    let detect_collisions = sweep_registry::resolve_collision_detection(&sweep_workspace);
+    sweep.set_collision_detection(detect_collisions);
+    log::info!(
+        "sweep_registry: cross-host collision detection {} (#4085)",
+        if detect_collisions {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
+    let sweep_registry = Arc::new(Mutex::new(sweep));
+    let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
+
+    // Multi-workspace sweep-registry pool (Issue #3928 — phase b of #3835/#3926).
+    // Both autonomous loops (work-finder + epic supervisor) share ONE pool so a
+    // given repo has exactly one `SweepRegistry` instance — unifying in-flight
+    // dedup and the reaper across both loops. The pool captures a handle to this
+    // shared daemon runtime so every provisioned registry's reaper runs here even
+    // when a workspace is first touched from the epic supervisor's OS thread. The
+    // default workspace is *seeded* with the registry constructed above (also used
+    // by the IPC `DispatchSweep` path), so the empty-registry case reuses it
+    // byte-for-byte rather than building a second instance.
+    let workspace_pool =
+        Arc::new(WorkspacePool::new(event_bus.clone(), tokio::runtime::Handle::current()));
+    workspace_pool.seed(sweep_workspace.clone(), sweep_registry.clone());
+
+    // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
+    // connection that advertises this daemon's dispatch claims and consumes peer
+    // advertisements into a shared TTL-bounded view, so peer daemons back off
+    // before the non-atomic `loom:building` label flip would let them race.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. Injected into
+    // the seeded default registry here (the IPC `DispatchSweep` path); every other
+    // provisioned registry is injected in `get_or_provision`.
+    //
+    // Deliberately started **before** `start_safehouse_narration` below (Issue
+    // #6352): the narration sink reads back this call's publisher + view
+    // synchronously (`WorkspacePool::start_safehouse_narration` locks
+    // `peer_coord`) to build its fleet-wide completion-dedup handle, so peer
+    // coordination must already be established by the time narration starts
+    // — reversing this order would silently leave completion dedup
+    // per-host-only even with `safehouse.enabled` true.
+    workspace_pool.start_peer_coordination(&sweep_workspace);
+    {
+        let mut reg = sweep_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workspace_pool.inject_peer_coordination(&mut reg);
+    }
+
+    // Optional safehouse fleet-comms narration (#3997): subscribe the shared
+    // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
+    // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
+    // public-feed `completion` envelope can carry a best-effort per-issue token
+    // total; the sink only ever reads, on the blocking pool. Started after peer
+    // coordination above (Issue #6352) so it can pick up the fleet-wide
+    // completion-dedup handle.
+    workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
+
+    // Restart-survivorship capacity seed (Issue #6262). A daemon restart leaves
+    // in-flight sweeps running but rebuilds capacity accounting from scratch, so
+    // any survivor the rebuild misses is a slot the work finder believes is free
+    // and immediately refills — the mechanism behind the 2026-08-14 "28 running
+    // vs cap 12" incident. Two things happen here, both strictly BEFORE the work
+    // finder / epic supervisor / role runner / drain supervisor are spawned
+    // below:
+    //
+    //   1. Every registered root's `SweepRegistry` is provisioned, so the
+    //      lock-based `reconstruct()` — still the primary mechanism — runs for
+    //      ALL roots at one deterministic point rather than as a side effect of
+    //      whichever consumer touches each root first.
+    //   2. Any still-live sweep the machine-level journal (`~/.loom/sweeps.json`)
+    //      records for a managed root that the lock pass did NOT recover is
+    //      unioned in. `reconstruct` drops a lock whose `owner.json` is missing
+    //      or unparseable without asking whether a process is still running, and
+    //      a lock released while the child lived leaves no lock at all — in both
+    //      cases the survivor is invisible to it. `claim_reconciliation` above is
+    //      NOT the backstop for that: it reconciles the forge labels of sweeps it
+    //      can prove are *dead*, and never re-admits a live one into capacity
+    //      accounting.
+    //
+    // Best-effort and never fatal — see `startup_adoption`'s module docs.
+    {
+        let roots = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+            .unwrap_or_default()
+            .effective_roots(&sweep_workspace);
+        let _ = loom_daemon::startup_adoption::seed_capacity_from_journal(&workspace_pool, &roots);
+    }
+
+    // Startup watchdog (Issue #3887): auto-cancel + re-dispatch (once, bounded)
+    // any daemon-dispatched sweep that hangs at startup with no progress. On by
+    // default; disable with LOOM_SWEEP_WATCHDOG=0 or
+    // `autonomous.watchdog.enabled = false`.
+    let _watchdog_handle = if sweep_registry::resolve_watchdog_enabled(&startup_race_config) {
+        let timeout = sweep_registry::resolve_watchdog_timeout(&startup_race_config);
+        let interval = sweep_registry::resolve_watchdog_interval(&startup_race_config);
+        // Review-phase stall watchdog (Issue #3910): a third backstop, resolved
+        // independently (env > config > default, defaults on) and threaded into
+        // the same tick. `None` disables it without touching the startup
+        // watchdog. It catches a still-running sweep wedged in a hung
+        // Judge/Doctor subagent (log silent past the stall timeout).
+        let review_stall_timeout =
+            if sweep_registry::resolve_review_stall_enabled(&startup_race_config) {
+                Some(sweep_registry::resolve_review_stall_timeout(&startup_race_config))
+            } else {
+                log::info!("sweep_registry: review-phase stall watchdog disabled (#3910)");
+                None
+            };
+        // Stale-untracked-sweep backstop (Issue #7529): a fourth backstop,
+        // resolved independently (env > config > default, defaults on) and
+        // threaded into the same tick. Catches a sweep neither of the two
+        // `children`-gated watchdogs above can ever reach — one this daemon
+        // instance re-admitted from durable state (`reconstruct()` or
+        // `adopt_live_journal_sweeps`, #6262) rather than spawned itself —
+        // that has gone silent well past every existing timeout.
+        let stale_sweep_params =
+            if sweep_registry::resolve_stale_sweep_enabled(&startup_race_config) {
+                Some((
+                    sweep_registry::resolve_stale_sweep_age(&startup_race_config),
+                    sweep_registry::resolve_review_stall_timeout(&startup_race_config),
+                ))
+            } else {
+                log::info!("sweep_registry: stale-untracked-sweep backstop disabled (#7529)");
+                None
+            };
+        Some(sweep_registry::spawn_watchdog_task(
+            sweep_registry.clone(),
+            timeout,
+            interval,
+            review_stall_timeout,
+            stale_sweep_params,
+        ))
+    } else {
+        log::info!("sweep_registry: startup watchdog disabled (#3887)");
+        None
+    };
+
+    // Shared reactive main-health halt flag (Issue #3812 — Phase C of epic
+    // #3809). Constructed here — before both the epic supervisor and the
+    // work-finder — so it can be threaded into both dispatch paths. When the gate
+    // loop (below) is disabled nothing ever flips it, so neither the supervisor
+    // nor the work-finder is ever halted (zero behavior change with the gate off).
+    // Per-repo halt state (#3930): one `MainHealthState` per registered repo,
+    // keyed by normalized root, so a red `main` in one managed repo halts only
+    // that repo's dispatch — never the siblings'. With an empty registry (the
+    // common single-workspace case) exactly one root is keyed, reducing to the
+    // pre-#3930 single-flag behavior byte-for-byte.
+    // #10869: made through `checkout_ff`, which registers them so the timer's
+    // checkout fast-forward asks whether a gate run is building in a checkout
+    // before it moves it.
+    let workspace_health_states = loom_daemon::fleet_sync::checkout_ff::health_states();
+
+    // Shared drain-and-restart state (Issue #4090). Constructed here — before the
+    // epic supervisor, work-finder, and role runner — so its flag can be threaded
+    // into all three dispatch producers AND into the IPC server (which sets/aborts
+    // it and renders it in `loom-daemon status`). With no drain requested the flag
+    // stays `false`, so every producer's halt check is byte-for-byte unchanged.
+    // #8652: backed by the persisted paused-time ledger (see `DrainState::with_default_ledger`).
+    // #9598: `fleet_state::wire` is that same `with_default_ledger()` for every
+    // host with no `fleet.repo` — and for a host whose store says `running` —
+    // so boot is byte-for-byte unchanged there. A `paused` host instead starts
+    // HELD: dispatch producers see the same flag a `fleet drain` sets, so
+    // in-flight work (there is none yet at boot) finishes and nothing new is
+    // admitted. `wire` also arms the `fleet.syncIntervalSecs` timer against
+    // this drain state, which is what enforces a run-state change that lands
+    // mid-run — it is armed HERE, rather than inside `fleet_sync::start`
+    // above, because neither the drain state nor the workspace pool it drains
+    // through exists at the point in boot where the startup render must happen.
+    let drain_state = loom_daemon::fleet_state::wire(fleet_started, &workspace_pool, &event_bus);
+    let drain_flag = drain_state.flag();
+
+    // Shared role-runner in-progress guard (#4364): one set, cloned into both
+    // the work-finder's idle-edge path and every interval role loop, so an
+    // interval run and an idle-triggered run never overlap for the same
+    // (root, role). In-process shared state only — no event-bus topic.
+    let role_in_progress = role_runner::new_in_progress_guard();
+    // #6102: publish the same set as a process-global so `loom-daemon status`
+    // can report the live role-agent count alongside in-flight sweeps, without
+    // threading this `Arc` through the IPC server. Registered unconditionally
+    // (even when the role runner is disabled) so the reported count is honestly
+    // `0` rather than "unknown" — and so it is registered exactly once, at the
+    // single construction site, rather than from whichever loop happens to spawn.
+    role_runner::register_global_in_progress(role_in_progress.clone());
+    // #10832: hold dispatch and run H5 (health probation, then resume the
+    // paused agents) before any dispatch producer below is spawned.
+    h5.spawn(&drain_state, &workspace_pool, &sweep_workspace, &event_bus, &role_in_progress);
+
+    // Epic supervisor loop (Issue #3872 — Phase 4 of epic #3842). Opt-in via
+    // `LOOM_EPIC_SUPERVISOR`. The loop drives every open `loom:epic` issue
+    // through its fork-join lifecycle by dispatching the enabled role each tick.
+    //
+    // It runs on a DEDICATED OS THREAD with its own current-thread runtime —
+    // NOT `tokio::spawn` on this shared daemon runtime — because the concrete
+    // `SpawnDispatcher::dispatch_role` is spawn-and-wait (`Command::status()`
+    // blocks for the full lifetime of each Architect/Champion process, holding
+    // the #3707 issue-creation mutex across the burst). Keeping that blocking
+    // call off the shared runtime preserves the responsiveness of the event
+    // bus, reaper, sweep registry, and IPC listener while a role process runs.
+    // Multi-workspace fan-out (#3928): the supervisor loop resolves
+    // `effective_roots()` each tick and drives one `EpicSupervisor` per registered
+    // workspace (empty registry ⇒ the single `sweep_workspace`, byte-for-byte).
+    // Per-root spawn-binary resolution now happens inside the loop thread, so no
+    // single up-front `resolve_spawn_bin()` gate is needed here.
+    let supervisor_handle = if epic_supervisor::supervisor_enabled() {
+        let interval = epic_supervisor::resolve_supervisor_interval();
+        match epic_supervisor::spawn_multi_supervisor_thread(
+            workspace_pool.clone(),
+            sweep_workspace.clone(),
+            event_bus.clone(),
+            workspace_health_states.clone(),
+            interval,
+            drain_flag.clone(),
+        ) {
+            Ok(handle) => {
+                log::info!(
+                    "epic_supervisor: enabled (multi-workspace, interval={}s)",
+                    interval.as_secs()
+                );
+                Some(handle)
+            }
+            Err(e) => {
+                log::error!("epic_supervisor: failed to start loop thread: {e}");
+                None
+            }
+        }
+    } else {
+        log::debug!("epic_supervisor: disabled (set LOOM_EPIC_SUPERVISOR=1 to enable)");
+        None
+    };
+    // Shared shutdown flag so the signal handler can stop the loop cleanly.
+    let supervisor_shutdown = supervisor_handle
+        .as_ref()
+        .map(epic_supervisor::SupervisorHandle::shutdown_token);
+    // Keep the handle alive for the daemon's lifetime; its Drop signals stop.
+    let _supervisor_handle = supervisor_handle;
+
+    // Autonomous work-finder loop (Issue #3810 — Phase A of epic #3809; dynamic
+    // concurrency scaling added in #3811 — Phase B). Opt-in via
+    // `LOOM_WORK_FINDER`. Each tick queries the forge for open `loom:issue`
+    // items and dispatches up to a **work-driven** cap — recomputed every tick as
+    // `min(disk headroom, ram headroom, configured_max)` (the CPU/load term
+    // added in #3978 was removed in #4512; the token-pool term was removed in
+    // #5270) — through the same `SweepRegistry::dispatch()` path the IPC
+    // `DispatchSweep` request uses. `LOOM_WORK_FINDER_MAX_CONCURRENT` is
+    // repurposed (Phase A → B) from a fixed target into the operator ceiling;
+    // the cap also never exceeds the scratch-volume disk headroom nor the
+    // host's RAM headroom (never starve concurrent sweep builds into starving
+    // the main-health gate's own build, #3978).
+    //
+    // Unlike the epic supervisor above, this runs as a plain `tokio::spawn`
+    // interval task on the shared daemon runtime (like the reaper): every call
+    // into `dispatch()` returns promptly (fire-and-forget child spawn), so the
+    // finder never parks a runtime worker in a long blocking call.
+    // The shared reactive main-health halt flag (`main_health_state`) is
+    // constructed above (before the epic supervisor) so both dispatch paths share
+    // it. Config surface (#3813): `.loom/config.json → autonomous.workFinder` lets a
+    // repo enable/tune the loop from committed config with zero env vars, while
+    // an operator env var still overrides for a single run (precedence env >
+    // config > default). An absent `autonomous` block is byte-for-byte the
+    // env-only behavior shipped in Phases A/B.
+    let work_finder_config = work_finder::read_work_finder_config(&sweep_workspace);
+
+    let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
+        let interval = work_finder::resolve_interval_with_config(&work_finder_config);
+        // #6203: also resolve *which layer* supplied `configured_max` (env /
+        // config / default) so the startup log below can tell an operator
+        // whether their `.loom/config.json` edit was actually picked up. This
+        // is only the loop's starting value: since #9060 the loop re-reads it
+        // every tick, so a config edit hot-applies (an env override does not
+        // — the process environment is fixed at launch).
+        let configured_max = work_finder::ConfiguredMax::resolve(&work_finder_config);
+        // Retired CPU-headroom knobs (#4512): `cpuUtilizationTarget` /
+        // `estCoresPerSweep` (and their env twins) are accepted-but-ignored, so
+        // a fleet's committed config keeps parsing across the upgrade. Warn
+        // once, here at startup, naming exactly what is being ignored and what
+        // to tune instead.
+        work_finder::warn_deprecated_cpu_knobs(&work_finder_config);
+        // Per-tick admission (ramp) cap (#4234): resolved once at startup from
+        // the same `work_finder_config`, precedence env > config > default —
+        // the same startup-capture pattern as the CPU knobs above. Bounds how
+        // many *new* sweeps a single tick may admit, independent of how large
+        // the dynamic cap computes to that tick — see
+        // `work_finder::WORK_FINDER_MAX_ADMISSIONS_PER_TICK_ENV` for the full
+        // ramp-lag rationale (#4231's second wave).
+        let max_admissions_per_tick =
+            work_finder::resolve_max_admissions_per_tick_with_config(&work_finder_config);
+        // #4084: hold new dispatch off a root while its build-gate run is in
+        // flight, so a fresh sweep build does not race the gate's own build for
+        // cores (the contention that timed the gate out under #4073's mild
+        // niceness). Resolved once at startup from the same primary workspace
+        // config as the gate's master switch (env > config > default(on)).
+        let suppress_dispatch_during_gate = main_health_gate::resolve_suppress_dispatch_during_gate(
+            &main_health_gate::read_autonomous_gate_config(&sweep_workspace),
+        );
+        // Host-distress circuit breaker (#4235): resolve its config once at
+        // startup (env > config > default, default-ON) from the daemon's primary
+        // workspace and register the process-global handle. The work-finder loop
+        // (spawned just below) samples load-per-core into it each tick and
+        // consults it as a second dispatch suppressor; `loom-daemon status` and
+        // the `dispatch_sweep` IPC handler read it via the same global. Registered
+        // only when the work-finder is enabled, since the loop is the breaker's
+        // sole sampler — a daemon with no work-finder never trips it (and its
+        // dispatch_sweep sees a Closed/absent breaker: zero behavior change).
+        let host_breaker_config = host_breaker::resolve_config_for(&sweep_workspace);
+        host_breaker::register_global(std::sync::Arc::new(
+            host_breaker::SharedHostBreaker::new(host_breaker_config)
+                .with_disk_guard(&sweep_workspace),
+        ));
+        log::info!(
+            "host_breaker: enabled={} (load_per_core_trip={:.2}, sustain_ticks={}, cooldown_secs={})",
+            host_breaker_config.enabled,
+            host_breaker_config.load_per_core_threshold,
+            host_breaker_config.sustain_ticks,
+            host_breaker_config.cooldown_secs,
+        );
+        // Saturation admission brake (#4903): same startup-resolve +
+        // process-global-registration shape as the breaker above, and registered
+        // in the same place for the same reason — the work-finder loop is its
+        // sole sampler, so a daemon with no work-finder never engages it. The
+        // brake is the *point-in-time* half of the load-aware pair: it holds NEW
+        // admissions while the host is already saturated and releases the moment
+        // it recovers, where the breaker latches on sustained distress and holds
+        // through a cool-down. Neither ever touches a running sweep.
+        let admission_brake_config = admission_brake::resolve_config_for(&sweep_workspace);
+        admission_brake::register_global(std::sync::Arc::new(
+            admission_brake::SharedAdmissionBrake::new(admission_brake_config),
+        ));
+        log::info!(
+            "admission_brake: enabled={} (load_per_core_hold={:.2}; holds NEW sweep admissions \
+             only — in-flight sweeps are never preempted; starvation escape hatch: warn at \
+             {}s, yield one tick at {}s of held+0-in-flight, #5715)",
+            admission_brake_config.enabled,
+            admission_brake_config.load_per_core_threshold,
+            admission_brake_config.starvation_warn_secs,
+            admission_brake_config.starvation_escape_secs,
+        );
+        log::info!(
+            "work_finder: enabled (multi-workspace, interval={}s, \
+             configured_max={} (source={}), \
+             max_admissions_per_tick={max_admissions_per_tick}, build_slots={}, \
+             dynamic cap = min(disk, ram, configured_max) — token axis is \
+             selection-only, not a cap, since #5270, \
+             global across workspaces; configured_max is re-read every tick — \
+             a config edit hot-applies, an env override needs a restart, #9060)",
+            interval.as_secs(),
+            configured_max.value,
+            configured_max.source,
+            loom_daemon::build_slot::resolve_slots()
+        );
+        // Multi-workspace fan-out (#3928): re-reads `effective_roots()` each tick
+        // and dispatches into each registered repo's own working tree via the
+        // shared `workspace_pool`. Empty registry ⇒ the single `sweep_workspace`.
+        //
+        // `startup_reconciliation_ready` (Issue #7974) is awaited internally
+        // before the loop's first real tick — see `spawn_startup_passes`'s doc
+        // comment above for why this is what still keeps the
+        // reconcile-before-dispatch invariant (#6615) intact now that the
+        // startup pass no longer blocks `run_daemon` itself.
+        Some(work_finder::spawn_multi_work_finder_task(
+            workspace_pool.clone(),
+            sweep_workspace.clone(),
+            interval,
+            configured_max,
+            max_admissions_per_tick,
+            workspace_health_states.clone(),
+            suppress_dispatch_during_gate,
+            event_bus.clone(),
+            drain_flag.clone(),
+            role_in_progress.clone(),
+            startup_reconciliation_ready,
+        ))
+    } else {
+        log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
+        None
+    };
+    // Starred-issue liveness + loom-ui star intents (#9244 C), alongside dispatch.
+    // The bus handle (#9321) carries each new escalation / recovery onto
+    // `operator_priority.escalation` so the Safehouse sink relays it into the
+    // team's Matrix room rather than leaving the ask as a forge comment only.
+    let _star_liveness = _work_finder_handle.is_some().then(|| {
+        loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
+    });
+
+    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
+        sweep_workspace.clone(),
+        socket_path.clone(),
+        Some(event_bus.clone()),
+    ); // #10164
+
+    // Idle-edge role triggering (#4364) is inert without the work-finder loop:
+    // the work finder is the sole source of the per-root idle signal, so an
+    // `autonomous.roleRunner.onIdle` set with no work finder enabled can never
+    // fire. Warn once at startup so a misconfiguration surfaces in the log
+    // rather than silently doing nothing. (The interval cadence still runs.)
+    if !work_finder::resolve_enabled(&work_finder_config)
+        && !role_runner::resolve_on_idle_roles(&role_runner::read_role_runner_config(
+            &sweep_workspace,
+        ))
+        .is_empty()
+    {
+        log::warn!(
+            "role_runner: autonomous.roleRunner.onIdle is set but the work finder is disabled — \
+             idle-edge triggering has no idle signal to observe and will never fire (enable the \
+             work finder with LOOM_WORK_FINDER=1 or autonomous.workFinder.enabled=true). The \
+             interval cadence is unaffected."
+        );
+    }
+
+    // Role-runner roster heartbeat (Issue #7690, Phase A of #6704). Opt-in via
+    // `autonomous.roleRunner.roster.enabled` (+ `.issue`), resolved once at
+    // startup from the daemon's primary workspace — the roster is a
+    // fleet-wide, host-level concern like the static shard posture above, not
+    // a per-workspace one. Disabled (the default) spawns nothing and makes
+    // zero extra forge calls. Purely observational in this phase: it does not
+    // affect `role_shard::decide()`'s verdict — see that function's own
+    // module docs and `defaults/docs/role-runner-roster.md`.
+    let _roster_heartbeat_handle =
+        role_runner::spawn_roster_heartbeat_task(sweep_workspace.clone());
+
+    // Reactive main-health backstop loop (Issue #3812 — Phase C of epic #3809).
+    // Opt-in via `LOOM_MAIN_HEALTH_GATE` AND a `buildGate` block in
+    // `.loom/config.json`. On a red `main` (a non-zero `buildGate.command`) it
+    // sets `main_health_state` halted, which stops the work-finder above from
+    // dispatching new sweeps until a green run clears it. The gate command runs
+    // on a blocking thread (it may take minutes), so a plain `tokio::spawn`
+    // interval task on the shared runtime is correct (like the reaper).
+    // Config surface (#3813): `autonomous.mainHealthGate.enabled` can enable the
+    // gate from committed config; `LOOM_MAIN_HEALTH_GATE` remains the master
+    // on/off override (precedence env > config > default). The gate's *behavior*
+    // (command, timeout) still comes from the separate `buildGate` block, so
+    // Phase C's tested semantics are unchanged.
+    // Multi-workspace fan-out (#3930): the gate loop re-reads `effective_roots()`
+    // each cycle and runs one gate check per registered root, writing into that
+    // root's own `MainHealthState` in `workspace_health_states`. A red repo halts
+    // only its own dispatch. Per-root enablement + `buildGate` config are read
+    // from each repo's own `.loom/config.json` inside the loop, so no single
+    // up-front buildGate resolution is needed. The startup master switch is still
+    // the daemon's own workspace config (env > config), mirroring how the
+    // work-finder / epic-supervisor loops are gated at startup by `sweep_workspace`.
+    let autonomous_gate_config = main_health_gate::read_autonomous_gate_config(&sweep_workspace);
+    let _main_health_gate_handle = if main_health_gate::resolve_enabled(&autonomous_gate_config) {
+        let interval = main_health_gate::resolve_interval();
+        log::info!("main_health_gate: enabled (multi-workspace, interval={}s)", interval.as_secs());
+        Some(main_health_gate::spawn_multi_main_health_gate_task(
+            workspace_health_states.clone(),
+            sweep_workspace.clone(),
+            interval,
+        ))
+    } else {
+        log::debug!("main_health_gate: disabled (set LOOM_MAIN_HEALTH_GATE=1 or autonomous.mainHealthGate.enabled=true + a buildGate config to enable)");
+        None
+    };
+
+    // Autonomous token-ranking refresh loop (Issue #3969): the daemon itself
+    // periodically re-probes each registered repo's token pool and rewrites
+    // `.loom/tokens/.ranking` (atomically — same script an operator's cron used
+    // to run by hand: `probe-tokens.sh --ranking` / `loom-daemon tokens check
+    // --ranking`), so token selection's ranking tier stays fresh without a
+    // standing manual/cron step. Unlike the work-finder and main-health-gate
+    // loops above, this is **default-ON** — it only ever reads rate-limit
+    // headers and rewrites a bookkeeping file with no dispatch side effect, so
+    // an absent daemon-side refresher would silently regress every install back
+    // to the stale-ranking failure mode this issue exists to fix. Config
+    // surface: `autonomous.tokenRankingRefresh.{enabled,intervalSecs}`,
+    // precedence env > config > default (env:
+    // `LOOM_TOKEN_RANKING_REFRESH` / `LOOM_TOKEN_RANKING_REFRESH_INTERVAL_SECS`).
+    // An operator cron running the identical script concurrently is harmless —
+    // the underlying `loom-daemon tokens check --ranking` write is atomic, so the two
+    // refreshers can race to schedule a write but never to a torn file.
+    let token_ranking_refresh_config =
+        token_ranking_refresh::read_token_ranking_refresh_config(&sweep_workspace);
+    let _token_ranking_refresh_handle =
+        if token_ranking_refresh::resolve_enabled(&token_ranking_refresh_config) {
+            let interval = token_ranking_refresh::resolve_interval(&token_ranking_refresh_config);
+            log::info!(
+                "token_ranking_refresh: enabled (multi-workspace, interval={}s)",
+                interval.as_secs()
+            );
+            Some(token_ranking_refresh::spawn_multi_token_ranking_refresh_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "token_ranking_refresh: disabled (set LOOM_TOKEN_RANKING_REFRESH=0 or \
+             autonomous.tokenRankingRefresh.enabled=false to opt out)"
+            );
+            None
+        };
+
+    // Fleet-captain singleton tasks that own their loop (`fleet_singletons`):
+    // the GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
+    // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
+    // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
+    // is on; and the intake reconcile singleton (W7), a config read per tick
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer;
+    // and the shard-owned `loom:blocked` release task (#10763).
+    // The release task serves only through a loop that actually started (#10763
+    // P2), so the role-runner decision is resolved here, once, and reused below.
+    let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
+    let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
+    let loops = (_work_finder_handle.is_some(), role_runner_on).into(); // (work finder, role runner)
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus, loops);
+
+    // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
+    let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
+
+    // Periodic merged-PR worktree reaper (Issue #4876). Before this loop the
+    // ONLY trigger for "auto-removed when their PR merges" (CLAUDE.md's stated
+    // contract) was `merge-pr.sh`'s synchronous `_remove_loom_worktree()` — so a
+    // PR merged on a different HOST, in a different CHECKOUT, through the forge
+    // UI/API, or while the daemon was down left its worktree behind forever.
+    // Across a three-host fleet that leaked 44 worktrees (81% disk) on one
+    // worker and 35 on the primary host. This loop makes every host reap its own
+    // worktrees from forge state on a cadence, independent of who merged.
+    //
+    // Multi-workspace like the health gate / ranking refresh: it walks
+    // `effective_roots()` each tick, so cleanup is NOT limited to the daemon's
+    // attached workspace (a daemon attached to `~/GitHub/anvil` still reaps
+    // `~/GitHub/loom` when that repo is registered).
+    //
+    // Default-ON (like the ranking refresh, unlike the work finder / gate): it
+    // restores an already-documented behavior, and its removal decision is
+    // `worktree_ops::clean::classify_worktree` under `--safe, !--force` PLUS a
+    // `.loom-managed` sentinel requirement the interactive CLI does not apply —
+    // i.e. a strict subset of what `loom-daemon clean --safe` would remove.
+    // Opt out with `LOOM_WORKTREE_REAPER=0` / `autonomous.worktreeReaper.enabled=false`.
+    //
+    // The same loop also carries the orphaned-PROCESS reaper (#5110): an agent's
+    // background process tree can outlive the agent, reparent to `systemd`, and
+    // keep working forever (one such driver held a worker at load 65 for 5h52m).
+    // Both passes answer the same question about the same worktrees — "does
+    // anything still own issue-N?" — so they share a tick. Each has its own
+    // enable knob, and either one being on is enough to start the loop.
+    //
+    // It also carries the primary-checkout reaper (#5268): a registered root's
+    // OWN `HEAD` can get parked on a dead branch (no PR ever opened, or a PR
+    // that closed without merging) and stay there forever — nothing else
+    // touches the primary checkout's branch. Same tick, same "each has its own
+    // enable knob, any one being on starts the loop" shape.
+    let worktree_reaper_config = worktree_reaper::read_worktree_reaper_config(&sweep_workspace);
+    let process_reaper_config = orphan_process_reaper::read_config(&sweep_workspace);
+    let primary_checkout_reaper_config = primary_checkout_reaper::read_config(&sweep_workspace);
+    let worktree_reaper_on = worktree_reaper::resolve_enabled(&worktree_reaper_config);
+    let process_reaper_on = orphan_process_reaper::resolve_enabled(&process_reaper_config);
+    let primary_checkout_reaper_on =
+        primary_checkout_reaper::resolve_enabled(&primary_checkout_reaper_config);
+    let _worktree_reaper_handle =
+        if worktree_reaper_on || process_reaper_on || primary_checkout_reaper_on {
+            let interval = worktree_reaper::resolve_interval(&worktree_reaper_config);
+            log::info!(
+                "worktree_reaper: enabled (multi-workspace, interval={}s, worktrees={}, \
+                 orphan_processes={}, primary_checkout={})",
+                interval.as_secs(),
+                worktree_reaper_on,
+                process_reaper_on,
+                primary_checkout_reaper_on
+            );
+            Some(worktree_reaper::spawn_multi_worktree_reaper_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "worktree_reaper: disabled (set LOOM_WORKTREE_REAPER=0 or \
+                 autonomous.worktreeReaper.enabled=false to opt out; \
+                 LOOM_ORPHAN_PROCESS_REAPER=0 / autonomous.processReaper.enabled=false \
+                 for the orphaned-process pass; LOOM_PRIMARY_CHECKOUT_REAPER=0 / \
+                 autonomous.primaryCheckoutReaper.enabled=false for the primary-checkout pass)"
+            );
+            None
+        };
+
+    // Stash-summary cache-refresh loop (Issue #7526): keeps
+    // `quarantine_stash_status`'s per-root `StashSummary` cache warm so
+    // `build_daemon_status` never has to shell out to `git stash list`
+    // synchronously — see that module's doc comment for the fleet
+    // measurement that motivated it. Always-on, no enable knob (like
+    // `token_ranking_refresh`): a read-only cache-warmer with no destructive
+    // or dispatch side effect.
+    let _stash_summary_refresh_handle = {
+        let interval = quarantine_stash_status::DEFAULT_STASH_SUMMARY_REFRESH_INTERVAL;
+        // Duration's Debug renders whole seconds as `<n>s`, same text as before.
+        log::info!("quarantine_stash_status: enabled (multi-workspace, interval={interval:?})");
+        quarantine_stash_status::spawn_multi_stash_summary_refresh_task(
+            sweep_workspace.clone(),
+            interval,
+        )
+    };
+
+    // Install/host invariant self-check (#5035): periodically verify the
+    // install/host invariants the daemon's own operation depends on — the MCP
+    // bundle loads, `.loom/runtimes/` is populated for the configured runtimes,
+    // and the token `.ranking` is fresh — repairing the mechanically-safe drift
+    // and filing one deduped issue per non-repairable condition. **Default-off**
+    // (FLAGS-OFF) and **report-only by default** even when enabled, so the check
+    // can be trusted before it is allowed to act. Same multi-workspace
+    // spawn_blocking shape as the reaper; the checks are filesystem reads and
+    // any repair is timeout-guarded, so a pass can never wedge dispatch.
+    let install_self_check_config = install_self_check::read_config(&sweep_workspace);
+    let _install_self_check_handle =
+        if install_self_check::resolve_enabled(&install_self_check_config) {
+            let interval = install_self_check::resolve_interval(&install_self_check_config);
+            let repair = install_self_check::resolve_repair(&install_self_check_config);
+            log::info!(
+                "install_self_check: enabled (multi-workspace, interval={}s, repair={})",
+                interval.as_secs(),
+                repair
+            );
+            Some(install_self_check::spawn_multi_install_self_check_task(
+                sweep_workspace.clone(),
+                interval,
+            ))
+        } else {
+            log::debug!(
+                "install_self_check: disabled (set LOOM_INSTALL_SELF_CHECK=1 or \
+                 autonomous.installSelfCheck.enabled=true to opt in)"
+            );
+            None
+        };
+
+    // The declared-cadence liveness heartbeat (Issue #4011) used to be spawned
+    // here. It now starts much earlier — immediately after credential
+    // preflight, above the rate-limit breaker registration and the startup
+    // reconciliation passes — so it (and the pidfile / IPC socket bind
+    // further below) are never delayed by a slow reconciliation pass (Issue
+    // #7974). `heartbeat_interval` (still needed below, by the marker
+    // healing) is bound there.
+
+    // Startup autonomy-desired marker healing (Issue #4331). The marker is the
+    // durable "a daemon is EXPECTED on this host" signal the watchdog + status
+    // key off (#4011). `loom-daemon restart` (#4054), the in-daemon self-update
+    // loop, and a bare launchd/systemd relaunch all bring up a fresh daemon
+    // WITHOUT re-running the start script's `write_intent_marker` — so an ABSENT
+    // marker was never healed, leaving a supervised daemon running with crash
+    // protection silently disarmed. This single startup choke point covers all
+    // three paths: if the daemon is supervised and the marker is absent, re-write
+    // it. An unsupervised (`--foreground`/nohup/debug) run never writes one — it
+    // must not arm the host-side pager for a process nothing will relaunch.
+    // #9588: the per-outcome logging lives beside the outcomes.
+    autonomy_marker::log_heal_outcome(autonomy_marker::heal_on_startup(
+        heartbeat_interval.as_secs(),
+    ));
+
+    // Startup supervision drop-in (#11111): a floor roll relaunches onto a new
+    // binary without re-rendering the unit, so write #11058's supervision
+    // settings as a drop-in and `daemon-reload`; systemd applies them at this
+    // daemon's next exit. systemd on Linux only; failures log at WARN. On its
+    // own thread so a wedged user manager cannot delay startup.
+    if let Err(e) = std::thread::Builder::new()
+        .name("supervision-dropin".to_string())
+        .spawn(loom_daemon::daemon_start::supervision_dropin::ensure_on_startup)
+    {
+        log::warn!(
+            "supervision drop-in: could not spawn its startup thread ({e}); the unit keeps \
+             its current supervision settings until the next startup"
+        );
+    }
+
+    // Watchdog-provisioning-guard loop (Issue #5405): #5343's
+    // heal_watchdog_provisioning_gap() only fires as a side effect of
+    // RE-RUNNING loom-daemon-start.sh — a host that was provisioned before
+    // #5343 and simply keeps running forever never gets healed, because
+    // nothing host-resident ever notices the gap. This periodic loop is that
+    // host-resident notice: every interval it re-invokes
+    // `loom-daemon-start.sh --heal-watchdog-only` (a narrow entry point that
+    // performs ONLY the watchdog heal and can never reach the daemon-start
+    // path, so it can never disturb this running daemon), which is a cheap
+    // no-op on any host that already has a marker+watchdog pair and a pure
+    // filesystem read on any host with no autonomy-desired marker at all.
+    // Default-on like the marker healing above (crash-protection class, not
+    // a FLAGS-OFF dispatch-affecting loop) — opt out with
+    // LOOM_WATCHDOG_PROVISIONING_GUARD=0 or
+    // autonomous.watchdogProvisioningGuard.enabled=false.
+    let watchdog_guard_config = watchdog_provisioning_guard::read_config(&sweep_workspace);
+    let _watchdog_provisioning_guard_handle =
+        if watchdog_provisioning_guard::resolve_enabled(&watchdog_guard_config) {
+            let interval = watchdog_provisioning_guard::resolve_interval(&watchdog_guard_config);
+            Some(watchdog_provisioning_guard::spawn_watchdog_provisioning_guard_task(
+                sweep_workspace.clone(),
+                interval,
+                watchdog_provisioning_guard::default_heal_timeout(),
+            ))
+        } else {
+            log::debug!(
+                "watchdog_provisioning_guard: disabled (set LOOM_WATCHDOG_PROVISIONING_GUARD=0 or \
+                 autonomous.watchdogProvisioningGuard.enabled=false to opt out) (#5405)"
+            );
+            None
+        };
+
+    // Autonomous periodic support-role runner (Issue #4015): dispatches the
+    // standalone support roles (Champion, Curator, Judge, Auditor, Guide)
+    // host-side through `spawn-claude.sh` on their own per-role cadence,
+    // drawing from the SAME rotated, health-ranked token pool sweeps already
+    // use via `sweep_registry` — instead of relying solely on the GitHub
+    // Actions cron workflows (`.github/workflows/loom-*.yml`), which
+    // authenticate with a single static `CLAUDE_API_KEY` secret with no
+    // rotation and no health-awareness. Opt-in via `LOOM_ROLE_RUNNER` (or
+    // `autonomous.roleRunner.enabled=true`) — like the work-finder and
+    // main-health-gate loops above, this has dispatch-affecting side effects
+    // (each tick is a full `claude -p "/<role>"` session that can mutate
+    // issues/PRs), so an absent config leaves the daemon's behavior
+    // byte-for-byte unchanged. The Actions workflows remain a supported
+    // fallback for deployments with no always-on daemon.
+    //
+    // One task is spawned per [`role_runner::DEFAULT_ROLES`] entry,
+    // unconditionally — each on its own multi-workspace loop
+    // (`role_runner::spawn_multi_role_task`), mirroring the token-ranking
+    // refresh loop's re-fan-out-every-tick shape. This intentionally does
+    // **not** filter the spawned set through
+    // `role_runner::resolve_roles(&role_runner_config)` (issue #5654):
+    // `role_runner`'s own module doc and `resolve_roles`'s doc both describe
+    // `autonomous.roleRunner.roles` as a **per-repo** allowlist, resolved
+    // fresh inside `spawn_multi_role_task`'s loop from each *registered*
+    // root's own config (`role_runner.rs`'s per-tick `resolve_roles(&config)`
+    // check) — but until #5654, the SET OF LOOPS SPAWNED HERE was gated on
+    // `resolve_roles(&role_runner_config)` where `role_runner_config` comes
+    // from `sweep_workspace` alone (this daemon's own home/`LOOM_WORKSPACE`
+    // directory, which is not even guaranteed to be one of the registered
+    // fleet roots — see `WorkspaceRegistry::effective_roots`). A role absent
+    // from *that one directory's* pinned `roles` list therefore never got a
+    // loop at all, silently zeroing it out fleet-wide regardless of what any
+    // of the other registered repos wanted — the root cause of "doctor is
+    // never admitted on one host while hermit/auditor run" (#5654). Spawning
+    // unconditionally for every `DEFAULT_ROLES` entry restores the
+    // documented per-repo model: the home workspace's own
+    // `roleRunner.roles` now only affects the home workspace's own
+    // participation (via the existing per-root check), never any other
+    // repo's.
+    let _role_runner_handles = if role_runner_on {
+        // Purely informational (#5654): the home workspace's own resolved
+        // list no longer gates which loops are spawned below, but logging it
+        // alongside the full `DEFAULT_ROLES` set makes a divergence between
+        // the two visible at startup instead of only inferable from a
+        // per-repo `DEBUG` line at tick time.
+        let home_resolved = role_runner::resolve_roles(&role_runner_config);
+        log::info!(
+            "role_runner: enabled (multi-workspace, spawning all {} DEFAULT_ROLES loop(s): {}); \
+             {}'s own resolved autonomous.roleRunner.roles = [{}] ({} entries) — informational \
+             only, no longer gates which loops are spawned (#5654)",
+            role_runner::DEFAULT_ROLES.len(),
+            role_runner::DEFAULT_ROLES
+                .iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            sweep_workspace.display(),
+            home_resolved
+                .iter()
+                .map(|r| r.name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            home_resolved.len(),
+        );
+        // Cross-host role-tick collision detection (#4623), the role-runner
+        // counterpart of #4085's sweep-dispatch probe. Resolved per registered
+        // root at tick time (a root can opt in/out on its own); this line
+        // reports the daemon workspace's own resolution so an operator can
+        // confirm the toggle took effect. Detection only — a detected
+        // collision is logged/counted, never acted on.
+        log::info!(
+            "role_runner: cross-host collision detection {} for {} (#4623; \
+             LOOM_ROLE_RUNNER_DETECT_COLLISIONS > autonomous.roleRunner.collisionDetection > \
+             autonomous.collisionDetection.enabled)",
+            if role_collision::resolve_detection_enabled(&sweep_workspace) {
+                "ENABLED"
+            } else {
+                "disabled"
+            },
+            sweep_workspace.display()
+        );
+        let handles: Vec<_> = role_runner::DEFAULT_ROLES
+            .iter()
+            .map(|spec| {
+                // #6204: log the resolved cadence *with the tier that supplied
+                // it* (built-in / config / env). A uniform interval across
+                // every role is the expected shape of an override — but with
+                // no source in the line it reads as the per-role built-ins
+                // having silently stopped applying, which is how #6204 was
+                // filed against an inherited `LOOM_ROLE_RUNNER_INTERVAL_SECS`.
+                let interval = role_runner::resolve_interval_for_role(spec, &role_runner_config);
+                log::info!(
+                    "{}",
+                    role_runner::resolved_interval_log_line(
+                        &sweep_workspace,
+                        spec,
+                        &role_runner_config
+                    )
+                );
+                role_runner::spawn_multi_role_task(
+                    *spec,
+                    sweep_workspace.clone(),
+                    interval,
+                    drain_flag.clone(),
+                    role_in_progress.clone(),
+                    // #7607: a role tick that skips its spawn on an exhausted
+                    // token pool feeds the same fleet-wide #6614 empty-pool
+                    // brake a sweep's token-selection death does, so the
+                    // advisory trips regardless of which path noticed first.
+                    Some(workspace_pool.clone() as Arc<dyn role_runner::PoolExhaustedObserver>),
+                )
+            })
+            .collect();
+        Some(handles)
+    } else {
+        // #6469: this MUST land at `info!`, not `debug!` — a fleet running at
+        // INFO (the normal level) silently boots with zero trace that role
+        // loops are off, which is exactly the "the daemon is silent about the
+        // single most consequential switch on the host" symptom the issue was
+        // filed against. `log_role_runner_disabled` names the tier that
+        // resolved the off state and the scope, mirroring the enabled
+        // branch's own `log::info!` above.
+        role_runner::log_role_runner_disabled(&sweep_workspace, &role_runner_config);
+        None
+    };
+
+    // Durable watch-monitor loop (Issue #3971): the daemon polls the forge for
+    // the terminal state of operator-registered issue/PR watches
+    // (`~/.loom/watches.json`) and appends resolutions to
+    // `~/.loom/logs/watch-results.log`. Because the watch lives in a file the
+    // long-lived daemon owns, an operator's watch survives their Claude Code
+    // session dying — the failure this issue exists to fix. Like the
+    // token-ranking refresh above (and unlike the dispatch-affecting work-finder
+    // / main-health-gate loops) it is **default-ON**: it has no dispatch side
+    // effect and makes ZERO forge calls until an operator registers a watch.
+    // Config surface: `autonomous.watchMonitor.{enabled,intervalSecs,expirySecs}`,
+    // precedence env > config > default (env: `LOOM_WATCH_MONITOR` /
+    // `LOOM_WATCH_MONITOR_INTERVAL_SECS` / `LOOM_WATCH_MONITOR_EXPIRY_SECS`).
+    let watch_monitor_config = watch_registry::read_watch_monitor_config(&sweep_workspace);
+    let _watch_monitor_handle = if watch_registry::resolve_enabled(&watch_monitor_config) {
+        let interval = watch_registry::resolve_interval(&watch_monitor_config);
+        let expiry = watch_registry::resolve_expiry(&watch_monitor_config);
+        log::info!(
+            "watch_monitor: enabled (interval={}s, expiry={}s)",
+            interval.as_secs(),
+            expiry.as_secs()
+        );
+        Some(watch_registry::spawn_watch_monitor_task(
+            watch_registry::GhWatchProbe::new(),
+            interval,
+            expiry,
+            event_bus.clone(),
+            sweep_workspace.clone(),
+        ))
+    } else {
+        log::debug!(
+            "watch_monitor: disabled (set LOOM_WATCH_MONITOR=1 or \
+             autonomous.watchMonitor.enabled=true to opt in)"
+        );
+        None
+    };
+
+    // Autonomous self-update loop (Issue #4055 — Phase 3 of #4017). Without a fleet
+    // store, opt-in via `LOOM_AUTO_UPDATE` / `autonomous.autoUpdate.enabled`. When the daemon's own
+    // source checkout advances past the commit this binary was built from, the
+    // loop rebuilds + provisions (reusing `loom-daemon-update.sh --no-restart`)
+    // and rolls onto the fresh binary via pause-and-roll (#10831) — every
+    // in-flight agent is paused at a safe point or requeued, then the daemon
+    // restarts. Gated on a clean tree, a settle
+    // window, zero in-flight sweeps (`ipc::count_in_flight_sweeps`), and exponential
+    // backoff with a terminal give-up state, all surfaced in `loom-daemon status`.
+    //
+    // Unlike the per-workspace loops above this is spawned exactly **once** for the
+    // whole daemon (its subject is the daemon process itself — one binary, one
+    // source checkout, one restart), NOT a `spawn_multi_*` per-workspace fan-out.
+    // Config is read from the daemon's default workspace, like the sibling readers.
+    // #10954: spawned on every fleet host (fleet_sync::start ran above), and on a
+    // host with no fleet store only when autoUpdate is enabled — see `loop_mode`.
+    let _auto_update_handle =
+        auto_update::loop_mode::start(&sweep_workspace, &workspace_pool, &drain_state, &event_bus);
+
+    // Independent, opt-in idle exit (#4467). The daemon only exits; the host
+    // guard retains sole authority to power off.
+    let idle_exit_config = idle_exit::read_config(&sweep_workspace);
+    let _idle_exit_handle = if idle_exit::resolve_enabled(&idle_exit_config) {
+        let minutes = idle_exit::resolve_minutes(&idle_exit_config);
+        let starvation = idle_exit::resolve_starvation(&idle_exit_config);
+        if loom_daemon::ipc::detect_supervisor().as_deref() == Some("launchd") {
+            log::warn!(
+                "idle_exit: ENABLED under launchd; KeepAlive:SuccessfulExit relaunches exit(0), \
+                 so idle exit is meaningful only under on-failure-style supervision"
+            );
+        }
+        log::info!("idle_exit: enabled (idle_minutes={minutes}, on_token_starvation={starvation})");
+        Some(idle_exit::spawn_task(
+            idle_exit_config,
+            sweep_workspace.clone(),
+            workspace_pool.clone(),
+            role_in_progress.clone(),
+            event_bus.clone(),
+            socket_path.clone(),
+        ))
+    } else {
+        log::debug!("idle_exit: disabled (opt in with autonomous.idleExit.enabled=true)");
+        None
+    };
+
+    // Read-only observer side channels — telemetry export (#4705) and the
+    // forge event feed (ADR-0021, #8765). Both opt-in, both off by default,
+    // neither able to change what any dispatch path does. See
+    // `observer_tasks` for why they share a call site.
+    let _observer_handles =
+        observer_tasks::spawn(&sweep_workspace, &event_bus, workspace_pool.clone());
+
+    // Start IPC server. `workspace_health_states` is threaded in so the
+    // `DaemonStatus` request can report each registered repo's own halt state
+    // (#3930), and `sweep_workspace` is the `effective_roots` fallback for the
+    // per-repo status breakdown — the same values the work-finder and gate loop
+    // share above. `credential_preflight` (#4005) is threaded in so
+    // `DaemonStatus` can report the startup credential resolution computed
+    // once above, without reading logs.
+    let server = IpcServer::new(
+        socket_path.clone(),
+        tm,
+        activity_db,
+        sweep_registry,
+        event_bus,
+        workspace_health_states.clone(),
+        workspace_pool.clone(),
+        sweep_workspace.clone(),
+        credential_preflight,
+        drain_state.clone(),
+    );
+
+    // Setup signal handler for graceful shutdown. We listen for BOTH SIGINT
+    // (Ctrl-C, interactive) and SIGTERM (`kill <pid>`, the default signal a
+    // backgrounded daemon receives from `loom-daemon-stop.sh` — #3813). Either
+    // one removes the socket and exits cleanly so a subsequent start does not
+    // trip the singleton guard on a stale socket.
+    //
+    // In-flight `/loom:sweep` children are NOT cancelled on shutdown — they are
+    // independent detached processes and survive a daemon restart by design
+    // (killing the dispatcher must not kill dispatched work). This is the
+    // documented "survive, don't drain" decision (see daemon-reference.md).
+    let socket_path_clone = socket_path.clone();
+    tokio::spawn(async move {
+        let signal_name = wait_for_shutdown_signal().await;
+        log::info!("Received {signal_name}, cleaning up...");
+        // Signal the off-runtime epic supervisor loop to stop.
+        if let Some(flag) = &supervisor_shutdown {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = tokio::fs::remove_file(&socket_path_clone).await;
+        // Issue #6129: name this explicitly in the daemon's own log, not just
+        // in loom-daemon-stop.sh's stdout — a raw `systemctl --user stop
+        // loom-daemon` / `launchctl bootout` never runs that script, so its
+        // stdout notice is the only place an operator who bypassed the
+        // wrapper would ever see this. In-flight sweep children and
+        // scheduled role-agent ticks (Champion/Curator/Judge/Doctor/Guide/…)
+        // are intentionally left running by this stop (see the module-level
+        // "survive, don't drain" comment above) — on a Linux systemd --user
+        // host they can also be architecturally DETACHED from this process
+        // (a `systemd-run --user --scope` scope parented to the user
+        // manager, not to this daemon; issue #5111's CPU-quota mechanism).
+        // `loom-daemon-quiesce.sh` is the explicit, single-command way to
+        // stop dispatch AND every one of those children, the same way on
+        // launchd and systemd.
+        log::info!(
+            "In-flight sweeps and role agents (if any) are intentionally left running by this stop. \
+             To also stop them, run: .loom/scripts/cli/loom-daemon-quiesce.sh (issue #6129)."
+        );
+        // Exit code carries shutdown intent (Issue #4054, Curator Finding 1):
+        // under launchd `KeepAlive:SuccessfulExit` a clean exit(0) triggers a
+        // relaunch, so a signal-driven stop MUST exit non-zero — otherwise an
+        // operator stop would race launchd into relaunching the daemon. Only the
+        // `RestartDaemon` primitive exits 0. SIGTERM => 143, SIGINT => 130.
+        let code = if signal_name == "SIGTERM" {
+            loom_daemon::ipc::EXIT_SIGTERM
+        } else {
+            loom_daemon::ipc::EXIT_SIGINT
+        };
+        // #6388: this process cannot know operator INTENT from a signal alone
+        // (a stray SIGTERM — e.g. an unrelated test run — looks identical to
+        // a deliberate stop here) — only the autonomy-desired marker records
+        // intent, and only loom-daemon-watchdog.sh reads it. So this log line
+        // states the fact ("signal received"), not a judgment about why.
+        log::info!(
+            "Socket cleaned up, exiting {code} ({signal_name} received — no supervised relaunch)"
+        );
+        loom_daemon::observability::shutdown::exit(code).await;
+    });
+
+    log::info!("Loom daemon starting...");
+    server.run().await?;
+
+    Ok(())
+}
+
+/// Await either SIGINT (Ctrl-C) or, on Unix, SIGTERM (`kill <pid>`), returning a
+/// short human-readable name for whichever fired first. On non-Unix platforms
+/// only Ctrl-C is available. Introduced in #3813 so a backgrounded daemon shut
+/// down via `kill` (SIGTERM) cleans up its socket exactly like an interactive
+/// Ctrl-C, rather than being torn down by the default SIGTERM disposition with
+/// the socket left behind.
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If a signal stream cannot be installed, fall back to Ctrl-C only
+        // rather than aborting shutdown handling entirely.
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => {
+                        if let Err(err) = r {
+                            log::error!("Unable to listen for Ctrl-C: {err}");
+                        }
+                        "SIGINT (Ctrl-C)"
+                    }
+                    _ = sigterm.recv() => "SIGTERM",
+                }
+            }
+            Err(err) => {
+                log::error!("Unable to install SIGTERM handler ({err}); listening for Ctrl-C only");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    log::error!("Unable to listen for Ctrl-C: {err}");
+                }
+                "SIGINT (Ctrl-C)"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            log::error!("Unable to listen for Ctrl-C: {err}");
+        }
+        "SIGINT (Ctrl-C)"
+    }
+}
+
+fn check_tmux_installed() -> Result<()> {
+    Command::new("which")
+        .arg("tmux")
+        .output()?
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| anyhow!("tmux not installed. Install with: brew install tmux"))
+}
+
+/// Resolve the daemon's loom directory: the parent of `LOOM_SOCKET_PATH` when
+/// that env var is set (test isolation), else `$HOME/.loom`. Pure — no side
+/// effects (no directory creation), so it's safe to call from `setup_logging()`
+/// (which runs before `main()`'s own `loom_dir`/`socket_path` resolution block)
+/// as well as from `main()` and `resolve_socket_path()` without duplicating the
+/// branching logic three times over.
+pub(crate) fn resolve_loom_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        let socket_path = PathBuf::from(path);
+        let loom_dir = socket_path
+            .parent()
+            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
+            .to_path_buf();
+        return Ok(loom_dir);
+    }
+    let loom_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("No home directory"))?
+        .join(".loom");
+    Ok(loom_dir)
+}
+
+/// Resolve the daemon log file path: `LOOM_DAEMON_LOG` (full override) when
+/// set, else `<loom dir>/daemon.log` derived from [`resolve_loom_dir`]. This
+/// means `LOOM_SOCKET_PATH`-style test isolation covers the log file for free
+/// — a test daemon pointed at a tempdir socket also logs into that tempdir,
+/// never into the operator's `~/.loom/daemon.log` (Issue #4010). Precedence is
+/// env > default only; see #4010 for why a config tier is out of scope here
+/// (`setup_logging()` runs before workspace/config resolution).
+fn resolve_log_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LOOM_DAEMON_LOG") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(resolve_loom_dir()?.join("daemon.log"))
+}
+
+fn setup_logging() -> Result<()> {
+    let log_path = resolve_log_path()?;
+
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Rotate log file if it exceeds 10MB (keeps last 10 files)
+    rotate_log_file(&log_path, 10 * 1024 * 1024, 10)?;
+
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    // Issue #8504: every machine-readable timestamp `loom-daemon` writes is
+    // UTC with an explicit `Z` designator, so it can never be mistaken for
+    // (or silently drift into) the host's local time — this is the daemon's
+    // own log-line prefix, read and correlated across a fleet of hosts in
+    // different timezones. `loom_daemon::health::DAEMON_LOG_STAMP_FORMAT` is
+    // the SAME constant `health::parse_log_line_stamp` reads back with, so
+    // the write and read sides cannot drift apart.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{}] [{}] {}",
+                chrono::Utc::now().format(loom_daemon::health::DAEMON_LOG_STAMP_FORMAT),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+
+    log::info!("Daemon logging initialized to {}", log_path.display());
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod resolve_paths_tests {
+    //! Tests for [`resolve_loom_dir`] and [`resolve_log_path`] (Issue #4010).
+    //!
+    //! `setup_logging()` itself is deliberately NOT unit-tested here: it calls
+    //! `env_logger::Builder::...init()`, which panics if called a second time
+    //! in the same process. Splitting the pure path-resolution logic out into
+    //! these two functions is exactly what makes it testable at all.
+    //!
+    //! Every test below mutates the process-global `LOOM_SOCKET_PATH` /
+    //! `LOOM_DAEMON_LOG` env vars, so they're `#[serial(loom_socket_path_env)]`
+    //! (the crate already depends on `serial_test` for this exact purpose — see
+    //! `dispatch_tests` below) to avoid racing other env-mutating tests in the
+    //! same binary. The key is NAMED, not the default/unnamed `#[serial]`:
+    //! `serial_test` gives each key its own independent lock, so a bare
+    //! `#[serial]` here would not exclude `daemon_heartbeat.rs`'s or
+    //! `watchdog_provisioning_guard.rs`'s socket-path tests, which are on
+    //! `loom_socket_path_env`. That mismatch (#6177's shape) let a concurrent
+    //! `remove_var("LOOM_SOCKET_PATH")` from these tests redirect
+    //! `daemon_heartbeat.rs`'s live writer task at `$HOME/.loom` and write a
+    //! real `daemon.heartbeat` on the host running `cargo test` (#8077).
+    use super::{resolve_log_path, resolve_loom_dir};
+    use serial_test::serial;
+
+    #[test]
+    #[serial(loom_socket_path_env)]
+    fn resolve_loom_dir_defaults_to_home_loom() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        let expected = dirs::home_dir().expect("home dir").join(".loom");
+        assert_eq!(resolve_loom_dir().expect("resolve"), expected);
+    }
+
+    #[test]
+    #[serial(loom_socket_path_env)]
+    fn resolve_loom_dir_honors_socket_path_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("loom-daemon.sock");
+        std::env::set_var("LOOM_SOCKET_PATH", &socket_path);
+
+        let resolved = resolve_loom_dir().expect("resolve");
+
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        assert_eq!(resolved, dir.path());
+    }
+
+    #[test]
+    #[serial(loom_socket_path_env)]
+    fn resolve_log_path_defaults_to_home_loom_daemon_log() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        let expected = dirs::home_dir()
+            .expect("home dir")
+            .join(".loom")
+            .join("daemon.log");
+        assert_eq!(resolve_log_path().expect("resolve"), expected);
+    }
+
+    #[test]
+    #[serial(loom_socket_path_env)]
+    fn resolve_log_path_honors_loom_daemon_log_override() {
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::set_var("LOOM_DAEMON_LOG", "/tmp/some/d/daemon.log");
+
+        let resolved = resolve_log_path().expect("resolve");
+
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/some/d/daemon.log"));
+    }
+
+    /// `LOOM_DAEMON_LOG` must win even when `LOOM_SOCKET_PATH` is also set —
+    /// the explicit log override always takes precedence over the derived path.
+    #[test]
+    #[serial(loom_socket_path_env)]
+    fn resolve_log_path_daemon_log_wins_over_socket_path_derivation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("loom-daemon.sock");
+        std::env::set_var("LOOM_SOCKET_PATH", &socket_path);
+        std::env::set_var("LOOM_DAEMON_LOG", "/tmp/explicit/daemon.log");
+
+        let resolved = resolve_log_path().expect("resolve");
+
+        std::env::remove_var("LOOM_SOCKET_PATH");
+        std::env::remove_var("LOOM_DAEMON_LOG");
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/explicit/daemon.log"));
+    }
+}

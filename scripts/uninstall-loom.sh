@@ -1,0 +1,2105 @@
+#!/usr/bin/env bash
+# Uninstall Loom from a target repository
+#
+# AGENT USAGE INSTRUCTIONS:
+#   This script removes Loom orchestration from a target Git repository.
+#
+#   Non-interactive mode (for Claude Code):
+#     ./scripts/uninstall-loom.sh --yes /path/to/target-repo
+#     ./scripts/uninstall-loom.sh -y /path/to/target-repo
+#
+#   Interactive mode (prompts for confirmations):
+#     ./scripts/uninstall-loom.sh /path/to/target-repo
+#
+#   Force auto-merge (create PR and auto-merge):
+#     ./scripts/uninstall-loom.sh --force /path/to/target-repo
+#
+#   Local mode (remove files in working directory, no worktree/PR):
+#     ./scripts/uninstall-loom.sh --yes --local /path/to/target-repo
+#
+#   Clean mode (remove all files including unknown, for clean reinstall):
+#     ./scripts/uninstall-loom.sh --yes --local --clean /path/to/target-repo
+#
+#   Worktree removal (opt-in; see issue #5973):
+#     ./scripts/uninstall-loom.sh --yes --local --remove-worktrees /path/to/target-repo
+#
+#   By default, live `.loom/worktrees/issue-*` (and any other registered)
+#   worktrees under the target are PRESERVED by every mode, including
+#   --local (used by install.sh's --confirm-reinstall / --clean reinstall
+#   flows) -- a reinstall must not silently destroy a worktree an operator
+#   deliberately kept checked out between sessions. Pass --remove-worktrees
+#   to opt in; even then, each worktree is removed via `git worktree remove`
+#   (never a blind `rm -rf`), so one with uncommitted changes is skipped
+#   with a warning rather than destroyed, and every removed/skipped entry is
+#   named in the output.
+#
+#   What this script does:
+#     1. Validates target repository (must be a Git repo with Loom installed)
+#     2. Creates uninstall worktree (.loom/worktrees/loom-uninstall)
+#     3. Removes Loom files (based on defaults/ manifest)
+#     4. Smart-removes CLAUDE.md / AGENTS.md Loom sections and .gitignore patterns
+#     5. Prompts for unknown files (interactive mode)
+#     6. Creates pull request for review
+#
+#   Requirements:
+#     - Target must be a Git repository with Loom installed
+#     - GitHub CLI (gh) must be authenticated
+
+set -euo pipefail
+
+# Parse command line arguments
+NON_INTERACTIVE=false
+FORCE_AUTO_MERGE=false
+LOCAL_MODE=false
+CLEAN_MODE=false
+# Opt-in worktree removal (issue #5973). Default false -- a live
+# `.loom/worktrees/*` entry is left on disk unless this is explicitly set,
+# so a reinstall (which chains --local under the hood) never silently
+# destroys a worktree an operator kept checked out between sessions.
+REMOVE_WORKTREES=false
+# Plan-only mode (issue #5517): build and print the removal manifest (Steps
+# 1-3 below are pure enumeration/reporting, no writes) then exit 0 before
+# Step 4 (worktree creation) / Step 5 (file removal) / Step 6 (smart-remove
+# writes) ever run. Forces NON_INTERACTIVE so a dry run never blocks on stdin.
+DRY_RUN=false
+TARGET_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -y|--yes)
+      NON_INTERACTIVE=true
+      shift
+      ;;
+    -f|--force)
+      FORCE_AUTO_MERGE=true
+      shift
+      ;;
+    -l|--local)
+      LOCAL_MODE=true
+      shift
+      ;;
+    --clean)
+      CLEAN_MODE=true
+      shift
+      ;;
+    --remove-worktrees)
+      REMOVE_WORKTREES=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $0 [OPTIONS] /path/to/target-repo"
+      echo ""
+      echo "Options:"
+      echo "  -y, --yes    Non-interactive mode (preserve unknown files)"
+      echo "  -f, --force  Auto-merge the uninstall PR after creation"
+      echo "  -l, --local  Remove files in working directory (no worktree, no PR)"
+      echo "  --clean      Remove all files in managed directories (including unknown files)"
+      echo "  --remove-worktrees  Also remove live .loom/worktrees/* entries (opt-in, #5973)."
+      echo "               Preserved by default; a dirty worktree is skipped (with a warning)"
+      echo "               even with this flag -- only 'git worktree remove' (not 'rm -rf') is used."
+      echo "  --dry-run    Print the file removal plan and exit 0; removes nothing. Implies -y"
+      echo "               (never prompts)."
+      echo "  -h, --help   Show this help message"
+      exit 0
+      ;;
+    *)
+      TARGET_PATH="$1"
+      shift
+      ;;
+  esac
+done
+
+# --dry-run must never block on stdin -- force non-interactive so every
+# downstream prompt (unknown-file confirmation, final "Proceed?" prompt) is
+# skipped in favor of its non-interactive (report-only) branch.
+if [[ "$DRY_RUN" == "true" ]] && [[ "$NON_INTERACTIVE" != "true" ]]; then
+  NON_INTERACTIVE=true
+fi
+
+# Determine Loom repository root (where this script lives)
+LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Issue #5738: reuse provision-daemon.sh's `_pmd_cleanup_retired_shims` +
+# its safety-gate helper for Step 5b below, rather than duplicating the
+# loom-tools-ownership check. Self-contained (defines its own _pmd_* output
+# helpers), so sourcing it here has no other side effects.
+# shellcheck source=scripts/install/provision-daemon.sh
+source "$LOOM_ROOT/scripts/install/provision-daemon.sh"
+
+# ANSI color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+error() {
+  echo -e "${RED}✗ Error: $*${NC}" >&2
+  exit 1
+}
+
+info() {
+  echo -e "${BLUE}ℹ $*${NC}"
+}
+
+success() {
+  echo -e "${GREEN}✓ $*${NC}"
+}
+
+warning() {
+  echo -e "${YELLOW}⚠ Warning: $*${NC}"
+}
+
+header() {
+  echo -e "${CYAN}$*${NC}"
+}
+
+# ── Repo-owned ownership boundary inside .loom/ (issue #5971) ──────────────
+#
+# `.loom/` is Loom-managed but not Loom-exclusive: `.loom/hooks/` is an
+# extension point Loom itself invokes (worktree.sh runs post-worktree.sh) and
+# `.loom/roles/` accepts consumer-authored custom roles. Hook scripts are also
+# deliberately excluded from the installed-files manifest (epic #3835 Phase 5 /
+# #4262), so "absent from the manifest" can never mean "not yours" there.
+# Deleting such a file is unrecoverable and silent -- the hook simply stops
+# firing -- which is exactly the reported incident (a consumer repo's
+# .loom/hooks/post-worktree.sh vanished during a routine version upgrade).
+#
+# Two predicates gate every removal decision below:
+#
+#   _is_repo_owned   -- the repo DECLARED the path its own by listing its
+#                       .loom/-relative path in .loom/resync-ignore. Same file,
+#                       same exact-match semantics resync-installed.sh already
+#                       uses for "never overwrite this"; it now also means
+#                       "never delete this". See defaults/docs/repo-owned-files.md.
+#   _is_shipped_by_defaults
+#                    -- this Loom checkout's defaults/ tree ships a file at the
+#                       corresponding path, so the file is unambiguously Loom's.
+#
+# The Rust installer (loom-daemon init's clean sweep) applies the identical
+# rule -- see loom-daemon/src/init/repo_owned.rs.
+_is_repo_owned() {
+  # $1 = repo-relative path, e.g. ".loom/hooks/post-worktree.sh"
+  local ignore_file="$TARGET_PATH/.loom/resync-ignore"
+  [[ -f "$ignore_file" ]] || return 1
+  local rel="${1#.loom/}" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"                       # strip trailing comment
+    line="${line#"${line%%[![:space:]]*}"}"  # ltrim
+    line="${line%"${line##*[![:space:]]}"}"  # rtrim
+    [[ -z "$line" ]] && continue
+    line="${line#.loom/}"
+    [[ "$line" == "$rel" ]] && return 0
+  done < "$ignore_file"
+  return 1
+}
+
+_is_shipped_by_defaults() {
+  # $1 = repo-relative path under .loom/, e.g. ".loom/hooks/guard-destructive.sh"
+  [[ -f "$LOOM_ROOT/defaults/${1#.loom/}" ]]
+}
+
+# Cleanup function called on error
+cleanup_on_error() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 ]]; then
+    echo ""
+    warning "Uninstall failed at step: ${CURRENT_STEP:-unknown}"
+
+    if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -d "${TARGET_PATH}/${WORKTREE_PATH}" ]]; then
+      info "Cleaning up worktree: ${WORKTREE_PATH}..."
+      cd "$TARGET_PATH" 2>/dev/null || true
+      git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
+      if [[ -n "${BRANCH_NAME:-}" ]]; then
+        git branch -D "${BRANCH_NAME}" 2>/dev/null || true
+      fi
+    fi
+
+    echo ""
+    error "Uninstall did not complete. See above for details."
+  fi
+}
+
+trap cleanup_on_error EXIT
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
+
+# Validate arguments
+if [[ -z "$TARGET_PATH" ]]; then
+  error "Target repository path required\nUsage: $0 [--yes|-y] [--force|-f] /path/to/target-repo"
+fi
+
+# Export for sub-scripts
+export NON_INTERACTIVE
+export FORCE_AUTO_MERGE
+export LOCAL_MODE
+
+# Resolve target to absolute path
+TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
+  error "Target path does not exist: $TARGET_PATH"
+
+# If target is inside a worktree, resolve to the main repository root --
+# EXCEPT in --local mode (issue #5240). --local is documented above as
+# "Remove files in working directory (no worktree, no PR)": the caller wants
+# this script to operate exactly on the directory it was given, not on
+# whatever the main repository root happens to be. `install.sh`'s two
+# --quick-reinstall / --clean call sites rely on that contract: they chain
+# this uninstall directly into a synchronous reinstall that runs against the
+# SAME $TARGET_PATH right afterward. When $TARGET_PATH is a linked git
+# worktree, redirecting the uninstall (but not the subsequent reinstall) to
+# the main checkout silently splits the two operations across two different
+# directories -- the uninstall deletes/mutates files in the primary checkout
+# while the reinstall proceeds against the original worktree, corrupting a
+# live sibling checkout that may be in concurrent use. The redirect remains
+# in effect for the default (non-local, worktree+PR) mode, where it is safe:
+# that mode branches its own isolated worktree off origin/main before doing
+# any real work, so resolving the *input* target path to the main repository
+# root here only affects repo identification, never a write target.
+if [[ "$LOCAL_MODE" != "true" ]]; then
+  MAIN_WORKTREE=$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
+  if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
+    warning "Target path is inside a worktree: $TARGET_PATH"
+    info "Resolving to main repository root: $MAIN_WORKTREE"
+    TARGET_PATH="$MAIN_WORKTREE"
+  fi
+fi
+
+echo ""
+header "╔═══════════════════════════════════════════════════════════╗"
+header "║           Loom Uninstall - Remove from Repository         ║"
+header "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+
+info "Target: $TARGET_PATH"
+echo ""
+
+# ============================================================================
+# STEP 1: Validate Target Repository
+# ============================================================================
+CURRENT_STEP="Validate Target"
+header "Step 1: Validating Target Repository"
+echo ""
+
+# Check if target is a git repository (worktree-safe: a linked worktree's .git is a file)
+if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+  error "Target is not a git repository: $TARGET_PATH"
+fi
+success "Git repository detected"
+
+# Check if Loom is installed
+if [[ ! -d "$TARGET_PATH/.loom" ]]; then
+  error "Loom is not installed in $TARGET_PATH (no .loom directory found)"
+fi
+success "Loom installation detected"
+
+# Check if it's the Loom source repository
+is_loom_source_repo() {
+  local path="$1"
+  [[ -f "$path/.loom-source" ]] && return 0
+  [[ -d "$path/loom-daemon" && -d "$path/loom-api" && -d "$path/defaults" ]] && return 0
+  return 1
+}
+
+if is_loom_source_repo "$TARGET_PATH"; then
+  error "Cannot uninstall Loom from its own source repository"
+fi
+success "Not the Loom source repository"
+
+# Check if gh CLI is available (not needed for local mode)
+if [[ "$LOCAL_MODE" != "true" ]]; then
+  if ! command -v gh &> /dev/null; then
+    error "GitHub CLI (gh) is not installed. Install from: https://cli.github.com/"
+  fi
+  success "GitHub CLI (gh) available"
+
+  # Check if gh is authenticated
+  if ! gh auth status &> /dev/null; then
+    error "GitHub CLI is not authenticated. Run: gh auth login"
+  fi
+  success "GitHub CLI authenticated"
+fi
+
+echo ""
+
+# ============================================================================
+# STEP 2: Build Removal Manifest
+# ============================================================================
+CURRENT_STEP="Build Manifest"
+header "Step 2: Building File Removal Manifest"
+echo ""
+
+# Arrays to track what will be removed
+# Note: Use ${arr[@]+"${arr[@]}"} pattern for empty array safety with set -u on bash 3.2
+REMOVE_FILES=()        # Files to definitely remove
+REMOVE_DIRS=()         # Directories to remove if empty after file removal
+UNKNOWN_FILES=()       # Files in Loom directories that don't match known patterns
+SMART_REMOVE_FILES=()  # Files needing smart removal (CLAUDE.md, AGENTS.md, .gitignore)
+
+# Check if install-metadata.json has an installed_files manifest
+# If so, use it as the authoritative source instead of walking defaults/
+METADATA_FILE="$TARGET_PATH/.loom/install-metadata.json"
+USE_MANIFEST=false
+
+if [[ -f "$METADATA_FILE" ]]; then
+  # Check if the metadata has the installed_files field
+  if grep -q '"installed_files"' "$METADATA_FILE" 2>/dev/null; then
+    USE_MANIFEST=true
+    info "Using installed file manifest from install-metadata.json"
+  fi
+fi
+
+if [[ "$USE_MANIFEST" == "true" ]]; then
+  # ── Manifest-based removal (new path) ──────────────────────────────────
+  # Parse installed_files array from JSON using lightweight shell tools.
+  # Handles both single-line and multi-line JSON array formats.
+  # Extract the array content, split on commas, strip quotes.
+  MANIFEST_CONTENT=$(cat "$METADATA_FILE" | tr '\n' ' ')
+  INSTALLED_LIST=$(echo "$MANIFEST_CONTENT" | grep -o '"installed_files"[[:space:]]*:[[:space:]]*\[.*\]' | sed 's/.*\[//;s/\]//' | tr ',' '\n')
+
+  # Issue #3492: compute the current Loom ownership boundary once. Every
+  # manifest entry below is intersected against it; paths the previous
+  # manifest claimed Loom owned but that the current defaults/ no longer
+  # ships are preserved with a warning rather than rm -f'd. Defends
+  # against pre-#3450 manifests that captured consumer-authored
+  # .claude/skills/**, .claude/commands/<non-loom>/**, etc.
+  # shellcheck source=scripts/install/manifest.sh
+  source "$LOOM_ROOT/scripts/install/manifest.sh"
+  LOOM_OWNERSHIP_SET="$(_emit_loom_ownership_set)"
+  PRESERVED_NOT_OWNED=()
+  PRESERVED_DECLARED=()
+
+  while IFS= read -r file_path; do
+    # Trim whitespace and quotes
+    file_path=$(echo "$file_path" | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+    [[ -z "$file_path" ]] && continue
+
+    # CLAUDE.md and AGENTS.md get smart removal (step 6), not direct removal
+    # .claude/settings.json gets smart removal (selective Loom hook/permission removal)
+    # .gitignore gets smart removal (additive merge — never hard-delete; #3450)
+    if [[ "$file_path" == "CLAUDE.md" ]]; then
+      continue
+    fi
+    if [[ "$file_path" == "AGENTS.md" ]]; then
+      continue
+    fi
+    if [[ "$file_path" == ".claude/settings.json" ]]; then
+      continue
+    fi
+    if [[ "$file_path" == ".gitignore" ]]; then
+      # v0.7.2's over-broad manifest registered consumer-owned .gitignore as
+      # Loom-installed. Hard-deleting it then re-creating from scratch wiped
+      # the user's Python/Rust/IDE/OS ignore rules. Route every manifest entry
+      # for .gitignore through the smart-removal step that strips only the
+      # Loom patterns. See issue #3450.
+      continue
+    fi
+    if [[ "$file_path" == ".github/labels.yml" ]]; then
+      # labels.yml gets smart removal (step 6): strip only the Loom-owned
+      # BEGIN/END LOOM LABELS block, preserving consumer-authored labels in the
+      # same file. Hard-deleting it would destroy a consumer's own labels. #4187.
+      continue
+    fi
+    # Defense in depth (issues #3450, #3480): .github/ is an ALLOWLIST —
+    # only the files Loom actually ships into targets (source of truth:
+    # defaults/.github/ as walked by scripts/install/manifest.sh) may be
+    # registered for hard-delete. Everything else under .github/ —
+    # consumer workflows, composite actions, dependabot.yml, etc. — is
+    # consumer-owned by default and must be preserved, even when a legacy
+    # over-broad manifest (v0.7.x, #3450) lists it. If Loom ever ships new
+    # .github/ files (e.g. workflows), add those exact paths here AND in
+    # the install-side sweep carve-out in scripts/install-loom.sh.
+    case "$file_path" in
+      .github/labels.yml|.github/CONFIGURATION.md|.github/ISSUE_TEMPLATE/config.yml|.github/ISSUE_TEMPLATE/task.yml)
+        # Loom-shipped — eligible for removal.
+        ;;
+      .github/*)
+        # Consumer-owned by default.
+        continue
+        ;;
+    esac
+
+    # Issue #5971: an explicit repo-owned declaration outranks the manifest. A
+    # legacy over-broad manifest can list a path the repo actually owns; if the
+    # repo said so in .loom/resync-ignore, never delete it.
+    if _is_repo_owned "$file_path"; then
+      PRESERVED_DECLARED+=("$file_path")
+      continue
+    fi
+
+    # Issue #3492: intersect against the current ownership boundary. A
+    # path the previous manifest claimed Loom owned but that the current
+    # defaults/ no longer ships is consumer-authored (captured by an
+    # over-broad pre-#3450 manifest) and must NOT be rm -f'd.
+    # Issue #7285: here-string, never `printf ... | grep -q` — the
+    # ownership set is multi-KB, so an early-exiting `grep -q` can
+    # SIGPIPE printf mid-write and, under `pipefail`, that broken-pipe
+    # status masks a real match (inverting this ownership decision).
+    if [[ -n "$LOOM_OWNERSHIP_SET" ]] \
+        && ! grep -Fxq -- "$file_path" <<<"$LOOM_OWNERSHIP_SET"; then
+      PRESERVED_NOT_OWNED+=("$file_path")
+      continue
+    fi
+
+    if [[ -f "$TARGET_PATH/$file_path" ]]; then
+      REMOVE_FILES+=("$file_path")
+    fi
+  done <<< "$INSTALLED_LIST"
+
+  # Issue #3492: surface preserved paths so operators can audit their tree
+  # for other pre-#3450 contamination. Single warning per file, no silent
+  # skip.
+  if (( ${#PRESERVED_NOT_OWNED[@]} > 0 )); then
+    for f in "${PRESERVED_NOT_OWNED[@]}"; do
+      warning "preserving ${f} (not owned by current Loom defaults/; likely consumer-authored, captured by pre-#3450 manifest)"
+    done
+  fi
+
+  # Issue #5971: same treatment for explicitly declared repo-owned paths.
+  if (( ${#PRESERVED_DECLARED[@]} > 0 )); then
+    for f in "${PRESERVED_DECLARED[@]}"; do
+      warning "preserving ${f} (declared repo-owned in .loom/resync-ignore)"
+    done
+  fi
+
+  # Also add install-metadata.json itself to removal
+  REMOVE_FILES+=(".loom/install-metadata.json")
+
+  # Add runtime artifacts not tracked in the manifest
+  RUNTIME_ARTIFACTS=(
+    ".loom/state.json"
+    ".loom/daemon-state.json"
+    ".loom/stop-daemon"
+    ".loom/manifest.json"
+    ".loom/loom-source-path"
+    ".loom/metrics_state.json"
+    ".loom/stuck-config.json"
+    ".loom/activity.db"
+  )
+
+  for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
+    if [[ -f "$TARGET_PATH/$artifact" ]]; then
+      if ! grep -q "^${artifact}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
+        REMOVE_FILES+=("$artifact")
+      fi
+    fi
+  done
+
+  # Add archived daemon state files
+  for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
+      REMOVE_FILES+=("$rel_f")
+    fi
+  done
+
+  # Add log files
+  for f in "$TARGET_PATH/.loom/"*.log; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    REMOVE_FILES+=("$rel_f")
+  done
+
+  # Add socket files
+  for f in "$TARGET_PATH/.loom/"*.sock; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    REMOVE_FILES+=("$rel_f")
+  done
+
+  # In --clean mode, also queue non-manifest files found in Loom-owned
+  # directories. The manifest tells us what Loom installed; --clean means "wipe
+  # what Loom owns, including files the manifest never recorded". Shared
+  # directories (.claude/commands/, .claude/agents/) are still preserved.
+  #
+  # Issue #5971: this sweep used to queue EVERY file it found under those four
+  # directories with no ownership test at all -- including a repo-owned
+  # .loom/hooks/post-worktree.sh. Two gates now apply, in this order:
+  #
+  #   1. A path DECLARED repo-owned in .loom/resync-ignore is never queued, in
+  #      any of the four directories. This is the explicit opt-out an operator
+  #      running --clean can still be held to: they asked to wipe Loom's files,
+  #      not the repo's.
+  #   2. .loom/hooks/ additionally gets an implicit carve-out: a file there
+  #      that the current defaults/ does not ship is preserved. Unlike
+  #      roles/scripts/docs, .loom/hooks/ is an extension point Loom INVOKES
+  #      but whose contents are deliberately excluded from the installed-files
+  #      manifest (epic #3835 Phase 5 / #4262) -- so no manifest can ever
+  #      confirm a hooks file is Loom's, and "unrecognized" there is far more
+  #      likely to mean "the repo's" than anywhere else.
+  #
+  # Every preserved file is NAMED in the output below; nothing is skipped
+  # silently. The Rust reinstall sweep (loom-daemon init, the path the reported
+  # incident actually took -- no operator --clean involved) is strictly more
+  # conservative: it preserves anything it cannot attribute to Loom in ANY
+  # managed directory. See loom-daemon/src/init/repo_owned.rs and
+  # defaults/docs/repo-owned-files.md.
+  if [[ "$CLEAN_MODE" == "true" ]]; then
+    LOOM_OWNED_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".loom/hooks")
+    PRESERVED_REPO_OWNED=()
+    for loom_dir in "${LOOM_OWNED_DIRS[@]}"; do
+      [[ -d "$TARGET_PATH/$loom_dir" ]] || continue
+      while IFS= read -r -d '' file; do
+        rel_file="${file#$TARGET_PATH/}"
+
+        if _is_repo_owned "$rel_file"; then
+          PRESERVED_REPO_OWNED+=("$rel_file (declared repo-owned in .loom/resync-ignore)")
+          continue
+        fi
+
+        if [[ "$loom_dir" == ".loom/hooks" ]] && ! _is_shipped_by_defaults "$rel_file"; then
+          PRESERVED_REPO_OWNED+=("$rel_file (not shipped by current defaults/hooks/ -- .loom/hooks/ is an extension point, so this is preserved as possibly repo-owned; list it in .loom/resync-ignore to declare ownership, or delete it by hand)")
+          continue
+        fi
+
+        # Check if already in removal list
+        is_listed=false
+        for listed in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"}; do
+          if [[ "$rel_file" == "$listed" ]]; then
+            is_listed=true
+            break
+          fi
+        done
+        if [[ "$is_listed" == "false" ]]; then
+          REMOVE_FILES+=("$rel_file")
+        fi
+      done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
+    done
+
+    if (( ${#PRESERVED_REPO_OWNED[@]} > 0 )); then
+      for f in "${PRESERVED_REPO_OWNED[@]}"; do
+        warning "preserving ${f}"
+      done
+    fi
+  fi
+
+else
+  # ── Heuristic-based removal (legacy path for pre-manifest installs) ────
+
+  # 1. Build manifest from defaults/ directory (if available)
+  DEFAULTS_PATH="$LOOM_ROOT/defaults"
+  KNOWN_DEFAULTS=()
+
+  if [[ -d "$DEFAULTS_PATH" ]]; then
+    # Walk defaults/ to find all files that Loom installs
+    while IFS= read -r -d '' file; do
+      rel_path="${file#$DEFAULTS_PATH/}"
+
+      # Map defaults paths to target repo paths
+      case "$rel_path" in
+        # roles/ -> .loom/roles/
+        roles/*)
+          target_file=".loom/$rel_path"
+          ;;
+        # scripts/ -> .loom/scripts/
+        scripts/*)
+          target_file=".loom/$rel_path"
+          ;;
+        # config.json -> .loom/config.json
+        config.json)
+          target_file=".loom/config.json"
+          ;;
+        # package.json -> .loom/package.json (if installed there)
+        package.json)
+          target_file=".loom/package.json"
+          ;;
+        # .loom-README.md -> .loom/README.md
+        .loom-README.md)
+          target_file=".loom/README.md"
+          ;;
+        # README.md from defaults -> skip (this is Loom's own README)
+        README.md)
+          continue
+          ;;
+        # .loom/ files -> .loom/ (CLAUDE.md in .loom/)
+        .loom/*)
+          target_file="$rel_path"
+          ;;
+        # .DS_Store -> skip
+        .DS_Store)
+          continue
+          ;;
+        # All other files map directly (CLAUDE.md, .claude/*, .codex/*, .github/*)
+        *)
+          target_file="$rel_path"
+          ;;
+      esac
+
+      KNOWN_DEFAULTS+=("$target_file")
+
+      # Check if the file exists in target and add to removal list
+      # CLAUDE.md and AGENTS.md get smart removal (step 6), not direct removal
+      if [[ "$target_file" == "CLAUDE.md" ]] || [[ "$target_file" == "AGENTS.md" ]]; then
+        continue
+      fi
+      # labels.yml gets smart removal (step 6): strip only the Loom marker
+      # block, preserving consumer-authored labels. See issue #4187.
+      if [[ "$target_file" == ".github/labels.yml" ]]; then
+        continue
+      fi
+
+      if [[ -f "$TARGET_PATH/$target_file" ]]; then
+        REMOVE_FILES+=("$target_file")
+      fi
+    done < <(find -L "$DEFAULTS_PATH" -type f -print0 | sort -z)
+  else
+    warning "Loom defaults/ directory not found at $DEFAULTS_PATH"
+    info "Using fallback pattern matching for file detection"
+  fi
+
+  # 2. Add generated role .md files (correspond to .json files)
+  if [[ -d "$TARGET_PATH/.loom/roles" ]]; then
+    for json_file in "$TARGET_PATH/.loom/roles/"*.json; do
+      [[ -f "$json_file" ]] || continue
+      base_name=$(basename "$json_file" .json)
+      md_file=".loom/roles/${base_name}.md"
+      if [[ -f "$TARGET_PATH/$md_file" ]]; then
+        # Add if not already in the list
+        if ! grep -q "^${md_file}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
+          REMOVE_FILES+=("$md_file")
+        fi
+      fi
+    done
+  fi
+
+  # 3. Add runtime artifacts
+  RUNTIME_ARTIFACTS=(
+    ".loom/state.json"
+    ".loom/daemon-state.json"
+    ".loom/config.json"
+    ".loom/stop-daemon"
+    ".loom/manifest.json"
+    ".loom/loom-source-path"
+    ".loom/metrics_state.json"
+    ".loom/stuck-config.json"
+    ".loom/activity.db"
+    ".loom/install-metadata.json"
+  )
+
+  for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
+    if [[ -f "$TARGET_PATH/$artifact" ]]; then
+      if ! grep -q "^${artifact}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
+        REMOVE_FILES+=("$artifact")
+      fi
+    fi
+  done
+
+  # Add archived daemon state files
+  for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
+      REMOVE_FILES+=("$rel_f")
+    fi
+  done
+
+  # Add log files
+  for f in "$TARGET_PATH/.loom/"*.log; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
+      REMOVE_FILES+=("$rel_f")
+    fi
+  done
+
+  # Add socket files
+  for f in "$TARGET_PATH/.loom/"*.sock; do
+    [[ -f "$f" ]] || continue
+    rel_f="${f#$TARGET_PATH/}"
+    if ! grep -q "^${rel_f}$" 2>/dev/null <<<"$(printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"})"; then
+      REMOVE_FILES+=("$rel_f")
+    fi
+  done
+
+  # 6. Detect unknown files in Loom-installed directories
+  # Only scan directories that the install process creates — NOT runtime dirs like worktrees/
+  LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands" ".claude/agents")
+
+  # Claimed role name prefixes — any file in .loom/roles/ matching these prefixes
+  # is owned by Loom and should be removed during uninstall. This handles deprecated
+  # role files from older versions (e.g., builder-complexity.md, hermit-patterns.md)
+  # without needing to maintain an explicit list of deprecated filenames.
+  CLAIMED_ROLE_PREFIXES=(
+    architect auditor builder champion curator
+    doctor driver guide hermit judge
+    loom shepherd
+  )
+
+  for loom_dir in "${LOOM_DIRS[@]}"; do
+    if [[ ! -d "$TARGET_PATH/$loom_dir" ]]; then
+      continue
+    fi
+
+    while IFS= read -r -d '' file; do
+      rel_file="${file#$TARGET_PATH/}"
+
+      # Check if this file is in our removal list or known defaults
+      is_known=false
+      for known in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} ${KNOWN_DEFAULTS[@]+"${KNOWN_DEFAULTS[@]}"}; do
+        if [[ "$rel_file" == "$known" ]]; then
+          is_known=true
+          break
+        fi
+      done
+
+      # For .loom/roles/, also check claimed role name prefixes
+      # This catches deprecated role files from older Loom versions
+      if [[ "$is_known" == "false" ]] && [[ "$loom_dir" == ".loom/roles" ]]; then
+        base_name=$(basename "$rel_file")
+        for prefix in "${CLAIMED_ROLE_PREFIXES[@]}"; do
+          if [[ "$base_name" == "${prefix}"* ]]; then
+            is_known=true
+            # Add to removal list since it's a claimed Loom file
+            REMOVE_FILES+=("$rel_file")
+            break
+          fi
+        done
+      fi
+
+      if [[ "$is_known" == "false" ]]; then
+        UNKNOWN_FILES+=("$rel_file")
+      fi
+    done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
+  done
+
+  # Also add the CLI wrapper if it exists (new location: .loom/bin/loom).
+  # NOTE (Epic #3835 Phase 3a, #4157): this removes ONLY the per-repo tmux
+  # agent-pool manager. The machine-level dispatcher at ~/.local/bin/loom (and
+  # the ~/.local/share/loom checkout link) is deliberately NOT removed by a
+  # per-repo uninstall — same semantics as the machine-level ~/.local/bin/loom-daemon
+  # binary, which is shared across every repo Loom is installed into and outlives
+  # any single repo's uninstall. Removing it here would break `loom` for every
+  # other consumer repo on the machine.
+  if [[ -f "$TARGET_PATH/.loom/bin/loom" ]] && [[ -x "$TARGET_PATH/.loom/bin/loom" ]]; then
+    REMOVE_FILES+=(".loom/bin/loom")
+  fi
+
+  # NOTE (Epic #3835 Phase 4, #4261): the user-scope skill + agent links
+  # (~/.claude/commands/loom and ~/.claude/agents/loom-*.md) are machine-level
+  # SHARED resources — one set, resolved by every repo Loom is installed into,
+  # exactly like the ~/.local/bin/loom dispatcher above. A per-repo uninstall
+  # therefore does NOT remove them: doing so would break `/loom:*` skills and
+  # `loom-*` subagents for every OTHER consumer repo on the machine. A
+  # machine-level teardown can remove them safely via `deprovision_loom_skills`
+  # in scripts/install/provision-skills.sh, which deletes a link ONLY when it
+  # points into the machine checkout and never touches an operator's real files.
+
+  # NOTE (Epic #3835 Phase 5, #4262): the user-scope guard-hook entries wired
+  # into ~/.claude/settings.json by provision_loom_hooks are ALSO a machine-level
+  # SHARED resource — one set of entries, resolved by every repo Loom is
+  # installed into, exactly like the skills above. A per-repo uninstall therefore
+  # does NOT strip them: doing so would disable the destructive-command / worktree
+  # guards for every OTHER consumer repo on the machine. A machine-level teardown
+  # can remove them safely via `deprovision_loom_hooks` in
+  # scripts/install/provision-hooks.sh, which removes ONLY entries carrying the
+  # machine-level `/defaults/hooks/` marker and never touches an operator's own
+  # hooks. (The per-repo PROJECT-level `.claude/settings.json` Loom hook entries
+  # ARE stripped below, via the jq smart-removal on that file.)
+
+  # Backward compatibility: also check old location (repo root)
+  if [[ -f "$TARGET_PATH/loom" ]] && [[ -x "$TARGET_PATH/loom" ]]; then
+    REMOVE_FILES+=("loom")
+  fi
+fi
+
+# 4. Add runtime directories (progress, logs). NOTE (#5973): ".loom/worktrees"
+# is deliberately NOT in this blind-remove list -- it can hold live,
+# git-registered worktrees (e.g. a Builder's in-flight `.loom/worktrees/issue-N`
+# preserved between sessions), and this array's entries are removed
+# unconditionally via `rm -rf` below with no dirty-check. Worktree handling is
+# its own opt-in, dirty-aware step (see "STEP 5a: Handle .loom/worktrees"
+# below) so a reinstall can never silently destroy uncommitted work.
+RUNTIME_DIRS=(
+  ".loom/progress"
+  ".loom/logs"
+)
+
+# 5. Mark CLAUDE.md, AGENTS.md, .gitignore, and settings.json for smart removal
+if [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
+  SMART_REMOVE_FILES+=("CLAUDE.md")
+fi
+
+# AGENTS.md gets the same marker-based smart removal as CLAUDE.md (issue #4479)
+if [[ -f "$TARGET_PATH/AGENTS.md" ]]; then
+  SMART_REMOVE_FILES+=("AGENTS.md")
+fi
+
+# .gitignore needs pattern removal (not full removal)
+if [[ -f "$TARGET_PATH/.gitignore" ]]; then
+  SMART_REMOVE_FILES+=(".gitignore")
+fi
+
+# .claude/settings.json needs selective Loom hook/permission removal
+if [[ -f "$TARGET_PATH/.claude/settings.json" ]]; then
+  SMART_REMOVE_FILES+=(".claude/settings.json")
+fi
+
+# .github/labels.yml needs marker-block removal (strip only the Loom labels
+# block; delete the file only when nothing meaningful remains). Issue #4187.
+if [[ -f "$TARGET_PATH/.github/labels.yml" ]]; then
+  SMART_REMOVE_FILES+=(".github/labels.yml")
+fi
+
+
+# Track directories to check for emptiness after removal
+REMOVE_DIRS=(
+  ".loom/bin"
+  ".loom/roles"
+  ".loom/scripts"
+  ".loom/scripts/cli"
+  ".loom/docs"
+  ".loom/hooks"
+  ".loom"
+  ".claude/commands/loom"
+  ".claude/commands"
+  ".claude/agents"
+  ".claude"
+  ".codex"
+)
+
+# Report what was found
+info "Files to remove: ${#REMOVE_FILES[@]}"
+info "Smart-remove files: ${#SMART_REMOVE_FILES[@]} (CLAUDE.md, AGENTS.md, .gitignore)"
+info "Unknown files found: ${#UNKNOWN_FILES[@]}"
+echo ""
+
+if [[ ${#REMOVE_FILES[@]} -eq 0 ]] && [[ ${#SMART_REMOVE_FILES[@]} -eq 0 ]]; then
+  warning "No Loom files found to remove"
+  info "The .loom directory exists but contains no recognized Loom files"
+  echo ""
+fi
+
+# ============================================================================
+# STEP 3: Confirm Removal (Interactive Mode)
+# ============================================================================
+CURRENT_STEP="Confirm Removal"
+header "Step 3: Confirming File Removal"
+echo ""
+
+# Show summary of what will be removed
+if [[ ${#REMOVE_FILES[@]} -gt 0 ]]; then
+  info "The following Loom files will be removed:"
+  for f in "${REMOVE_FILES[@]}"; do
+    echo "  - $f"
+  done
+  echo ""
+fi
+
+if [[ ${#SMART_REMOVE_FILES[@]} -gt 0 ]]; then
+  info "The following files will be partially cleaned:"
+  for f in "${SMART_REMOVE_FILES[@]}"; do
+    case "$f" in
+      CLAUDE.md)
+        echo "  - CLAUDE.md (remove Loom section or entire file if Loom-generated)"
+        ;;
+      AGENTS.md)
+        echo "  - AGENTS.md (remove Loom section, marker-based)"
+        ;;
+      .gitignore)
+        echo "  - .gitignore (remove Loom-specific patterns only)"
+        ;;
+      .claude/settings.json)
+        echo "  - .claude/settings.json (remove Loom hooks and permissions only)"
+        ;;
+      .github/labels.yml)
+        echo "  - .github/labels.yml (remove Loom label block only, or entire file if Loom-generated)"
+        ;;
+    esac
+  done
+  echo ""
+fi
+
+# Handle unknown files
+REMOVE_UNKNOWN_FILES=()
+PRESERVED_CUSTOM_FILES=()
+if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
+  if [[ "$CLEAN_MODE" == "true" ]]; then
+    # Clean mode: remove unknown files from Loom-OWNED directories only
+    # NEVER remove unknown files from SHARED directories (.claude/agents/)
+    # because those may contain custom project-specific agent definitions not installed by Loom
+    #
+    # Shared directories: directories where both Loom and users put files
+    # Loom-owned directories: directories that Loom fully manages (.loom/*, .claude/commands/loom/)
+    SHARED_DIR_PREFIXES=(".claude/agents/")
+
+    for f in "${UNKNOWN_FILES[@]}"; do
+      is_shared=false
+      for shared_prefix in "${SHARED_DIR_PREFIXES[@]}"; do
+        if [[ "$f" == "$shared_prefix"* ]]; then
+          is_shared=true
+          break
+        fi
+      done
+
+      if [[ "$is_shared" == "true" ]]; then
+        # Preserve custom files in shared directories
+        PRESERVED_CUSTOM_FILES+=("$f")
+      else
+        REMOVE_UNKNOWN_FILES+=("$f")
+      fi
+    done
+
+    # Report what will be removed vs preserved
+    if [[ ${#REMOVE_UNKNOWN_FILES[@]} -gt 0 ]]; then
+      if [[ ${#REMOVE_UNKNOWN_FILES[@]} -le 20 ]]; then
+        info "Unknown files in Loom-owned directories (removing in clean mode):"
+        for f in "${REMOVE_UNKNOWN_FILES[@]}"; do
+          echo "  - $f (will remove)"
+        done
+      else
+        info "${#REMOVE_UNKNOWN_FILES[@]} unknown files in Loom-owned directories (removing in clean mode)"
+      fi
+    fi
+
+    if [[ ${#PRESERVED_CUSTOM_FILES[@]} -gt 0 ]]; then
+      info "Custom files in shared directories (preserved):"
+      for f in "${PRESERVED_CUSTOM_FILES[@]}"; do
+        echo "  - $f (preserved - not installed by Loom)"
+      done
+    fi
+  elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+    if [[ ${#UNKNOWN_FILES[@]} -le 20 ]]; then
+      info "Unknown files in Loom directories (preserved in non-interactive mode):"
+      for f in "${UNKNOWN_FILES[@]}"; do
+        echo "  - $f (preserved)"
+      done
+    else
+      info "${#UNKNOWN_FILES[@]} unknown files in Loom directories (preserved in non-interactive mode)"
+    fi
+  else
+    info "Found files in Loom directories that are not standard Loom files:"
+    echo ""
+    for f in "${UNKNOWN_FILES[@]}"; do
+      read -r -p "  Remove $f? [y/N] " -n 1 REMOVE_REPLY
+      echo ""
+      if [[ $REMOVE_REPLY =~ ^[Yy]$ ]]; then
+        REMOVE_UNKNOWN_FILES+=("$f")
+      fi
+    done
+  fi
+  echo ""
+fi
+
+# Final confirmation in interactive mode
+if [[ "$NON_INTERACTIVE" != "true" ]]; then
+  TOTAL_REMOVALS=$(( ${#REMOVE_FILES[@]} + ${#REMOVE_UNKNOWN_FILES[@]} + ${#SMART_REMOVE_FILES[@]} ))
+  echo ""
+  if [[ "$LOCAL_MODE" == "true" ]]; then
+    warning "This will modify $TOTAL_REMOVALS files in the working directory."
+  else
+    warning "This will modify $TOTAL_REMOVALS files in a new branch and create a PR."
+  fi
+  read -r -p "Proceed with uninstall? [y/N] " -n 1 PROCEED
+  echo ""
+  if [[ ! $PROCEED =~ ^[Yy]$ ]]; then
+    info "Uninstall cancelled"
+    trap - EXIT SIGINT SIGTERM
+    exit 0
+  fi
+fi
+
+echo ""
+
+# --dry-run stops HERE (issue #5517): everything above (Steps 1-3) only reads
+# the target and builds/reports the removal manifest -- no writes happen until
+# Step 4 (worktree creation), Step 5 (file removal), and Step 6 (smart-remove
+# writes to CLAUDE.md/.gitignore/etc.) below. NON_INTERACTIVE was forced true
+# above, so nothing between here and this point ever blocked on a prompt.
+if [[ "$DRY_RUN" == "true" ]]; then
+  header "DRY RUN — no files were removed"
+  echo ""
+  TOTAL_WOULD_REMOVE=$(( ${#REMOVE_FILES[@]} + ${#SMART_REMOVE_FILES[@]} ))
+  if [[ "$LOCAL_MODE" == "true" ]]; then
+    info "Would modify $TOTAL_WOULD_REMOVE file(s)/dir(s) in the working directory (see the plan above)."
+  else
+    info "Would modify $TOTAL_WOULD_REMOVE file(s)/dir(s) in a new branch and open a PR (see the plan above)."
+  fi
+  trap - EXIT SIGINT SIGTERM
+  exit 0
+fi
+
+# ============================================================================
+# STEP 4: Create Uninstall Worktree (skipped in local mode)
+# ============================================================================
+if [[ "$LOCAL_MODE" != "true" ]]; then
+  CURRENT_STEP="Create Worktree"
+  header "Step 4: Creating Uninstall Worktree"
+  echo ""
+
+  # Reuse the create-worktree.sh script, but override the branch name
+  # We need to temporarily override the default branch name
+  cd "$TARGET_PATH"
+
+  # Ensure .loom/worktrees directory exists
+  mkdir -p .loom/worktrees
+
+  WORKTREE_PATH=".loom/worktrees/loom-uninstall"
+  BASE_BRANCH_NAME="loom/uninstall"
+
+  # Detect the default branch
+  DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "")
+
+  if [[ -n "$DEFAULT_BRANCH" ]]; then
+    git fetch origin --prune 2>/dev/null || true
+    if ! git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+      DEFAULT_BRANCH=""
+    fi
+  fi
+
+  if [[ -z "$DEFAULT_BRANCH" ]]; then
+    if git show-ref --verify --quiet refs/remotes/origin/main; then
+      DEFAULT_BRANCH="main"
+    elif git show-ref --verify --quiet refs/remotes/origin/master; then
+      DEFAULT_BRANCH="master"
+    fi
+  fi
+
+  if [[ -z "$DEFAULT_BRANCH" ]]; then
+    if git show-ref --verify --quiet refs/heads/main; then
+      DEFAULT_BRANCH="main"
+    elif git show-ref --verify --quiet refs/heads/master; then
+      DEFAULT_BRANCH="master"
+    else
+      DEFAULT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    fi
+  fi
+
+  # Fetch latest.
+  # `--` ends option parsing (#9106): $DEFAULT_BRANCH can come from
+  # `git symbolic-ref refs/remotes/origin/HEAD`, which `git remote set-head -a`
+  # populates from the REMOTE, so it is not guaranteed to be a locally-chosen
+  # name. This script is standalone (it cannot source `check_branch_name` from
+  # a `.loom/` it is in the middle of removing), so `--` is the dependency-free
+  # half of the same mitigation.
+  info "Fetching latest changes from origin/${DEFAULT_BRANCH}..."
+  git fetch origin -- "${DEFAULT_BRANCH}" 2>/dev/null || true
+
+  # Determine base branch ref
+  if git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+    BASE_BRANCH="origin/${DEFAULT_BRANCH}"
+  elif git show-ref --verify --quiet "refs/heads/${DEFAULT_BRANCH}"; then
+    BASE_BRANCH="${DEFAULT_BRANCH}"
+  else
+    BASE_BRANCH="HEAD"
+  fi
+
+  # Clean up any existing worktree
+  if [[ -d "$WORKTREE_PATH" ]]; then
+    info "Removing existing worktree: $WORKTREE_PATH"
+    git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
+  fi
+
+  # Prune any stale worktree metadata (defensive: handles incomplete cleanup)
+  git worktree prune 2>/dev/null || true
+
+  # Find available branch name
+  BRANCH_NAME="$BASE_BRANCH_NAME"
+  SUFFIX=2
+
+  while true; do
+    if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+      git branch -D "$BRANCH_NAME" >/dev/null 2>&1 || true
+    fi
+
+    if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$BASE_BRANCH" 2>&1; then
+      break
+    fi
+
+    info "Branch '$BRANCH_NAME' already exists, trying alternative..."
+    BRANCH_NAME="${BASE_BRANCH_NAME}-${SUFFIX}"
+    SUFFIX=$((SUFFIX + 1))
+
+    if [[ $SUFFIX -gt 10 ]]; then
+      error "Could not find available branch name after 10 attempts"
+    fi
+  done
+
+  success "Worktree created: $WORKTREE_PATH"
+  info "Branch: $BRANCH_NAME"
+  info "Base: $DEFAULT_BRANCH"
+  echo ""
+else
+  # Local mode: operate directly on working directory
+  info "Local mode: operating directly on working directory"
+  echo ""
+fi
+
+# ============================================================================
+# STEP 5: Remove Loom Files
+# ============================================================================
+CURRENT_STEP="Remove Files"
+header "Step 5: Removing Loom Files"
+echo ""
+
+if [[ "$LOCAL_MODE" == "true" ]]; then
+  WORKTREE_ABS="$TARGET_PATH"
+else
+  WORKTREE_ABS="$TARGET_PATH/$WORKTREE_PATH"
+fi
+cd "$WORKTREE_ABS"
+
+REMOVED_COUNT=0
+REMOVED_LIST=()
+
+# Remove known Loom files
+for file in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"}; do
+  if [[ -f "$WORKTREE_ABS/$file" ]]; then
+    rm -f "$WORKTREE_ABS/$file"
+    REMOVED_LIST+=("$file")
+    REMOVED_COUNT=$((REMOVED_COUNT + 1))
+  fi
+done
+
+# Remove user-approved unknown files
+for file in ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}; do
+  if [[ -f "$WORKTREE_ABS/$file" ]]; then
+    rm -f "$WORKTREE_ABS/$file"
+    REMOVED_LIST+=("$file")
+    REMOVED_COUNT=$((REMOVED_COUNT + 1))
+  fi
+done
+
+# Remove runtime directories
+for dir in "${RUNTIME_DIRS[@]}"; do
+  if [[ -d "$WORKTREE_ABS/$dir" ]]; then
+    rm -rf "${WORKTREE_ABS:?refusing to remove a runtime dir with an empty WORKTREE_ABS}/${dir:?refusing to remove a runtime dir with an empty dir name}"
+    REMOVED_LIST+=("$dir/")
+    REMOVED_COUNT=$((REMOVED_COUNT + 1))
+  fi
+done
+
+# ----------------------------------------------------------------------------
+# STEP 5a: Handle .loom/worktrees (opt-in, dirty-aware) -- issue #5973
+# ----------------------------------------------------------------------------
+# Deliberately handled separately from RUNTIME_DIRS above: ".loom/worktrees"
+# can hold live, git-registered worktrees (e.g. a Builder's in-flight
+# `.loom/worktrees/issue-N`, deliberately preserved across sessions). Blindly
+# `rm -rf`-ing the whole directory (the pre-#5973 behavior) silently destroyed
+# those on every --local uninstall, including the one chained inside a plain
+# `install.sh --confirm-reinstall`, with no warning and no dirty-check.
+#
+# Fix: never touch a live worktree unless --remove-worktrees was explicitly
+# passed, and even then remove each entry individually via `git worktree
+# remove` (not `rm -rf`) so git's own dirty-check applies -- an entry with
+# uncommitted changes is refused and skipped, never destroyed. Every
+# removed/preserved/skipped entry is named in the output (not just a single
+# ".loom/worktrees/" summary line).
+#
+# Issue #6159 (check-in on #5999): the orphan fallback below used to gate its
+# `rm -rf` on a substring match against `git worktree remove`'s *error text*
+# ("is not a working tree"). That predicate is version-coupled to a message
+# git makes no compatibility promise about, and it is the only thing standing
+# between a live worktree and an unconditional recursive delete. It is now
+# replaced by a positive membership test against `git worktree list
+# --porcelain` -- a documented, stable plumbing interface -- plus a
+# containment check. This is a stricter guard than the daemon-side one in
+# loom-daemon/src/worktree_ops/clean.rs (should_force_remove_orphan_dir),
+# which still gates on the error string (is_untracked_worktree_error) ANDed
+# with a .loom-managed sentinel and containment; this predicate does not read
+# the error text at all, so a future git rewording it cannot flip the
+# classification in either direction. The `rm -rf` therefore fires only when
+# git itself reports the path is NOT one of its worktrees AND the path
+# resolves to somewhere strictly under .loom/worktrees/.
+#
+# The membership query itself fails CLOSED (see _is_registered_worktree): if
+# `git worktree list --porcelain` cannot be answered at all, the path is
+# treated as registered and preserved. That keeps the property #6159 valued in
+# the old predicate -- "any anomaly falls in the safe direction" -- which a
+# naive membership test would have lost, since an errored query also produces
+# empty output and would otherwise read as "not registered".
+
+# Resolve a path to its physical location (symlinks collapsed). Deliberately
+# avoids `realpath`/`readlink -f`, neither of which is portable to stock macOS.
+_uninstall_realpath() {
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+# Is $1 (an already-resolved absolute path) currently registered with git as a
+# worktree of $TARGET_PATH? Uses the porcelain listing rather than parsing a
+# human-readable error, so a reworded git message can never be mistaken for
+# "this is an orphan" (#6159).
+#
+# FAILS CLOSED. The listing is captured into a variable first, so a *failed*
+# query (transient I/O error, lock contention on .git/worktrees/ metadata, a
+# permissions problem, repo corruption -- any of which can equally well be what
+# made `git worktree remove` fail moments earlier) is distinguishable from a
+# successful query that simply found no match. On failure this reports
+# "registered", so the caller protects the path instead of `rm -rf`-ing it:
+# never treat "I could not ask git" as "git says this is an orphan".
+_is_registered_worktree() {
+  local candidate_real="$1" line wt_real listing
+  if ! listing="$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null)"; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ "$line" == "worktree "* ]] || continue
+    wt_real="$(_uninstall_realpath "${line#worktree }")"
+    [[ "$wt_real" == "$candidate_real" ]] && return 0
+  done <<< "$listing"
+  return 1
+}
+
+WORKTREES_DIR="$WORKTREE_ABS/.loom/worktrees"
+if [[ -d "$WORKTREES_DIR" ]]; then
+  WORKTREE_ENTRIES=()
+  for entry in "$WORKTREES_DIR"/*/; do
+    [[ -d "$entry" ]] || continue
+    WORKTREE_ENTRIES+=("${entry%/}")
+  done
+
+  if [[ ${#WORKTREE_ENTRIES[@]} -gt 0 ]] && [[ "$REMOVE_WORKTREES" != "true" ]]; then
+    info "Preserving ${#WORKTREE_ENTRIES[@]} .loom/worktrees/ entries (pass --remove-worktrees to remove them):"
+    for entry in "${WORKTREE_ENTRIES[@]}"; do
+      rel_entry="${entry#"$WORKTREE_ABS"/}"
+      info "  preserved: $rel_entry"
+    done
+  elif [[ ${#WORKTREE_ENTRIES[@]} -gt 0 ]]; then
+    info "Removing .loom/worktrees/ entries (--remove-worktrees was passed)..."
+    WORKTREES_DIR_REAL="$(_uninstall_realpath "$WORKTREES_DIR")"
+    for entry in "${WORKTREE_ENTRIES[@]}"; do
+      rel_entry="${entry#"$WORKTREE_ABS"/}"
+      entry_real="$(_uninstall_realpath "$entry")"
+      if REMOVE_WT_OUTPUT=$(git -C "$TARGET_PATH" worktree remove "$entry" 2>&1); then
+        REMOVED_LIST+=("$rel_entry/")
+        REMOVED_COUNT=$((REMOVED_COUNT + 1))
+        info "  removed: $rel_entry"
+      elif ! _is_registered_worktree "$entry_real" \
+        && [[ "$entry_real" == "$WORKTREES_DIR_REAL"/* ]] \
+        && [[ "$entry_real" != "$WORKTREES_DIR_REAL" ]]; then
+        # git does not know this path as a worktree at all (e.g. an orphaned
+        # leftover from an earlier incomplete cleanup, or a `git worktree
+        # prune` that ran while the directory stayed on disk), and it resolves
+        # to somewhere strictly inside .loom/worktrees/ -- nothing live to
+        # protect, so a plain rm -rf is safe here. Both conditions are
+        # required: a registered worktree whose removal failed for ANY reason
+        # (dirty, locked, busy, permissions) falls through to the skip branch
+        # below and is never deleted.
+        rm -rf "$entry"
+        REMOVED_LIST+=("$rel_entry/")
+        REMOVED_COUNT=$((REMOVED_COUNT + 1))
+        info "  removed (orphaned, not git-registered): $rel_entry"
+      else
+        warning "  skipped (git worktree remove refused -- likely uncommitted changes): $rel_entry"
+        [[ -n "$REMOVE_WT_OUTPUT" ]] && info "    $REMOVE_WT_OUTPUT"
+      fi
+    done
+  fi
+fi
+
+# Prune stale worktree metadata from git's internal tracking
+# This prevents "missing but already registered worktree" errors on reinstall
+info "Pruning git worktree metadata..."
+cd "$TARGET_PATH"
+git worktree prune 2>/dev/null || true
+
+success "Removed $REMOVED_COUNT files/directories"
+echo ""
+
+# ============================================================================
+# STEP 5b: Clean Up Orphaned Machine-Level Shims (#5738)
+# ============================================================================
+# Unlike everything else in this script, this step is NOT part of the
+# git-tracked removal manifest / PR flow above — it is a direct, best-effort
+# filesystem cleanup of `~/.local/bin/loom-*` symlinks left behind by the
+# retired loom-tools/ Python package (#4971). That is deliberate: these
+# eleven names (`_PMD_RETIRED_SHIM_NAMES` in provision-daemon.sh) have no
+# loom-daemon subcommand and can never regenerate, so a dangling one is dead
+# weight for EVERY repo Loom is installed into on this machine, not just
+# $TARGET_PATH — unlike the machine-level `loom`/`loom-daemon` dispatcher and
+# the three REPAIRABLE shims (`loom-clean`, `loom-recover-orphans`,
+# `loom-claim`), which stay untouched here because they are live, shared,
+# working resources (see the NOTE above Step 2's REMOVE_FILES loop).
+# `_pmd_cleanup_retired_shims` only ever removes a symlink that is BOTH
+# loom-tools-owned (target path contains a `loom-tools` segment) AND
+# dangling (target does not exist) — a same-named user script, or a link
+# with a live target, is left alone unconditionally.
+header "Step 5b: Cleaning Up Orphaned Machine-Level Shims"
+echo ""
+_pmd_cleanup_retired_shims "${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}"
+success "Orphaned shim cleanup complete"
+echo ""
+
+# ============================================================================
+# STEP 6: Smart Remove CLAUDE.md
+# ============================================================================
+CURRENT_STEP="Smart Remove"
+header "Step 6: Smart File Processing"
+echo ""
+
+# Handle CLAUDE.md
+if [[ -f "$WORKTREE_ABS/CLAUDE.md" ]]; then
+  CLAUDE_MD="$WORKTREE_ABS/CLAUDE.md"
+
+  # Check for BEGIN/END markers
+  if grep -q '<!-- BEGIN LOOM ORCHESTRATION -->' "$CLAUDE_MD" 2>/dev/null && \
+     grep -q '<!-- END LOOM ORCHESTRATION -->' "$CLAUDE_MD" 2>/dev/null; then
+    # Remove only the Loom section (between markers, inclusive)
+    info "Removing Loom section from CLAUDE.md (marker-based)..."
+
+    # Use sed to remove everything between markers (inclusive).
+    # Portable in-place: pipe through a temp file and mv, avoiding the BSD vs
+    # GNU `sed -i` syntax divergence (matches the house idiom in version.sh).
+    sed '/<!-- BEGIN LOOM ORCHESTRATION -->/,/<!-- END LOOM ORCHESTRATION -->/d' "$CLAUDE_MD" > "${CLAUDE_MD}.tmp" && mv "${CLAUDE_MD}.tmp" "$CLAUDE_MD"
+
+    # Clean up any trailing blank lines (awk equivalent of the old sed
+    # blank-trim, consistent with the .gitignore handling below).
+    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$CLAUDE_MD" > "${CLAUDE_MD}.tmp" && mv "${CLAUDE_MD}.tmp" "$CLAUDE_MD"
+
+    # If file is now empty or only whitespace, remove it
+    if [[ ! -s "$CLAUDE_MD" ]] || ! grep -q '[^[:space:]]' "$CLAUDE_MD" 2>/dev/null; then
+      rm -f "$CLAUDE_MD"
+      REMOVED_LIST+=("CLAUDE.md")
+      success "CLAUDE.md removed (was entirely Loom content)"
+    else
+      REMOVED_LIST+=("CLAUDE.md (Loom section removed)")
+      success "CLAUDE.md Loom section removed, user content preserved"
+    fi
+  else
+    # No markers — decide whether this file is a Loom-generated guide or
+    # consumer-authored content that merely mentions Loom.
+    #
+    # The pre-#3450 heuristic ("either of two substrings appears anywhere")
+    # destroyed 1011-line consumer CLAUDE.md files whose changelog or code
+    # blocks quoted the legacy phrases. The stronger structural gate below
+    # requires the file to LOOK LIKE the Loom template:
+    #
+    #   1. Its first non-empty line is the Loom header — consumer files
+    #      that quote the header in a code block fail this anchor check.
+    #   2. The "Generated by Loom Installation Process" footer appears
+    #      within the last 5 lines (matching the template's footer slot).
+    #
+    # Both anchors are positional: a consumer can mention the phrases
+    # mid-document, but only the Loom installer writes a file whose first
+    # line IS the header and whose last 5 lines END with the footer.
+    #
+    # If you change this gate, run scripts/test-installer.sh Tests 31 / 49 /
+    # 49b (Loom-stub removal vs. consumer-preservation under legacy phrases).
+    CLAUDE_LINES=$(wc -l < "$CLAUDE_MD" 2>/dev/null | tr -d ' ')
+    CLAUDE_LINES=${CLAUDE_LINES:-0}
+    # First non-empty, non-whitespace-only line (case the file starts with blank lines)
+    FIRST_NONEMPTY=$(awk 'NF { print; exit }' "$CLAUDE_MD" 2>/dev/null)
+    # Footer must appear in the last 5 lines (positional)
+    HAS_FOOTER_IN_TAIL=false
+    if tail -n 5 "$CLAUDE_MD" 2>/dev/null | grep -q 'Generated by Loom Installation Process'; then
+      HAS_FOOTER_IN_TAIL=true
+    fi
+    if [[ "$FIRST_NONEMPTY" == '# Loom Orchestration - Repository Guide' ]] && \
+       [[ "$HAS_FOOTER_IN_TAIL" == "true" ]]; then
+      # Structurally identical to the Loom-shipped CLAUDE.md template:
+      # header is the first non-empty line, footer is in the last 5 lines.
+      rm -f "$CLAUDE_MD"
+      REMOVED_LIST+=("CLAUDE.md")
+      success "CLAUDE.md removed (Loom-generated, ${CLAUDE_LINES} lines)"
+    else
+      # Consumer content (or ambiguous): preserve. Issue #3450 — a permissive
+      # heuristic deleted 1011-line consumer files that happened to mention
+      # the legacy signature phrases. When in doubt, preserve.
+      info "CLAUDE.md does not match Loom-template shape (${CLAUDE_LINES} lines) — preserving"
+    fi
+  fi
+fi
+
+# Handle AGENTS.md (issue #4479, dual-runtime instruction anchor).
+#
+# Unlike CLAUDE.md, AGENTS.md has no historical "legacy full-guide-in-root"
+# layout to detect — it is a fresh dual-runtime addition — so there is no
+# markerless structural-anchor removal branch here. If the AGENTS section
+# markers are present, remove just that section (preserving surrounding user
+# content). If markers are absent, preserve the file untouched: we cannot
+# distinguish a hand-authored AGENTS.md from a Loom-managed one without markers,
+# and preserving is the safe default (same philosophy as CLAUDE.md's "when in
+# doubt, preserve").
+if [[ -f "$WORKTREE_ABS/AGENTS.md" ]]; then
+  AGENTS_MD="$WORKTREE_ABS/AGENTS.md"
+
+  if grep -q '<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->' "$AGENTS_MD" 2>/dev/null && \
+     grep -q '<!-- END LOOM ORCHESTRATION (AGENTS) -->' "$AGENTS_MD" 2>/dev/null; then
+    info "Removing Loom section from AGENTS.md (marker-based)..."
+
+    sed '/<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->/,/<!-- END LOOM ORCHESTRATION (AGENTS) -->/d' "$AGENTS_MD" > "${AGENTS_MD}.tmp" && mv "${AGENTS_MD}.tmp" "$AGENTS_MD"
+
+    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$AGENTS_MD" > "${AGENTS_MD}.tmp" && mv "${AGENTS_MD}.tmp" "$AGENTS_MD"
+
+    if [[ ! -s "$AGENTS_MD" ]] || ! grep -q '[^[:space:]]' "$AGENTS_MD" 2>/dev/null; then
+      rm -f "$AGENTS_MD"
+      REMOVED_LIST+=("AGENTS.md")
+      success "AGENTS.md removed (was entirely Loom content)"
+    else
+      REMOVED_LIST+=("AGENTS.md (Loom section removed)")
+      success "AGENTS.md Loom section removed, user content preserved"
+    fi
+  else
+    info "AGENTS.md has no Loom markers — preserving (cannot distinguish from hand-authored content)"
+  fi
+fi
+
+# Handle .loom/CLAUDE.md - remove the full Loom guide written by install
+if [[ -f "$WORKTREE_ABS/.loom/CLAUDE.md" ]]; then
+  rm -f "$WORKTREE_ABS/.loom/CLAUDE.md"
+  REMOVED_LIST+=(".loom/CLAUDE.md")
+  success ".loom/CLAUDE.md removed"
+fi
+
+# Handle .loom/AGENTS.md - remove the full Loom guide written by install
+if [[ -f "$WORKTREE_ABS/.loom/AGENTS.md" ]]; then
+  rm -f "$WORKTREE_ABS/.loom/AGENTS.md"
+  REMOVED_LIST+=(".loom/AGENTS.md")
+  success ".loom/AGENTS.md removed"
+fi
+
+# Handle .github/labels.yml — strip only the Loom-managed label block (#4187)
+#
+# labels.yml is the one scaffolding file a consumer legitimately co-owns: Loom
+# ships its workflow labels wrapped in `# BEGIN LOOM LABELS` / `# END LOOM
+# LABELS` markers, but a consumer may add their own labels to the same file.
+# Uninstall therefore removes ONLY the marked range, deleting the whole file
+# only when nothing meaningful remains outside it. A legacy markerless file is
+# deleted only when it is byte-identical to a shipped Loom template — otherwise
+# it is preserved with a warning, since it may hold consumer-authored labels.
+if [[ -f "$WORKTREE_ABS/.github/labels.yml" ]]; then
+  LABELS_YML="$WORKTREE_ABS/.github/labels.yml"
+
+  # Malformed-marker guard (mirrors CLAUDE.md / .gitignore): require exactly one
+  # BEGIN and one END marker, with BEGIN strictly before END, before we splice.
+  LABELS_BEGIN_COUNT=$(grep -c '^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null || true)
+  LABELS_END_COUNT=$(grep -c '^[[:space:]]*# END LOOM LABELS[[:space:]]*$' "$LABELS_YML" 2>/dev/null || true)
+
+  if [[ "$LABELS_BEGIN_COUNT" == "1" && "$LABELS_END_COUNT" == "1" ]] && \
+     awk '/^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$/ { b = NR }
+          /^[[:space:]]*# END LOOM LABELS[[:space:]]*$/   { e = NR }
+          END { exit !(b > 0 && e > 0 && b < e) }' "$LABELS_YML"; then
+    info "Removing Loom label block from .github/labels.yml (marker-based)..."
+
+    # Delete BEGIN..END inclusive; leave every other line byte-for-byte intact.
+    sed '/^[[:space:]]*# BEGIN LOOM LABELS[[:space:]]*$/,/^[[:space:]]*# END LOOM LABELS[[:space:]]*$/d' \
+      "$LABELS_YML" > "${LABELS_YML}.tmp" && mv "${LABELS_YML}.tmp" "$LABELS_YML"
+
+    # Trim now-trailing blank lines (same idiom as the CLAUDE.md handler).
+    awk 'NF || prev_blank++ < 1 { print; if (NF) prev_blank=0 }' "$LABELS_YML" > "${LABELS_YML}.tmp" && mv "${LABELS_YML}.tmp" "$LABELS_YML"
+
+    # Delete the file only when nothing meaningful remains outside the block —
+    # i.e. it is empty, whitespace-only, or comments-only (no `- name:` entries).
+    if [[ ! -s "$LABELS_YML" ]] || ! grep -qE '^[[:space:]]*-[[:space:]]*name:' "$LABELS_YML" 2>/dev/null; then
+      rm -f "$LABELS_YML"
+      REMOVED_LIST+=(".github/labels.yml")
+      success ".github/labels.yml removed (only Loom labels remained)"
+    else
+      REMOVED_LIST+=(".github/labels.yml (Loom label block removed)")
+      success ".github/labels.yml Loom label block removed, consumer labels preserved"
+    fi
+  else
+    if [[ "$LABELS_BEGIN_COUNT" != "0" || "$LABELS_END_COUNT" != "0" ]]; then
+      warning ".github/labels.yml has malformed Loom markers — preserving file to avoid data loss"
+    fi
+    # Markerless file: delete ONLY if byte-identical to a shipped Loom template
+    # (a pristine pre-marker install). Otherwise preserve — it may hold
+    # consumer-authored labels.
+    SHIPPED_LABELS_TEMPLATE="$LOOM_ROOT/defaults/.github/labels.yml"
+    if [[ "$LABELS_BEGIN_COUNT" == "0" && "$LABELS_END_COUNT" == "0" ]] && \
+       [[ -f "$SHIPPED_LABELS_TEMPLATE" ]] && \
+       cmp -s "$LABELS_YML" "$SHIPPED_LABELS_TEMPLATE"; then
+      rm -f "$LABELS_YML"
+      REMOVED_LIST+=(".github/labels.yml")
+      success ".github/labels.yml removed (byte-identical to shipped Loom template)"
+    else
+      info ".github/labels.yml has no Loom markers and differs from the shipped template — preserving (may contain consumer labels)"
+    fi
+  fi
+fi
+
+# Handle .gitignore - remove the Loom-managed block
+#
+# Issue #3590: the Loom-managed region is delimited by sentinel markers written
+# by `update_gitignore` (loom-daemon/src/init/post_init.rs). Deleting the whole
+# marked span in one pass is the single source of truth — it removes every Loom
+# pattern (not a drifted 4-item subset) and never reflows user spacing outside
+# the block, so an install -> uninstall -> install round-trip is byte-stable.
+# The markers mirror the `<!-- BEGIN/END LOOM ORCHESTRATION -->` convention used
+# for CLAUDE.md above.
+if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
+  info "Removing Loom patterns from .gitignore..."
+
+  GITIGNORE="$WORKTREE_ABS/.gitignore"
+
+  # Keep these in sync with post_init.rs (GITIGNORE_BEGIN_MARKER / END_MARKER).
+  GITIGNORE_BEGIN_MARKER="# >>> loom-managed (do not edit) >>>"
+  GITIGNORE_END_MARKER="# <<< loom-managed <<<"
+
+  MODIFIED=false
+
+  if grep -qxF "$GITIGNORE_BEGIN_MARKER" "$GITIGNORE" 2>/dev/null && \
+     grep -qxF "$GITIGNORE_END_MARKER" "$GITIGNORE" 2>/dev/null; then
+    # Marker-delimited block: delete BEGIN..END inclusive in a single pass.
+    # Exact-line matching (awk `$0==`) needs no regex escaping and leaves every
+    # other line — including user blank lines — byte-for-byte untouched.
+    awk -v b="$GITIGNORE_BEGIN_MARKER" -v e="$GITIGNORE_END_MARKER" '
+      $0 == b { inblock = 1; next }
+      inblock { if ($0 == e) inblock = 0; next }
+      { print }
+    ' "$GITIGNORE" > "${GITIGNORE}.tmp" && mv "${GITIGNORE}.tmp" "$GITIGNORE"
+    MODIFIED=true
+  else
+    # Backward-compat: legacy markerless installs (pre-#3590) wrote a header
+    # plus bare patterns. Remove the known headers and the full authoritative
+    # pattern set by exact whole-line match. This enumerated list exists ONLY
+    # for these legacy files; the marker path above is the source of truth for
+    # current installs. Blank lines are left as-is (no whole-file reflow).
+    LOOM_LEGACY_LINES=(
+      "# Loom runtime state (don't commit these)"
+      "# Loom - AI Development Orchestration"
+      ".loom-in-use"
+      ".loom-checkpoint"
+      ".loom/.daemon.pid"
+      ".loom/.daemon.log"
+      ".loom/daemon.sock"
+      ".loom/daemon-loop.pid"
+      ".loom/daemon-metrics.json"
+      ".loom/loom-source-path"
+      ".loom/spawn-loop-state.json"
+      ".loom/issue-failures.json"
+      ".loom/interventions/"
+      ".loom/worktrees/"
+      ".loom/state.json"
+      ".loom/mcp-command.json"
+      ".loom/activity.db"
+      ".loom/claims/"
+      ".loom/signals/"
+      ".loom/status/"
+      ".loom/retry-state/"
+      ".loom/diagnostics/"
+      ".loom/guide-docs-state.json"
+      ".loom/metrics_state.json"
+      ".loom/manifest.json"
+      ".loom/stuck-config.json"
+      ".loom/metrics/"
+      ".loom/usage-cache.json"
+      ".loom/claude-config/"
+      ".loom/*.log"
+      ".loom/*.sock"
+      ".loom/logs/"
+    )
+    for pattern in "${LOOM_LEGACY_LINES[@]}"; do
+      if grep -qxF "$pattern" "$GITIGNORE" 2>/dev/null; then
+        grep -vxF "$pattern" "$GITIGNORE" > "${GITIGNORE}.tmp" || true
+        mv "${GITIGNORE}.tmp" "$GITIGNORE"
+        MODIFIED=true
+      fi
+    done
+  fi
+
+  if [[ "$MODIFIED" == "true" ]]; then
+    # If file is now empty (or only whitespace), remove it
+    if [[ ! -s "$GITIGNORE" ]] || ! grep -q '[^[:space:]]' "$GITIGNORE" 2>/dev/null; then
+      rm -f "$GITIGNORE"
+      REMOVED_LIST+=(".gitignore")
+      success ".gitignore removed (was entirely Loom patterns)"
+    else
+      REMOVED_LIST+=(".gitignore (Loom patterns removed)")
+      success ".gitignore Loom patterns removed"
+    fi
+  else
+    info ".gitignore had no Loom patterns to remove"
+  fi
+fi
+
+# Handle .gitattributes - remove the Loom-managed merge-driver block (#4528)
+#
+# Written by scripts/install/gitattributes.sh (full/quick install) and
+# defaults/scripts/resync-installed.sh (self-heal on existing installs) to
+# give .loom/install-metadata.json a `merge=ours` attribute. Marker-delimited
+# the same way as the CLAUDE.md / .gitignore blocks above — delete BEGIN..END
+# inclusive in one pass, leaving any other .gitattributes content untouched.
+if [[ -f "$WORKTREE_ABS/.gitattributes" ]]; then
+  GITATTRS="$WORKTREE_ABS/.gitattributes"
+  GITATTRS_BEGIN_MARKER="# BEGIN LOOM-MANAGED (merge drivers, #4528)"
+  GITATTRS_END_MARKER="# END LOOM-MANAGED (merge drivers, #4528)"
+
+  if grep -qxF "$GITATTRS_BEGIN_MARKER" "$GITATTRS" 2>/dev/null && \
+     grep -qxF "$GITATTRS_END_MARKER" "$GITATTRS" 2>/dev/null; then
+    info "Removing Loom-managed merge-driver block from .gitattributes..."
+    awk -v b="$GITATTRS_BEGIN_MARKER" -v e="$GITATTRS_END_MARKER" '
+      $0 == b { inblock = 1; next }
+      inblock { if ($0 == e) inblock = 0; next }
+      { print }
+    ' "$GITATTRS" > "${GITATTRS}.tmp" && mv "${GITATTRS}.tmp" "$GITATTRS"
+
+    if [[ ! -s "$GITATTRS" ]] || ! grep -q '[^[:space:]]' "$GITATTRS" 2>/dev/null; then
+      rm -f "$GITATTRS"
+      REMOVED_LIST+=(".gitattributes")
+      success ".gitattributes removed (was entirely Loom-managed content)"
+    else
+      REMOVED_LIST+=(".gitattributes (Loom-managed block removed)")
+      success ".gitattributes Loom-managed block removed"
+    fi
+  fi
+fi
+
+# Handle .claude/settings.json - remove only Loom hooks and permissions
+if [[ -f "$WORKTREE_ABS/.claude/settings.json" ]]; then
+  SETTINGS_FILE="$WORKTREE_ABS/.claude/settings.json"
+  LOOM_DEFAULTS_SETTINGS="$LOOM_ROOT/defaults/.claude/settings.json"
+  info "Removing Loom hooks and permissions from .claude/settings.json..."
+
+  if command -v jq &> /dev/null && [[ -f "$LOOM_DEFAULTS_SETTINGS" ]]; then
+    # Use jq to selectively remove Loom hooks (command starts with .loom/hooks/)
+    # and Loom permissions (exact matches from defaults)
+
+    # Build jq filter to remove Loom hooks
+    # Step 1: Remove hooks whose command starts with the new Loom prefix
+    #         (${CLAUDE_PROJECT_DIR}/.loom/hooks/) OR the legacy bare-relative
+    #         prefix (.loom/hooks/) from pre-3265 installs. Both must be
+    #         stripped so uninstall is clean regardless of when Loom was first
+    #         installed.
+    # Step 2: Clean up empty matcher entries and hook types
+    # Step 3: Remove Loom-specific permissions
+    LOOM_PERMS=$(jq -r '.permissions.allow // [] | .[]' "$LOOM_DEFAULTS_SETTINGS" 2>/dev/null)
+
+    # Build the jq permission removal filter
+    PERM_FILTER=""
+    while IFS= read -r perm; do
+      [[ -z "$perm" ]] && continue
+      # Escape special jq characters
+      escaped_perm=$(printf '%s' "$perm" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      if [[ -n "$PERM_FILTER" ]]; then
+        PERM_FILTER="$PERM_FILTER, \"$escaped_perm\""
+      else
+        PERM_FILTER="\"$escaped_perm\""
+      fi
+    done <<< "$LOOM_PERMS"
+
+    # Same treatment for .permissions.deny (#6366) -- without this, a Loom
+    # deny entry survives uninstall forever: .permissions.allow empties out
+    # and gets deleted, but .permissions.deny (untouched) keeps .permissions
+    # non-empty, so the whole-file "was entirely Loom content" cleanup below
+    # never fires and .claude/settings.json is left behind with just the
+    # deny block.
+    LOOM_DENY=$(jq -r '.permissions.deny // [] | .[]' "$LOOM_DEFAULTS_SETTINGS" 2>/dev/null)
+
+    DENY_FILTER=""
+    while IFS= read -r deny; do
+      [[ -z "$deny" ]] && continue
+      escaped_deny=$(printf '%s' "$deny" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      if [[ -n "$DENY_FILTER" ]]; then
+        DENY_FILTER="$DENY_FILTER, \"$escaped_deny\""
+      else
+        DENY_FILTER="\"$escaped_deny\""
+      fi
+    done <<< "$LOOM_DENY"
+
+    # Apply the combined jq transformation.
+    #
+    # Note: $hook_prefix is the new Loom prefix, which contains the literal
+    # string '${CLAUDE_PROJECT_DIR}'. We single-quote the value passed to
+    # --arg so bash does NOT expand the variable -- the shell's
+    # $CLAUDE_PROJECT_DIR is unset/empty in this context, and we need the
+    # literal string preserved so jq's startswith check matches the
+    # template-installed entries verbatim.
+    jq --arg hook_prefix '${CLAUDE_PROJECT_DIR}/.loom/hooks/' \
+       --arg legacy_hook_prefix '.loom/hooks/' "
+      # Remove Loom hooks (commands starting with either the new prefix or
+      # the legacy bare-relative prefix from pre-3265 installs)
+      (if .hooks then
+        .hooks |= with_entries(
+          .value |= map(
+            .hooks |= map(select(
+              (.command | startswith(\$hook_prefix))
+              or (.command | startswith(\$legacy_hook_prefix))
+              | not
+            ))
+          )
+          | .value |= map(select(.hooks | length > 0))
+        )
+        | if (.hooks | to_entries | map(select(.value | length > 0)) | length) == 0
+          then del(.hooks)
+          else .hooks |= with_entries(select(.value | length > 0))
+          end
+      else . end)
+      # Remove Loom permissions (both allow and deny -- #6366)
+      | (if .permissions.allow then
+          .permissions.allow |= map(select(. as \$p | [$PERM_FILTER] | index(\$p) | not))
+          | if (.permissions.allow | length) == 0 then del(.permissions.allow) else . end
+        else . end)
+      | (if .permissions.deny then
+          .permissions.deny |= map(select(. as \$p | [$DENY_FILTER] | index(\$p) | not))
+          | if (.permissions.deny | length) == 0 then del(.permissions.deny) else . end
+        else . end)
+      | if .permissions == {} then del(.permissions) else . end
+    " "$SETTINGS_FILE" > "${SETTINGS_FILE}.tmp" 2>/dev/null
+
+    if [[ $? -eq 0 ]] && [[ -s "${SETTINGS_FILE}.tmp" ]]; then
+      mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
+
+      # Check if file is now essentially empty (just {})
+      remaining=$(jq 'to_entries | length' "$SETTINGS_FILE" 2>/dev/null || echo "0")
+      if [[ "$remaining" == "0" ]]; then
+        rm -f "$SETTINGS_FILE"
+        REMOVED_LIST+=(".claude/settings.json")
+        success ".claude/settings.json removed (was entirely Loom content)"
+      else
+        REMOVED_LIST+=(".claude/settings.json (Loom hooks/permissions removed)")
+        success ".claude/settings.json Loom hooks and permissions removed, project settings preserved"
+      fi
+    else
+      rm -f "${SETTINGS_FILE}.tmp"
+      warning "Failed to process .claude/settings.json with jq - preserving as-is"
+    fi
+  else
+    if ! command -v jq &> /dev/null; then
+      warning "jq not available - cannot selectively remove Loom hooks from .claude/settings.json"
+      info "To complete removal, manually edit .claude/settings.json and remove hooks with .loom/hooks/ commands"
+    else
+      warning "Loom defaults settings not found - cannot determine which permissions to remove"
+      info "To complete removal, manually edit .claude/settings.json and remove Loom entries"
+    fi
+  fi
+fi
+
+echo ""
+
+# ============================================================================
+# STEP 7: Clean Up Empty Directories
+# ============================================================================
+CURRENT_STEP="Clean Directories"
+header "Step 7: Cleaning Empty Directories"
+echo ""
+
+for dir in "${REMOVE_DIRS[@]}"; do
+  dir_path="$WORKTREE_ABS/$dir"
+  if [[ -d "$dir_path" ]]; then
+    # Check if directory holds foreign content (files or symlinks), ignoring
+    # empty subdirectories and .DS_Store.
+    #
+    # Issue #3634: count files AND symlinks — `\( -type f -o -type l \)` — rather
+    # than `-type f` (regular files only) or `-mindepth 1` (any child).
+    #
+    # `-type f` alone does NOT count symlinks (type `l`), so a directory whose
+    # only remaining content is a co-installed tool's symlink dir — e.g. Repo
+    # Skills' `.claude/commands/repo/` of symlinks — was judged "empty" and
+    # `rm -rf`'d, clobbering a foreign tool's install (the original bug).
+    #
+    # `-mindepth 1` over-corrects: it counts empty subdirectories as content.
+    # `REMOVE_DIRS` is NOT strictly child-first (`.loom/scripts` precedes
+    # `.loom/scripts/cli`), so a parent dir gets checked while its still-empty
+    # child exists → deemed non-empty → left behind, orphaning real Loom cruft
+    # (regressing CI Test 29).
+    #
+    # `\( -type f -o -type l \)` is the right signal: files/symlinks are foreign
+    # content to PRESERVE, while empty dirs are Loom cruft to REMOVE. A foreign
+    # symlink dir keeps its symlink (found → preserved); a Loom dir holding only
+    # empty subdirs finds nothing → removed. Order-independent.
+    #
+    # `-print -quit` (instead of piping to `head -1`) avoids SIGPIPE on `find`,
+    # which under `set -o pipefail` would trip the EXIT trap and abort the script.
+    remaining=$(find "$dir_path" \( -type f -o -type l \) -not -name '.DS_Store' -print -quit 2>/dev/null)
+    if [[ -z "$remaining" ]]; then
+      rm -rf "$dir_path"
+      REMOVED_LIST+=("$dir/ (empty directory)")
+      success "Removed empty directory: $dir"
+    fi
+    # Silently skip non-empty directories — they contain project-specific files
+  fi
+done
+
+echo ""
+
+# ============================================================================
+# STEP 8: Create PR (skipped in local mode)
+# ============================================================================
+if [[ "$LOCAL_MODE" == "true" ]]; then
+  # Local mode: stage changes but don't commit or create PR
+  CURRENT_STEP="Local Complete"
+  header "Step 8: Local Mode Complete"
+  echo ""
+
+  cd "$TARGET_PATH"
+
+  # Issue #3545: stage ONLY the paths this uninstall actually touched — never a
+  # bare `git add -A`. A bare `git add -A` stages every pending change in the
+  # tree, sweeping unrelated user work (in-progress edits, an embedded
+  # `.claude/worktrees/agent-*/`, etc.) into the index alongside the Loom
+  # deletions. The `install.sh --quick` reinstall path then prints generic
+  # `git add -A && git commit` guidance that would commit those user files.
+  # Scope staging to the Loom-managed paths that were removed / smart-edited so
+  # user files are never staged.
+  STAGE_PATHS=(
+    ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"}
+    ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}
+    ${SMART_REMOVE_FILES[@]+"${SMART_REMOVE_FILES[@]}"}
+    ".loom/CLAUDE.md"
+    ".loom/AGENTS.md"
+  )
+  for _stage_path in ${STAGE_PATHS[@]+"${STAGE_PATHS[@]}"}; do
+    # `-A` stages deletions and modifications alike; per-path invocation with
+    # `|| true` tolerates pathspecs that never matched (e.g. an untracked file
+    # that was removed, or a smart-remove target that did not exist).
+    git add -A -- "$_stage_path" 2>/dev/null || true
+  done
+
+  if git diff --staged --quiet; then
+    info "No changes detected - Loom files may have already been removed"
+    trap - EXIT SIGINT SIGTERM
+    echo ""
+    success "No changes needed - Loom appears to already be removed"
+    exit 0
+  fi
+
+  # Disable error trap - we completed successfully
+  trap - EXIT SIGINT SIGTERM
+
+  echo ""
+  success "Loom files removed from working directory"
+  info "Changes are staged but not committed (caller will handle commit)"
+  echo ""
+
+  info "Removed ${#REMOVED_LIST[@]} items:"
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    echo "  - $item"
+  done
+
+  if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
+    PRESERVED_COUNT=$(( ${#UNKNOWN_FILES[@]} - ${#REMOVE_UNKNOWN_FILES[@]} ))
+    if [[ $PRESERVED_COUNT -gt 0 ]]; then
+      echo ""
+      info "$PRESERVED_COUNT unknown files were preserved"
+    fi
+  fi
+
+  echo ""
+else
+  CURRENT_STEP="Create PR"
+  header "Step 8: Creating Pull Request"
+  echo ""
+
+  # Build the PR description with removal summary
+  REMOVED_SUMMARY=""
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    REMOVED_SUMMARY="${REMOVED_SUMMARY}\n- \`${item}\`"
+  done
+
+  # Extract version from the target repo's installed Loom if possible
+  INSTALLED_VERSION="unknown"
+  if [[ -f "$WORKTREE_ABS/.loom/config.json" ]] 2>/dev/null; then
+    INSTALLED_VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$WORKTREE_ABS/.loom/config.json" 2>/dev/null | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/"//' || echo "unknown")
+  fi
+
+  # Set environment variables for create-pr.sh
+  export LOOM_VERSION="${INSTALLED_VERSION}"
+  export LOOM_COMMIT="uninstall"
+
+  export COMMIT_MSG="Remove Loom orchestration framework
+
+Removes Loom configuration, roles, scripts, and tooling:
+- .loom/ directory (configuration, roles, scripts)
+- .claude/ slash commands and agent definitions
+- .codex/ configuration
+- .github/ Loom-specific labels and issue templates
+- CLAUDE.md and AGENTS.md documentation
+- .gitignore Loom patterns
+- Runtime artifacts (state files, logs)"
+
+  export PR_TITLE="Remove Loom orchestration framework"
+
+  # Build the PR body
+  PR_BODY_TEXT="## Loom Uninstallation
+
+This PR removes Loom orchestration framework from the repository.
+
+## What's Removed
+"
+
+  # Add removed files list
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    PR_BODY_TEXT="${PR_BODY_TEXT}
+- \`${item}\`"
+  done
+
+  PR_BODY_TEXT="${PR_BODY_TEXT}
+
+## Unknown Files
+"
+
+  # Add unknown files section
+  if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
+    if [[ ${#REMOVE_UNKNOWN_FILES[@]} -gt 0 ]]; then
+      PR_BODY_TEXT="${PR_BODY_TEXT}
+The following non-standard files were also removed (user-approved):"
+      for f in "${REMOVE_UNKNOWN_FILES[@]}"; do
+        PR_BODY_TEXT="${PR_BODY_TEXT}
+- \`$f\`"
+      done
+    fi
+
+    PRESERVED_UNKNOWN=()
+    for f in "${UNKNOWN_FILES[@]}"; do
+      is_removed=false
+      for r in ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}; do
+        if [[ "$f" == "$r" ]]; then
+          is_removed=true
+          break
+        fi
+      done
+      if [[ "$is_removed" == "false" ]]; then
+        PRESERVED_UNKNOWN+=("$f")
+      fi
+    done
+
+    if [[ ${#PRESERVED_UNKNOWN[@]} -gt 0 ]]; then
+      if [[ ${#PRESERVED_UNKNOWN[@]} -le 20 ]]; then
+        PR_BODY_TEXT="${PR_BODY_TEXT}
+
+The following non-standard files were preserved:"
+        for f in "${PRESERVED_UNKNOWN[@]}"; do
+          PR_BODY_TEXT="${PR_BODY_TEXT}
+- \`$f\`"
+        done
+      else
+        PR_BODY_TEXT="${PR_BODY_TEXT}
+
+${#PRESERVED_UNKNOWN[@]} non-standard files were preserved (too many to list individually)."
+      fi
+    fi
+  else
+    PR_BODY_TEXT="${PR_BODY_TEXT}
+No unknown files detected."
+  fi
+
+  PR_BODY_TEXT="${PR_BODY_TEXT}
+
+## Post-Merge Steps
+
+After merging this PR:
+1. Optionally remove loom:* labels from the repository
+2. Optionally remove branch rulesets added by Loom
+
+---
+Generated by [Loom](https://github.com/rjwalters/loom) uninstall"
+
+  export PR_BODY="$PR_BODY_TEXT"
+
+  # Check if there are actual changes to commit
+  #
+  # #8734 audit (follow-up to #7818/#8005): this `git add -A` is confirmed
+  # SAFE against the credential-bearing class without needing the
+  # `':!...'`-pathspec exclusion applied to land-resync-commit.sh /
+  # resync-installed.sh / the initial-commit sites in install(-loom).sh.
+  # WORKTREE_ABS here is `$TARGET_PATH/$WORKTREE_PATH` -- a git worktree this
+  # script itself created moments earlier (Step 4, `git worktree add -b
+  # "$BRANCH_NAME" "$WORKTREE_PATH" "$BASE_BRANCH"`) as a fresh checkout of
+  # the *base branch's tracked tree*. `git worktree add` never copies
+  # untracked files from the originating checkout into the new worktree, so
+  # any live untracked credential path (.loom/tokens/, .loom/accounts.env,
+  # etc.) sitting in $TARGET_PATH's own working directory structurally cannot
+  # appear here -- there is nothing for `git add -A` to sweep up. (The other
+  # mode, LOCAL_MODE, DOES operate directly on $TARGET_PATH's live working
+  # directory -- but that mode never reaches this line: see the `if
+  # [[ "$LOCAL_MODE" == "true" ]]` branch above, which already stages only
+  # the specific Loom-managed paths it touched via a scoped `git add -A --
+  # "$_stage_path"` loop, issue #3545.)
+  cd "$WORKTREE_ABS"
+  git add -A
+
+  if git diff --staged --quiet; then
+    info "No changes detected - Loom files may have already been removed"
+
+    # Clean up worktree
+    cd "$TARGET_PATH"
+    git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
+    git branch -D "$BRANCH_NAME" 2>/dev/null || true
+
+    trap - EXIT SIGINT SIGTERM
+    echo ""
+    success "No changes needed - Loom appears to already be removed"
+    exit 0
+  fi
+
+  # Use create-pr.sh to handle commit, push, and PR creation
+  if [[ -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
+    TARGET_BRANCH="${DEFAULT_BRANCH#origin/}"
+
+    PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$WORKTREE_ABS" "$TARGET_BRANCH") || \
+      error "Failed to create pull request"
+
+    # Parse output: PR_URL|MERGE_STATUS
+    LAST_OUTPUT_LINE=$(echo "$PR_URL_RAW" | tail -1)
+    PR_URL=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f1)
+    MERGE_STATUS=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f2)
+
+    # Validate PR URL
+    if [[ ! "$PR_URL" =~ ^https://github\.com/ ]]; then
+      PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]|]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+    fi
+
+    if [[ ! "$PR_URL" =~ ^https:// ]]; then
+      error "Invalid PR URL returned: $PR_URL"
+    fi
+
+    MERGE_STATUS="${MERGE_STATUS:-manual}"
+  else
+    error "create-pr.sh not found at $LOOM_ROOT/scripts/install/create-pr.sh"
+  fi
+
+  echo ""
+
+  # ============================================================================
+  # Complete
+  # ============================================================================
+  CURRENT_STEP="Complete"
+
+  # Disable error trap - we completed successfully
+  trap - EXIT SIGINT SIGTERM
+
+  echo ""
+  header "╔═══════════════════════════════════════════════════════════╗"
+  header "║              Loom Uninstall Complete                      ║"
+  header "╚═══════════════════════════════════════════════════════════╝"
+  echo ""
+
+  case "$MERGE_STATUS" in
+    merged)
+      success "Loom has been removed from the repository"
+      info "Pull request: $PR_URL (merged)"
+      ;;
+    auto)
+      success "Uninstall PR created with auto-merge enabled"
+      info "Pull request: $PR_URL (auto-merge enabled)"
+      ;;
+    *)
+      success "Uninstall PR created"
+      info "Pull request: $PR_URL"
+      echo ""
+      info "Review and merge the PR to complete the uninstall."
+      ;;
+  esac
+
+  echo ""
+
+  info "Removed ${#REMOVED_LIST[@]} items:"
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    echo "  - $item"
+  done
+
+  if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
+    PRESERVED_COUNT=$(( ${#UNKNOWN_FILES[@]} - ${#REMOVE_UNKNOWN_FILES[@]} ))
+    if [[ $PRESERVED_COUNT -gt 0 ]]; then
+      echo ""
+      info "$PRESERVED_COUNT unknown files were preserved"
+    fi
+  fi
+
+  echo ""
+  header "Post-Merge Steps:"
+  echo "  1. Remove loom:* labels (optional):"
+  echo "     gh label list | grep 'loom:' | awk '{print \$1}' | xargs -I{} gh label delete {} --yes"
+  echo "  2. Remove Loom branch rulesets (optional)"
+  echo ""
+fi

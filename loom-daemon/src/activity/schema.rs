@@ -1,0 +1,848 @@
+//! Database schema definitions for activity tracking.
+//!
+//! This module contains the SQL schema used to create and migrate
+//! the activity database tables.
+
+use anyhow::Result;
+use rusqlite::Connection;
+
+/// Initialize the database schema with all required tables and indexes.
+///
+/// This function is idempotent - it uses CREATE TABLE IF NOT EXISTS
+/// so it can be safely called on an existing database.
+#[allow(clippy::too_many_lines)]
+pub fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r"
+            CREATE TABLE IF NOT EXISTS agent_inputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                terminal_id TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                input_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                agent_role TEXT,
+                context TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_inputs_terminal_id ON agent_inputs(terminal_id);
+            CREATE INDEX IF NOT EXISTS idx_inputs_timestamp ON agent_inputs(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_inputs_type ON agent_inputs(input_type);
+
+            CREATE TABLE IF NOT EXISTS agent_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                terminal_id TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                content TEXT,
+                content_preview TEXT,
+                exit_code INTEGER,
+                metadata TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_outputs_input_id ON agent_outputs(input_id);
+            CREATE INDEX IF NOT EXISTS idx_outputs_terminal_id ON agent_outputs(terminal_id);
+            CREATE INDEX IF NOT EXISTS idx_outputs_timestamp ON agent_outputs(timestamp);
+
+            CREATE TABLE IF NOT EXISTS agent_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER NOT NULL,
+                result_type TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                status TEXT,
+                data TEXT,
+                FOREIGN KEY(input_id) REFERENCES agent_inputs(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_results_input_id ON agent_results(input_id);
+            CREATE INDEX IF NOT EXISTS idx_results_timestamp ON agent_results(timestamp);
+
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                started_at DATETIME,
+                completed_at DATETIME,
+                github_issue INTEGER,
+                github_pr INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS task_inputs (
+                task_id INTEGER NOT NULL,
+                input_id INTEGER NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES agent_tasks(id),
+                FOREIGN KEY(input_id) REFERENCES agent_inputs(id),
+                PRIMARY KEY(task_id, input_id)
+            );
+
+            -- Agent productivity metrics per task
+            CREATE TABLE IF NOT EXISTS agent_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                terminal_id TEXT NOT NULL,
+                agent_role TEXT NOT NULL,
+                agent_system TEXT NOT NULL,
+
+                -- Task identification
+                task_type TEXT,
+                github_issue INTEGER,
+                github_pr INTEGER,
+
+                -- Time tracking
+                started_at DATETIME NOT NULL,
+                completed_at DATETIME,
+                wall_time_seconds INTEGER,
+                active_time_seconds INTEGER,
+
+                -- Token usage
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                estimated_cost_usd REAL DEFAULT 0.0,
+
+                -- Outcome tracking
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                outcome_type TEXT,
+
+                -- Quality indicators
+                test_failures INTEGER DEFAULT 0,
+                ci_failures INTEGER DEFAULT 0,
+                commits_count INTEGER DEFAULT 0,
+                lines_changed INTEGER DEFAULT 0,
+
+                -- Metadata
+                context TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_metrics_agent_system ON agent_metrics(agent_system);
+            CREATE INDEX IF NOT EXISTS idx_metrics_task_type ON agent_metrics(task_type);
+            CREATE INDEX IF NOT EXISTS idx_metrics_completed ON agent_metrics(completed_at);
+            CREATE INDEX IF NOT EXISTS idx_metrics_github_issue ON agent_metrics(github_issue);
+            CREATE INDEX IF NOT EXISTS idx_metrics_status ON agent_metrics(status);
+
+            -- Token usage per API request (enhanced for LLM resource tracking)
+            --
+            -- SUPERSEDED (Issue #8059): this table has never had a writer, and
+            -- transcript ingestion deliberately does not add one — it writes to
+            -- `resource_usage` instead, which every cost analytics view already
+            -- reads and which carries the same counters. Writing both would
+            -- double-book the same tokens in one database. Kept (not dropped)
+            -- because older databases may contain rows and nothing depends on
+            -- removing it; do not add a writer without retiring one side first.
+            CREATE TABLE IF NOT EXISTS token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                metric_id INTEGER REFERENCES agent_metrics(id),
+                timestamp DATETIME NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                model TEXT,
+                estimated_cost_usd REAL DEFAULT 0.0,
+                -- Enhanced fields for resource tracking (Issue #1013)
+                tokens_cache_read INTEGER,    -- Cache read tokens (prompt caching)
+                tokens_cache_write INTEGER,   -- Cache write tokens (prompt caching)
+                duration_ms INTEGER,          -- API response time in milliseconds
+                provider TEXT                 -- 'anthropic', 'openai', etc.
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_token_usage_input_id ON token_usage(input_id);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_metric_id ON token_usage(metric_id);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model);
+            -- NOTE: idx_token_usage_provider is created in migrate_token_usage_table()
+            -- because the provider column may not exist in older databases.
+
+            -- Forge events for correlating agent activity with forge actions
+            -- NOTE: table name kept as 'github_events' for migration compatibility
+            CREATE TABLE IF NOT EXISTS github_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                activity_id INTEGER,
+                event_type TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                pr_number INTEGER,
+                issue_number INTEGER,
+                commit_sha TEXT,
+                author TEXT,
+                FOREIGN KEY (activity_id) REFERENCES agent_metrics(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_github_events_activity_id ON github_events(activity_id);
+            CREATE INDEX IF NOT EXISTS idx_github_events_event_type ON github_events(event_type);
+            CREATE INDEX IF NOT EXISTS idx_github_events_event_time ON github_events(event_time);
+            CREATE INDEX IF NOT EXISTS idx_github_events_pr_number ON github_events(pr_number);
+            CREATE INDEX IF NOT EXISTS idx_github_events_issue_number ON github_events(issue_number);
+
+            -- Per-prompt git change tracking
+            -- Links individual prompts to the git changes they caused
+            CREATE TABLE IF NOT EXISTS prompt_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                before_commit TEXT,
+                after_commit TEXT,
+                files_changed INTEGER DEFAULT 0,
+                lines_added INTEGER DEFAULT 0,
+                lines_removed INTEGER DEFAULT 0,
+                tests_added INTEGER DEFAULT 0,
+                tests_modified INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prompt_changes_input_id ON prompt_changes(input_id);
+            CREATE INDEX IF NOT EXISTS idx_prompt_changes_after_commit ON prompt_changes(after_commit);
+
+            -- Prompt-forge correlation table for linking prompts to forge actions
+            -- NOTE: table name kept as 'prompt_github' for migration compatibility
+            CREATE TABLE IF NOT EXISTS prompt_github (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                issue_number INTEGER,
+                pr_number INTEGER,
+                label_before TEXT,  -- JSON array of labels
+                label_after TEXT,   -- JSON array of labels
+                event_type TEXT NOT NULL  -- 'issue_created', 'pr_created', 'pr_merged', 'label_changed', etc.
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_input_id ON prompt_github(input_id);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_issue_number ON prompt_github(issue_number);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_pr_number ON prompt_github(pr_number);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_event_type ON prompt_github(event_type);
+
+            -- Quality metrics for tracking test outcomes and code quality
+            CREATE TABLE IF NOT EXISTS quality_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                timestamp DATETIME NOT NULL,
+
+                -- Test results
+                tests_passed INTEGER,
+                tests_failed INTEGER,
+                tests_skipped INTEGER,
+                test_runner TEXT,
+
+                -- Lint/format results
+                lint_errors INTEGER,
+                format_errors INTEGER,
+
+                -- Build status
+                build_success BOOLEAN,
+
+                -- PR review outcomes (populated later)
+                pr_approved BOOLEAN,
+                pr_changes_requested BOOLEAN,
+
+                -- Rework tracking (Issue #1054)
+                -- Counts how many review cycles a PR goes through
+                rework_count INTEGER DEFAULT 0,
+
+                -- Human rating (optional, for future use)
+                human_rating INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_quality_metrics_input_id ON quality_metrics(input_id);
+            CREATE INDEX IF NOT EXISTS idx_quality_metrics_timestamp ON quality_metrics(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_quality_metrics_test_runner ON quality_metrics(test_runner);
+
+            -- Resource usage tracking for LLM API calls (Issue #1053)
+            -- Links terminal output parsing to token consumption and costs
+            CREATE TABLE IF NOT EXISTS resource_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                timestamp DATETIME NOT NULL,
+                model TEXT NOT NULL,
+                tokens_input INTEGER NOT NULL,
+                tokens_output INTEGER NOT NULL,
+                tokens_cache_read INTEGER,
+                tokens_cache_write INTEGER,
+                cost_usd REAL NOT NULL,
+                duration_ms INTEGER,
+                provider TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_input_id ON resource_usage(input_id);
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_timestamp ON resource_usage(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_model ON resource_usage(model);
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_provider ON resource_usage(provider);
+
+            -- Transcript ingestion ledger (Issue #8059)
+            -- One row per Claude Code transcript whose token usage has been
+            -- ingested into resource_usage. `file_size`/`file_mtime` make an
+            -- unchanged transcript a cheap skip; `input_id` is the agent_inputs
+            -- anchor whose resource_usage rows are REPLACED (not appended to)
+            -- when a still-growing transcript is re-read, so repeated passes
+            -- can neither double-count nor miss a live session's tail.
+            CREATE TABLE IF NOT EXISTS transcript_ingest (
+                transcript_path TEXT PRIMARY KEY,
+                session_id TEXT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL,
+                rows_written INTEGER NOT NULL DEFAULT 0,
+                ingested_at DATETIME NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transcript_ingest_session ON transcript_ingest(session_id);
+            CREATE INDEX IF NOT EXISTS idx_transcript_ingest_input_id ON transcript_ingest(input_id);
+
+            -- Transcript archive ledger (Issue #8494; keyed per (transcript,
+            -- sink) since #8758). One row per Claude Code transcript already
+            -- rolled into a verified `.tar.zst` archive under a given sink.
+            -- `local` is the on-disk `.tar.zst` sink (#8494); a future remote
+            -- sink (s3/R2, sibling sub-issue #8759) ledgers its own rows for
+            -- the same transcripts without disturbing the local ones.
+            -- `file_size`/`file_mtime` make an unarchived-since-last-time
+            -- file a cheap skip, mirroring `transcript_ingest` above;
+            -- `archive_file` names which archive currently holds it, for
+            -- selective restore.
+            CREATE TABLE IF NOT EXISTS transcript_archive (
+                transcript_path TEXT NOT NULL,
+                sink TEXT NOT NULL DEFAULT 'local',
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                archive_file TEXT NOT NULL,
+                archived_at DATETIME NOT NULL,
+                PRIMARY KEY (transcript_path, sink)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transcript_archive_file ON transcript_archive(archive_file);
+
+            -- Budget configuration for cost tracking (Issue #1064)
+            -- Allows setting budget limits per period with alert thresholds
+            CREATE TABLE IF NOT EXISTS budget_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period TEXT NOT NULL CHECK(period IN ('daily', 'weekly', 'monthly')),
+                limit_usd REAL NOT NULL,
+                alert_threshold REAL NOT NULL DEFAULT 0.8,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_budget_config_period ON budget_config(period);
+            CREATE INDEX IF NOT EXISTS idx_budget_config_active ON budget_config(is_active);
+
+            -- Issue claim registry for reliable work distribution (Issue #1159)
+            -- Tracks which agent/terminal has claimed which issue/PR
+            -- Prevents race conditions and enables crash recovery
+            CREATE TABLE IF NOT EXISTS issue_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number INTEGER NOT NULL,
+                claim_type TEXT NOT NULL CHECK(claim_type IN ('issue', 'pr')),
+                terminal_id TEXT NOT NULL,
+                claimed_at DATETIME NOT NULL,
+                last_heartbeat DATETIME NOT NULL,
+                label TEXT,
+                agent_role TEXT,
+                -- Unique constraint: only one claim per issue/PR type combo
+                UNIQUE(number, claim_type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_issue_claims_terminal ON issue_claims(terminal_id);
+            CREATE INDEX IF NOT EXISTS idx_issue_claims_heartbeat ON issue_claims(last_heartbeat);
+            CREATE INDEX IF NOT EXISTS idx_issue_claims_type ON issue_claims(claim_type);
+
+            -- Daily weekly-limit-point samples (Issue #8347, part of #8063)
+            -- One row per UTC calendar day holding that day's HIGH-WATER MARK
+            -- of weekly-limit consumption across the token pool: the sum over
+            -- every bootstrapped account of its `7d_utilization` expressed in
+            -- percentage points (a fully-consumed account contributes 100).
+            -- Written best-effort by `loom-daemon tokens check --ranking`
+            -- (see `activity::weekly_point_history`), which the daemon's
+            -- existing ~10-minute ranking refresh already runs — there is no
+            -- separate poller for this table.
+            --
+            -- Upsert-MAX, never append: 7d utilization is monotonic
+            -- non-decreasing inside a rolling window until it resets, so the
+            -- day's maximum is a stable summary that recomputing cannot
+            -- corrupt (a later, lower reading after a window reset, or a
+            -- partial reading from a failed probe, can never lower the row).
+            CREATE TABLE IF NOT EXISTS weekly_point_samples (
+                day TEXT PRIMARY KEY,           -- UTC calendar day, 'YYYY-MM-DD'
+                points REAL NOT NULL,           -- summed 7d utilization, in percentage points
+                account_count INTEGER NOT NULL, -- accounts contributing to `points`
+                updated_at DATETIME NOT NULL    -- when `points` last increased
+            );
+            ",
+    )?;
+
+    // Run migrations for existing databases
+    migrate_token_usage_table(conn);
+    migrate_quality_metrics_table(conn);
+    migrate_transcript_archive_table(conn);
+
+    // Create cost analytics views
+    create_cost_analytics_views(conn);
+
+    // Create tuning schema (Issue #1074)
+    create_tuning_schema(conn);
+
+    Ok(())
+}
+
+/// Create tuning-related database tables (Issue #1074).
+///
+/// Wraps the tuning module's schema creation and handles errors gracefully.
+fn create_tuning_schema(conn: &Connection) {
+    match super::tuning::create_tuning_schema(conn) {
+        Ok(()) => log::debug!("Created or verified tuning schema"),
+        Err(e) => {
+            log::warn!("Could not create tuning schema: {e}");
+        }
+    }
+}
+
+/// Create SQL views for cost analytics (Issue #1064).
+///
+/// Creates views for aggregating costs by:
+/// - Agent role (`cost_by_role`)
+/// - GitHub issue (`cost_by_issue`)
+/// - PR (`cost_by_pr`)
+/// - Time period (`cost_by_day`, `cost_by_week`, `cost_by_month`)
+#[allow(clippy::too_many_lines)]
+fn create_cost_analytics_views(conn: &Connection) {
+    // Cost by role view - aggregates costs from resource_usage joined with agent_inputs
+    let views: [(&str, &str); 6] = [
+        (
+            "cost_by_role",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_role AS
+            SELECT
+                COALESCE(ai.agent_role, 'unknown') as agent_role,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                AVG(ru.cost_usd) as avg_cost,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens,
+                MIN(ru.timestamp) as first_usage,
+                MAX(ru.timestamp) as last_usage
+            FROM resource_usage ru
+            LEFT JOIN agent_inputs ai ON ru.input_id = ai.id
+            GROUP BY COALESCE(ai.agent_role, 'unknown')
+            ",
+        ),
+        (
+            "cost_by_issue",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_issue AS
+            SELECT
+                pg.issue_number,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(DISTINCT ru.input_id) as prompt_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens,
+                MIN(ru.timestamp) as first_usage,
+                MAX(ru.timestamp) as last_usage
+            FROM resource_usage ru
+            JOIN agent_inputs ai ON ru.input_id = ai.id
+            JOIN prompt_github pg ON ai.id = pg.input_id
+            WHERE pg.issue_number IS NOT NULL
+            GROUP BY pg.issue_number
+            ",
+        ),
+        (
+            "cost_by_pr",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_pr AS
+            SELECT
+                pg.pr_number,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(DISTINCT ru.input_id) as prompt_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens,
+                MIN(ru.timestamp) as first_usage,
+                MAX(ru.timestamp) as last_usage
+            FROM resource_usage ru
+            JOIN agent_inputs ai ON ru.input_id = ai.id
+            JOIN prompt_github pg ON ai.id = pg.input_id
+            WHERE pg.pr_number IS NOT NULL
+            GROUP BY pg.pr_number
+            ",
+        ),
+        (
+            "cost_by_day",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_day AS
+            SELECT
+                DATE(ru.timestamp) as date,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens
+            FROM resource_usage ru
+            GROUP BY DATE(ru.timestamp)
+            ORDER BY date DESC
+            ",
+        ),
+        (
+            "cost_by_week",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_week AS
+            SELECT
+                strftime('%Y-W%W', ru.timestamp) as week,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens
+            FROM resource_usage ru
+            GROUP BY strftime('%Y-W%W', ru.timestamp)
+            ORDER BY week DESC
+            ",
+        ),
+        (
+            "cost_by_month",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_month AS
+            SELECT
+                strftime('%Y-%m', ru.timestamp) as month,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens
+            FROM resource_usage ru
+            GROUP BY strftime('%Y-%m', ru.timestamp)
+            ORDER BY month DESC
+            ",
+        ),
+    ];
+
+    for (view_name, sql) in views {
+        match conn.execute_batch(sql) {
+            Ok(()) => log::debug!("Created or verified view: {view_name}"),
+            Err(e) => {
+                // Views already existing is fine
+                let err_str = e.to_string();
+                if err_str.contains("already exists") {
+                    log::debug!("View {view_name} already exists");
+                } else {
+                    log::warn!("Could not create view {view_name}: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Migrate `token_usage` table to add new columns for resource tracking.
+///
+/// This function adds columns that may not exist in older databases:
+/// - `tokens_cache_read`
+/// - `tokens_cache_write`
+/// - `duration_ms`
+/// - provider
+///
+/// Uses ALTER TABLE ADD COLUMN which is idempotent-ish (ignores errors for
+/// existing columns).
+/// Migrate `quality_metrics` table to add new columns.
+///
+/// This function adds columns that may not exist in older databases:
+/// - `rework_count` (Issue #1054)
+///
+/// Uses ALTER TABLE ADD COLUMN which is idempotent-ish (ignores errors for
+/// existing columns).
+fn migrate_quality_metrics_table(conn: &Connection) {
+    // Add rework_count column for tracking PR review cycles
+    let sql = "ALTER TABLE quality_metrics ADD COLUMN rework_count INTEGER DEFAULT 0";
+
+    match conn.execute(sql, []) {
+        Ok(_) => log::info!("Added column rework_count to quality_metrics table"),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("duplicate column") || err_str.contains("already exists") {
+                log::debug!("Column rework_count already exists in quality_metrics table");
+            } else {
+                log::debug!(
+                    "Could not add column rework_count to quality_metrics: {e} (may be expected)"
+                );
+            }
+        }
+    }
+}
+
+fn migrate_token_usage_table(conn: &Connection) {
+    // List of new columns to add (column_name, column_type, default_value)
+    let new_columns: [(&str, &str, Option<&str>); 4] = [
+        ("tokens_cache_read", "INTEGER", None),
+        ("tokens_cache_write", "INTEGER", None),
+        ("duration_ms", "INTEGER", None),
+        ("provider", "TEXT", None),
+    ];
+
+    for (column_name, column_type, default) in new_columns {
+        let sql = match default {
+            Some(def) => format!(
+                "ALTER TABLE token_usage ADD COLUMN {column_name} {column_type} DEFAULT {def}"
+            ),
+            None => format!("ALTER TABLE token_usage ADD COLUMN {column_name} {column_type}"),
+        };
+
+        // SQLite will error if column already exists, which is fine
+        match conn.execute(&sql, []) {
+            Ok(_) => log::info!("Added column {column_name} to token_usage table"),
+            Err(e) => {
+                // Check if it's a "duplicate column" error (expected for existing DBs)
+                let err_str = e.to_string();
+                if err_str.contains("duplicate column") || err_str.contains("already exists") {
+                    log::debug!("Column {column_name} already exists in token_usage table");
+                } else {
+                    // Unexpected error - log but don't fail (table might not exist yet)
+                    log::debug!(
+                        "Could not add column {column_name} to token_usage: {e} (may be expected)"
+                    );
+                }
+            }
+        }
+    }
+
+    // Create index on provider column after it's been added.
+    // This index was moved out of the main execute_batch because the provider
+    // column may not exist in older databases until this migration runs.
+    if let Err(e) = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_token_usage_provider ON token_usage(provider)",
+        [],
+    ) {
+        log::debug!("Could not create idx_token_usage_provider: {e} (may be expected)");
+    }
+}
+
+/// Migrate `transcript_archive` to the per-`(transcript, sink)` ledger of
+/// #8758. A database created by #8494 keyed the table on `transcript_path`
+/// alone; SQLite cannot alter a primary key in place, so the migration
+/// rebuilds the table (rename → create → copy with `sink='local'` → drop).
+///
+/// Every row written before #8758 came from the on-disk `.tar.zst` CLI pass,
+/// so `'local'` is the correct backfill identity — a re-run of that same pass
+/// skips exactly the files it already archived. Idempotent: a database that
+/// already carries the `sink` column (including one created fresh by
+/// [`init_schema`]'s `CREATE TABLE` above) is left untouched.
+fn migrate_transcript_archive_table(conn: &Connection) {
+    // `PRAGMA table_info` on a missing table returns zero rows (not an
+    // error), and an existing table's columns are listed by name — a robust
+    // sink-column probe that does not depend on error-message strings. The
+    // table itself always exists by the time this runs: `init_schema`'s
+    // `CREATE TABLE IF NOT EXISTS` above either created the new shape on a
+    // fresh database or left a pre-#8758 table in place for this migration.
+    let has_sink_column = conn
+        .prepare("PRAGMA table_info(transcript_archive)")
+        .and_then(|mut stmt| {
+            let mut found = false;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "sink" {
+                    found = true;
+                }
+            }
+            Ok(found)
+        })
+        .unwrap_or(false);
+    if has_sink_column {
+        log::debug!("transcript_archive already keyed per (transcript, sink)");
+        return;
+    }
+
+    let migration = "\
+        BEGIN;\
+        ALTER TABLE transcript_archive RENAME TO transcript_archive_pre_sink;\
+        CREATE TABLE transcript_archive (\
+            transcript_path TEXT NOT NULL,\
+            sink TEXT NOT NULL DEFAULT 'local',\
+            file_size INTEGER NOT NULL,\
+            file_mtime INTEGER NOT NULL,\
+            sha256 TEXT NOT NULL,\
+            archive_file TEXT NOT NULL,\
+            archived_at DATETIME NOT NULL,\
+            PRIMARY KEY (transcript_path, sink)\
+        );\
+        INSERT INTO transcript_archive (\
+            transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at\
+        ) SELECT transcript_path, 'local', file_size, file_mtime, sha256, archive_file, archived_at \
+          FROM transcript_archive_pre_sink;\
+        DROP TABLE transcript_archive_pre_sink;\
+        COMMIT;";
+    match conn.execute_batch(migration) {
+        Ok(()) => {
+            log::info!("Migrated transcript_archive to the per-(transcript, sink) ledger (#8758)")
+        }
+        Err(e) => {
+            // Best-effort rollback so a half-applied migration does not hold
+            // the write lock; the pre-migration table still carries every row.
+            let _ = conn.execute_batch("ROLLBACK;");
+            log::warn!("Could not migrate transcript_archive to per-(transcript, sink): {e}");
+        }
+    }
+
+    // The rebuild above drops the old index with the old table.
+    if let Err(e) = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcript_archive_file ON transcript_archive(archive_file)",
+        [],
+    ) {
+        log::debug!("Could not create idx_transcript_archive_file: {e} (may be expected)");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn test_init_schema_fresh_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // Verify token_usage table has all columns including provider
+        let has_provider: bool = conn
+            .prepare("SELECT provider FROM token_usage LIMIT 0")
+            .is_ok();
+        assert!(has_provider, "provider column should exist");
+
+        // Verify idx_token_usage_provider index exists
+        let index_exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_token_usage_provider'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(index_exists, "idx_token_usage_provider should exist");
+    }
+
+    #[test]
+    fn test_init_schema_with_old_token_usage_table() {
+        // Regression test for issue #2264: init_schema crashes when existing
+        // token_usage table lacks the provider column because the execute_batch
+        // tried to create an index on a non-existent column.
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create the OLD token_usage schema (without new columns)
+        conn.execute_batch(
+            r"
+            CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER,
+                metric_id INTEGER,
+                timestamp DATETIME NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                model TEXT,
+                estimated_cost_usd REAL DEFAULT 0.0
+            );
+            ",
+        )
+        .unwrap();
+
+        // This must NOT panic — it was the crash scenario in #2264
+        init_schema(&conn).unwrap();
+
+        // Verify migration added the new columns
+        for col in [
+            "provider",
+            "tokens_cache_read",
+            "tokens_cache_write",
+            "duration_ms",
+        ] {
+            let ok = conn
+                .prepare(&format!("SELECT {col} FROM token_usage LIMIT 0"))
+                .is_ok();
+            assert!(ok, "column {col} should exist after migration");
+        }
+
+        // Verify the provider index was created
+        let index_exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_token_usage_provider'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(index_exists, "idx_token_usage_provider should exist after migration");
+    }
+
+    #[test]
+    fn test_init_schema_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // Calling a second time should not error
+        init_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn fresh_transcript_archive_ledger_is_keyed_per_transcript_and_sink() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // The composite key accepts the same transcript under two sinks…
+        conn.execute(
+            "INSERT INTO transcript_archive \
+             (transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at) \
+             VALUES ('p.jsonl', 'local', 1, 2, 'x', 'a.tar.zst', '2026-09-23T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transcript_archive \
+             (transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at) \
+             VALUES ('p.jsonl', 's3', 1, 2, 'x', 'a.tar.zst', '2026-09-23T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // …but not the same (transcript, sink) twice.
+        assert!(conn
+            .execute(
+                "INSERT INTO transcript_archive \
+                 (transcript_path, sink, file_size, file_mtime, sha256, archive_file, archived_at) \
+                 VALUES ('p.jsonl', 'local', 1, 2, 'x', 'a.tar.zst', '2026-09-23T00:00:00Z')",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn pre_sink_transcript_archive_ledger_migrates_preserving_rows_as_local() {
+        // A #8494-era database: the ledger keyed on transcript_path alone,
+        // already carrying a row for an archived transcript.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transcript_archive (
+                transcript_path TEXT PRIMARY KEY,
+                file_size INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                archive_file TEXT NOT NULL,
+                archived_at DATETIME NOT NULL
+            );
+            INSERT INTO transcript_archive
+                (transcript_path, file_size, file_mtime, sha256, archive_file, archived_at)
+            VALUES ('p.jsonl', 10, 20, 'deadbeef', 'old.tar.zst', '2026-09-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let (sink, size, archive_file): (String, i64, String) = conn
+            .query_row(
+                "SELECT sink, file_size, archive_file FROM transcript_archive \
+                 WHERE transcript_path = 'p.jsonl'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sink, "local", "pre-#8758 rows were all archived on disk");
+        assert_eq!(size, 10);
+        assert_eq!(archive_file, "old.tar.zst");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM transcript_archive", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the row moved, it did not duplicate"
+        );
+        // The old table is gone and the index was recreated on the new table.
+        assert!(conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transcript_archive_pre_sink'")
+            .unwrap()
+            .exists([])
+            .is_ok_and(|x| !x));
+        assert!(conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_transcript_archive_file'")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        // Re-running init_schema on the migrated shape is a no-op.
+        init_schema(&conn).unwrap();
+    }
+}

@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+# scripts/loom — machine-level Loom dispatcher (Epic #3835 Phase 3a, #4157).
+#
+# Installed to ~/.local/bin/loom by scripts/install/provision-dispatcher.sh as a
+# machine-level, install-once-per-machine entry point (a sibling of the
+# ~/.local/bin/loom-daemon binary that provision-daemon.sh installs). It resolves
+# the machine-level Loom checkout (~/.local/share/loom) and exec's into it.
+#
+# Verbs (at minimum): start | stop | status | sweep | update | restart.
+#
+# Machine mode (Epic #3835 Phase 3b, #4229): every delegate this dispatcher
+# execs into (start/stop/update/restart) is handed the resolved checkout via
+# LOOM_MACHINE_CHECKOUT so the lifecycle scripts operate against the SAME
+# machine-level workdir/pid/flags home no matter what directory the operator
+# happened to invoke `loom` from — the launchd label they all drive
+# (com.rjwalters.loom-daemon) is a machine-wide singleton, not a per-repo one.
+# See defaults/docs/machine-dispatcher.md.
+#
+# ── NOT the same surface as ./.loom/bin/loom ────────────────────────────────
+# ./.loom/bin/loom is the PER-REPO tmux agent-pool manager (verbs: start status
+# health stop attach send scale logs). This dispatcher is the MACHINE-LEVEL
+# runtime driver. Three verbs collide by name — start / stop / status — and mean
+# different things in each surface. `.loom/bin` is never on PATH, and every
+# in-repo call to the pool manager is path-qualified (`./.loom/bin/loom …`), so
+# a bare `loom …` on PATH can never resolve to the pool manager and vice-versa —
+# the two invocation forms are disjoint by construction (that is why AC4 is a
+# regression test, not a compatibility shim). For the three colliding verbs this
+# dispatcher additionally detects a nearby per-repo pool manager and refuses to
+# guess (start/stop) or clearly labels itself (status) rather than silently
+# running the wrong surface. See defaults/docs/machine-dispatcher.md.
+#
+# Environment:
+#   LOOM_HOME   Override the machine-level checkout location
+#               (default: ~/.local/share/loom).
+
+set -euo pipefail
+
+DISPATCHER_VERSION="1"
+
+# ── output helpers (plain text so sourcing tests can assert on them) ──────────
+if [[ -t 2 ]]; then
+    _C_RED=$'\033[0;31m'; _C_YEL=$'\033[1;33m'; _C_NC=$'\033[0m'
+else
+    _C_RED=''; _C_YEL=''; _C_NC=''
+fi
+_err()  { printf '%sloom:%s %s\n' "$_C_RED" "$_C_NC" "$*" >&2; }
+_warn() { printf '%sloom:%s %s\n' "$_C_YEL" "$_C_NC" "$*" >&2; }
+
+# ── machine-level checkout resolution (AC1) ──────────────────────────────────
+# The provisioning step (provision-dispatcher.sh) establishes ~/.local/share/loom
+# as a symlink to the Loom source checkout the installer ran from — the
+# "link to an existing dev checkout" resolution — so a developer running Loom on
+# the Loom repo never ends up with two divergent copies (AC1's hard constraint).
+# At runtime the dispatcher only needs to *resolve* that location, honoring an
+# explicit LOOM_HOME override first.
+loom_resolve_checkout() {
+    if [[ -n "${LOOM_HOME:-}" ]]; then
+        printf '%s\n' "${LOOM_HOME%/}"
+        return 0
+    fi
+    printf '%s\n' "$HOME/.local/share/loom"
+}
+
+# Echo the canonical scripts subtree inside a resolved checkout. A Loom *source*
+# checkout ships defaults/scripts/…; a checkout that is itself an installed
+# consumer repo ships .loom/scripts/…. Prefer the source layout, fall back.
+loom_checkout_scripts_dir() {
+    local checkout="$1"
+    if [[ -d "$checkout/defaults/scripts" ]]; then
+        printf '%s\n' "$checkout/defaults/scripts"
+    elif [[ -d "$checkout/.loom/scripts" ]]; then
+        printf '%s\n' "$checkout/.loom/scripts"
+    else
+        return 1
+    fi
+}
+
+# ── repo-context resolution (AC7) ────────────────────────────────────────────
+# Walk up from $PWD. Sets three globals:
+#   LOOM_CTX_KIND  = consumer-repo | git-worktree | non-repo
+#   LOOM_CTX_ROOT  = resolved repo root (main checkout for a worktree), or ""
+#   LOOM_CTX_POOL  = path to a nearby ./.loom/bin/loom pool manager, or ""
+loom_detect_context() {
+    LOOM_CTX_KIND="non-repo"
+    LOOM_CTX_ROOT=""
+    LOOM_CTX_POOL=""
+
+    local dir="$PWD"
+    while [[ "$dir" != "/" && -n "$dir" ]]; do
+        if [[ -f "$dir/.loom/bin/loom" && -z "$LOOM_CTX_POOL" ]]; then
+            LOOM_CTX_POOL="$dir/.loom/bin/loom"
+        fi
+        # Linked-worktree detection MUST precede the consumer-repo (.loom/) check:
+        # a repo that commits .loom/ (config.json, roles/, scripts/ — the norm per
+        # CLAUDE.md) carries a real .loom/ directory inside every worktree checkout
+        # too, so testing -d "$dir/.loom" first would misclassify every worktree of
+        # such a repo as a consumer-repo and resolve LOOM_CTX_ROOT to the worktree
+        # instead of the main checkout. A linked worktree's .git is a *file*
+        # ("gitdir: <path>"), so -f "$dir/.git" distinguishes it cleanly.
+        if [[ -f "$dir/.git" ]]; then
+            # Linked git worktree: .git is a file "gitdir: <path>".
+            local gitdir main_repo
+            gitdir=$(sed 's/^gitdir: //' "$dir/.git" 2>/dev/null || true)
+            if [[ -n "$gitdir" ]]; then
+                main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
+                LOOM_CTX_ROOT="$main_repo"
+                LOOM_CTX_KIND="git-worktree"
+                if [[ -z "$LOOM_CTX_POOL" && -f "$main_repo/.loom/bin/loom" ]]; then
+                    LOOM_CTX_POOL="$main_repo/.loom/bin/loom"
+                fi
+                return 0
+            fi
+        fi
+        if [[ -d "$dir/.loom" ]]; then
+            LOOM_CTX_ROOT="$dir"
+            LOOM_CTX_KIND="consumer-repo"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 0
+}
+
+# ── collision guard for the three overlapping verbs (AC3) ────────────────────
+# start/stop mutate process state, so on a detected pool-manager collision we
+# refuse and disambiguate (never silently run the wrong surface). An explicit
+# --machine anywhere in the args opts out of the guard.
+loom_has_flag() {
+    local want="$1"; shift
+    local a
+    for a in "$@"; do [[ "$a" == "$want" ]] && return 0; done
+    return 1
+}
+
+loom_collision_guard() {
+    local verb="$1"; shift
+    loom_has_flag "--machine" "$@" && return 0
+    [[ -n "$LOOM_CTX_POOL" ]] || return 0
+    _err "'$verb' is ambiguous here — two different Loom surfaces both define it."
+    _err "  per-repo tmux agent pool:  ${LOOM_CTX_POOL} $verb"
+    _err "  machine-level loom-daemon: loom $verb --machine"
+    _err "Re-run with one of the above (see 'loom help')."
+    exit 3
+}
+
+# Resolve the machine checkout + its scripts/ tree, or die with a legible
+# error. Echoes "<checkout>\n<scripts_dir>" (two lines) on success. Shared by
+# every verb that delegates into the checkout (start/stop/update/restart) so
+# the "checkout missing" / "no scripts/ tree" messages stay identical across
+# all of them.
+loom_resolve_checkout_scripts() {
+    local checkout scripts_dir
+    checkout="$(loom_resolve_checkout)"
+    if [[ ! -e "$checkout" ]]; then
+        _err "machine-level checkout not found at: $checkout"
+        _err "install it (run the Loom installer) or set LOOM_HOME to a Loom checkout."
+        return 1
+    fi
+    if ! scripts_dir="$(loom_checkout_scripts_dir "$checkout")"; then
+        _err "no scripts/ tree under the machine checkout: $checkout"
+        return 1
+    fi
+    printf '%s\n%s\n' "$checkout" "$scripts_dir"
+}
+
+# Resolve + exec a daemon lifecycle script from the machine checkout, dropping
+# the leading --machine selector (the delegated script does not know that
+# flag). Exports LOOM_MACHINE_CHECKOUT so the delegate resolves its
+# workdir/pid/flags home from the checkout rather than $PWD (machine mode,
+# #4229) — see the file-header comment above.
+loom_exec_checkout_script() {
+    local rel="$1"; shift
+    local resolved checkout scripts_dir target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    scripts_dir="$(sed -n '2p' <<<"$resolved")"
+    target="$scripts_dir/$rel"
+    if [[ ! -x "$target" ]]; then
+        _err "expected script not found or not executable: $target"
+        exit 1
+    fi
+    local passthrough=()
+    local a
+    for a in "$@"; do [[ "$a" == "--machine" ]] && continue; passthrough+=("$a"); done
+    export LOOM_MACHINE_CHECKOUT="$checkout"
+    # `${arr[@]+…}` guard: expand to nothing (not an empty arg) when the array is
+    # empty, so this is safe under `set -u` on bash 3.2 (macOS default).
+    exec "$target" ${passthrough[@]+"${passthrough[@]}"}
+}
+
+# ── verbs ────────────────────────────────────────────────────────────────────
+loom_cmd_start() { loom_detect_context; loom_collision_guard start "$@"; loom_exec_checkout_script "cli/loom-daemon-start.sh" "$@"; }
+loom_cmd_stop()  { loom_detect_context; loom_collision_guard stop  "$@"; loom_exec_checkout_script "cli/loom-daemon-stop.sh"  "$@"; }
+
+# Refresh the machine-checkout's mcp-loom bundle (Epic #3835 Phase 3c, #4230).
+# Under user-scope `loom` MCP registration one server instance serves EVERY repo
+# from ~/.local/share/loom/mcp-loom/dist/index.js, so `loom update` must refresh
+# THAT bundle for the whole machine at once — the #3803 stale-dist drift fix.
+# Best-effort and non-fatal: a bundle build failure warns but never blocks the
+# daemon update that follows. #4229 coordination: this uses the ALREADY-RESOLVED
+# $checkout and adds NO checkout-resolution logic of its own.
+loom_refresh_mcp_bundle() {
+    local checkout="$1"
+    local mcp_dir="$checkout/mcp-loom"
+    # A consumer-repo checkout does not ship mcp-loom; nothing to refresh.
+    [[ -d "$mcp_dir" ]] || return 0
+    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+        _warn "mcp-loom refresh skipped: node/npm not on PATH (served bundle NOT rebuilt)."
+        return 0
+    fi
+    local entry="$mcp_dir/dist/index.js"
+    local src="$mcp_dir/src"
+    # Rebuild when the bundle is missing OR stale (older than any source file) —
+    # mirrors scripts/setup-mcp.sh's staleness predicate, so a source change
+    # (updating the checkout bumps src mtimes) makes new tools appear after
+    # update.
+    local needs_build=0
+    if [[ ! -f "$entry" ]]; then
+        needs_build=1
+    elif [[ -d "$src" ]] && [[ -n "$(find "$src" -type f -newer "$entry" -print -quit 2>/dev/null)" ]]; then
+        needs_build=1
+    fi
+    if [[ "$needs_build" -eq 0 ]]; then
+        printf 'loom: mcp-loom bundle already fresh (%s).\n' "$entry"
+        return 0
+    fi
+    printf 'loom: refreshing the user-scoped mcp-loom bundle (%s)...\n' "$mcp_dir"
+    if ( cd "$mcp_dir" && npm install --silent && npm run build ); then
+        printf 'loom: mcp-loom bundle rebuilt — restart Claude Code sessions to pick up new tools.\n'
+    else
+        _warn "mcp-loom bundle rebuild FAILED — the served bundle may be stale."
+        _warn "  Rebuild manually: (cd $mcp_dir && npm install && npm run build)"
+    fi
+    return 0
+}
+
+# `update` resolves the machine checkout, refreshes the user-scoped mcp-loom
+# bundle (#4230, above), then delegates the DAEMON update to the existing
+# surface (loom-daemon-update.sh, #3968 + #4055). The daemon half stays a thin
+# delegate — this verb implements no daemon rebuild/reprovision/restart logic of
+# its own, so it neither pre-empts #4017 nor duplicates #4055. The mcp-loom
+# refresh is added here (not in loom-daemon-update.sh) because that delegate is
+# daemon-scoped and short-circuits when the binary is already up to date, which
+# would skip the bundle refresh on the common "only mcp-loom changed" roll.
+#
+# Gap 1 fix (#4229): loom-daemon-update.sh rebuilds FROM SOURCE and used to
+# resolve its source tree by walking up from $PWD — which fails outside a Loom
+# source checkout even though THIS dispatcher already resolved+validated the
+# machine checkout above. Exporting LOOM_MACHINE_CHECKOUT hands that resolution
+# to the delegate as an explicit override, so `loom update` rebuilds the
+# checkout from any directory (a consumer repo, or no repo at all).
+loom_cmd_update() {
+    local resolved checkout scripts_dir target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    scripts_dir="$(sed -n '2p' <<<"$resolved")"
+    target="$scripts_dir/cli/loom-daemon-update.sh"
+    if [[ ! -x "$target" ]]; then
+        _err "update delegate not found or not executable: $target"
+        _err "'loom update' is a thin delegator; it does not rebuild/restart the daemon on its own."
+        exit 1
+    fi
+    # Refresh the served mcp-loom bundle BEFORE delegating — but honor the
+    # daemon updater's read-only modes so `loom update --check/--dry-run` never
+    # mutates the bundle.
+    if loom_has_flag "--check" "$@" || loom_has_flag "--dry-run" "$@"; then
+        printf 'loom: (%s) mcp-loom bundle refresh skipped in read-only mode.\n' \
+            "$(loom_has_flag "--check" "$@" && echo --check || echo --dry-run)"
+    else
+        loom_refresh_mcp_bundle "$checkout"
+    fi
+    export LOOM_MACHINE_CHECKOUT="$checkout"
+    exec "$target" "$@"
+}
+
+# loom_restart_harvest_live_env <scripts_dir> — before loom_cmd_restart's
+# bare-exec fallback re-renders the plist/unit via start_target, harvest and
+# re-export the LIVE installed launchd plist's / systemd unit's LOOM_*/token
+# env (#4581). Mirrors the harvest-and-preserve pattern
+# loom-daemon-update.sh's perform_relaunch / perform_systemd_relaunch
+# (#4118/#4126) already apply on its equivalent refused-restart path — shared
+# via lib/daemon-env-harvest.sh (harvest_plist_env / harvest_unit_env) so both
+# call sites stay byte-for-byte identical instead of drifting.
+#
+# Without this, the fallback's bare `exec` inherited only whatever LOOM_* vars
+# happened to be exported in the INVOKING shell — a fresh terminal, a
+# different SSH session, or any wrapper that doesn't re-source the operator's
+# profile silently narrowed a rich plist down to FLAGS-OFF defaults (the
+# #4522/#4579 incident this closes).
+#
+# Best-effort by design when there is nothing to harvest: a daemon that has
+# never been installed under launchd/systemd yet (first-ever start), or one
+# running the legacy pid-file/nohup path, has no live plist/unit file — in
+# that case the invoking shell's env is legitimately the only source, exactly
+# as before, so this is a silent no-op. It is a HARD abort (exit 6) only when
+# a plist/unit file DOES exist but cannot be read back — proceeding then would
+# silently narrow a real, live autonomy config (the #4011 class), the exact
+# failure this issue closes.
+loom_restart_harvest_live_env() {
+    local scripts_dir="$1"
+    local harvest_lib="$scripts_dir/lib/daemon-env-harvest.sh"
+    if [[ ! -r "$harvest_lib" ]]; then
+        _warn "daemon-env-harvest.sh not found under $scripts_dir/lib — skipping live-env harvest (this checkout may predate #4581)."
+        return 0
+    fi
+    # shellcheck source=/dev/null
+    source "$harvest_lib"
+
+    local count=0 harvested k
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+        local label plist
+        label="${LOOM_LAUNCHD_LABEL:-com.rjwalters.loom-daemon}"
+        plist="$HOME/Library/LaunchAgents/${label}.plist"
+        if [[ -f "$plist" ]]; then
+            if ! harvested="$(harvest_plist_env "$plist")"; then
+                _err "Refusing to fall back to a bare restart: could not read the live plist's EnvironmentVariables at $plist."
+                _err "Falling back now would silently narrow the autonomy flags to FLAGS-OFF defaults (#4011) — aborting."
+                exit 6
+            fi
+            local v64
+            while IFS=$'\t' read -r k v64; do
+                [[ -z "$k" ]] && continue
+                export "$k=$(printf '%s' "$v64" | base64 --decode)"
+                count=$((count + 1))
+            done <<< "$harvested"
+        fi
+    else
+        local unit unit_path
+        unit="${LOOM_SYSTEMD_UNIT:-loom-daemon.service}"
+        unit_path="$HOME/.config/systemd/user/${unit}"
+        if [[ -f "$unit_path" ]]; then
+            if ! harvested="$(harvest_unit_env "$unit_path")"; then
+                _err "Refusing to fall back to a bare restart: could not read the live unit's Environment= values at $unit_path."
+                _err "Falling back now would silently narrow the autonomy flags to FLAGS-OFF defaults (#4011) — aborting."
+                exit 6
+            fi
+            local v
+            while IFS=$'\t' read -r k v; do
+                [[ -z "$k" ]] && continue
+                export "$k=$v"
+                count=$((count + 1))
+            done <<< "$harvested"
+        fi
+    fi
+    if [[ "$count" -gt 0 ]]; then
+        echo "loom: preserved ${count} LOOM_*/token env var(s) from the live installed plist/unit across the restart fallback (#4581)."
+    fi
+}
+
+# `restart` (Gap 3, #4229): the filed scope lists start|stop|status|restart, but
+# only the first three shipped in #4157/#4208. Thin delegate mirroring
+# start/stop — same collision guard (the per-repo pool manager has no
+# `restart`, but guard consistency is cheaper than explaining an asymmetry) —
+# trying the daemon's own supervised restart IPC first (`loom-daemon restart`,
+# #4077), falling back to a plain stop-then-start when the daemon isn't
+# supervised (or isn't running at all yet). The fallback
+# harvests+re-exports the live installed plist's/unit's LOOM_*/token env
+# before re-rendering (#4581, loom_restart_harvest_live_env above) instead of
+# relying on whatever the invoking shell happens to have exported.
+loom_cmd_restart() {
+    loom_detect_context
+    loom_collision_guard restart "$@"
+
+    local resolved checkout scripts_dir stop_target start_target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    scripts_dir="$(sed -n '2p' <<<"$resolved")"
+    stop_target="$scripts_dir/cli/loom-daemon-stop.sh"
+    start_target="$scripts_dir/cli/loom-daemon-start.sh"
+    if [[ ! -x "$stop_target" || ! -x "$start_target" ]]; then
+        _err "expected lifecycle script(s) not found or not executable under: $scripts_dir/cli"
+        exit 1
+    fi
+
+    local passthrough=()
+    local a
+    for a in "$@"; do [[ "$a" == "--machine" ]] && continue; passthrough+=("$a"); done
+
+    export LOOM_MACHINE_CHECKOUT="$checkout"
+
+    # Output is NOT suppressed (#5119): the primitive now prints the
+    # supervisor-specific fate of in-flight work, a stale-unit warning, and — on
+    # a supervisor that fails to relaunch — its self-heal diagnostics. Swallowing
+    # all of that to keep the `if` quiet is how an operator ends up believing a
+    # roll was clean when the cgroup was just reaped.
+    if command -v loom-daemon >/dev/null 2>&1 && loom-daemon restart; then
+        # Deliberately NOT "in-flight sweeps preserved": that is a plain restart,
+        # not a drain, and on systemd the stop job reaps the unit's cgroup —
+        # every sweep/role-run child with it (#5119). The primitive's own output
+        # above already states the supervisor-specific truth; do not contradict
+        # it here. `loom-daemon restart --drain` is the preserving variant.
+        echo "loom-daemon restart scheduled (supervised relaunch; see the fate of in-flight work above — 'loom-daemon restart --drain' finishes it first)."
+        exit 0
+    fi
+
+    _warn "supervised 'loom-daemon restart' unavailable or refused (not launchd-managed, or not currently running) — falling back to stop-then-start."
+    if ! "$stop_target" --restarting; then
+        _err "loom-daemon-stop.sh failed — not starting a new binary on top of a possibly-still-running old one."
+        exit 1
+    fi
+    # Harvest-and-preserve (#4581): re-export the live installed plist's/unit's
+    # LOOM_*/token env BEFORE the bare exec below, so start_target's re-render
+    # does not silently narrow to whatever LOOM_* vars this shell happens to
+    # have exported. No-op when nothing is installed yet; aborts (exit 6) if a
+    # plist/unit exists but cannot be read back.
+    loom_restart_harvest_live_env "$scripts_dir"
+    # `${arr[@]+…}` guard: see loom_exec_checkout_script above.
+    exec "$start_target" ${passthrough[@]+"${passthrough[@]}"}
+}
+
+# `sweep <issue>` dispatches a single-issue lifecycle for the CURRENT repo.
+#
+# Runtime-neutral (#4480): rather than exec'ing `claude` directly, sweep routes
+# through the resolved repo's `spawn-worker.sh` — the runtime-resolution seam
+# (`LOOM_RUNTIME` env > `.loom/config.json` runtimes.default > built-in
+# "claude"). With nothing configured this is byte-for-byte identical to before
+# (spawn-worker.sh -> spawn-claude.sh -> `claude -p ... --dangerously-skip-permissions`),
+# but a Codex-hosted (or any non-Claude) operator can now dispatch the canonical
+# single-issue lifecycle too. Prerequisite checking (which runtime, which binary
+# is missing, unknown-runtime -> exit 78) belongs to spawn-worker.sh and each
+# spawn-<runtime>.sh — so the old hardcoded `command -v claude` gate is gone: it
+# always blamed Claude even on a fully-usable Codex-only host.
+loom_cmd_sweep() {
+    loom_detect_context
+    if [[ -z "$LOOM_CTX_ROOT" ]]; then
+        _err "'sweep' must run inside a Loom repo (no .loom/ found from $PWD)."
+        exit 1
+    fi
+    if [[ $# -eq 0 ]]; then
+        _err "usage: loom sweep <issue-number> [more issues|flags]"
+        exit 1
+    fi
+    local scripts_dir
+    if ! scripts_dir="$(loom_checkout_scripts_dir "$LOOM_CTX_ROOT")"; then
+        _err "no scripts/ tree found under $LOOM_CTX_ROOT (looked in defaults/scripts and .loom/scripts)."
+        exit 1
+    fi
+    local spawn_worker="$scripts_dir/spawn-worker.sh"
+    if [[ ! -x "$spawn_worker" ]]; then
+        _err "spawn-worker.sh not found or not executable at $spawn_worker."
+        exit 1
+    fi
+    # cd into the repo root so spawn-worker.sh's own workspace/config resolution
+    # (git rev-parse --git-common-dir -> .loom/config.json) lands on this repo.
+    cd "$LOOM_CTX_ROOT"
+    exec "$spawn_worker" -p "/loom:sweep $*" --dangerously-skip-permissions
+}
+
+# `migrate` takes a historical file-copy Loom install in the CURRENT repo to the
+# machine-level daemon model in one idempotent pass (Epic #3835 Phase 6, #4254).
+# It delegates to scripts/install/migrate-consumer.sh in the machine checkout,
+# passing the resolved repo root so the migration operates on the operator's repo
+# no matter which subdirectory `loom migrate` was invoked from.
+loom_cmd_migrate() {
+    local resolved checkout target
+    resolved="$(loom_resolve_checkout_scripts)" || exit 1
+    checkout="$(sed -n '1p' <<<"$resolved")"
+    if [[ -f "$checkout/scripts/install/migrate-consumer.sh" ]]; then
+        target="$checkout/scripts/install/migrate-consumer.sh"
+    elif [[ -f "$checkout/.loom/scripts/install/migrate-consumer.sh" ]]; then
+        target="$checkout/.loom/scripts/install/migrate-consumer.sh"
+    else
+        _err "migrate-consumer.sh not found under the machine checkout: $checkout"
+        exit 1
+    fi
+    # --help is reachable without a repo context.
+    if loom_has_flag "--help" "$@" || loom_has_flag "-h" "$@"; then
+        exec bash "$target" --help
+    fi
+    loom_detect_context
+    if [[ -z "$LOOM_CTX_ROOT" ]]; then
+        _err "'migrate' must run inside a Loom consumer repo (no .loom/ found from $PWD)."
+        exit 1
+    fi
+    export LOOM_MACHINE_CHECKOUT="$checkout"
+    exec bash "$target" "$LOOM_CTX_ROOT" "$@"
+}
+
+# `status` is read-only and AC7 requires it to produce correct, distinguishable
+# output from a consumer repo, a git worktree, and a non-repo directory. So on a
+# pool-manager collision it does NOT error — it prints machine-level status and a
+# clearly-labelled pointer to the per-repo pool manager (never a silent
+# wrong-surface run).
+loom_cmd_status() {
+    loom_detect_context
+    local checkout checkout_state target
+    checkout="$(loom_resolve_checkout)"
+    if [[ -L "$checkout" ]]; then
+        target="$(readlink "$checkout" 2>/dev/null || true)"
+        checkout_state="symlink -> ${target:-?}"
+    elif [[ -d "$checkout" ]]; then
+        checkout_state="directory (clone)"
+    else
+        checkout_state="ABSENT"
+    fi
+
+    echo "Loom (machine-level dispatcher)"
+    echo "  dispatcher:    ${BASH_SOURCE[0]}"
+    echo "  checkout:      ${checkout} [${checkout_state}]"
+    if command -v loom-daemon >/dev/null 2>&1; then
+        echo "  loom-daemon:   $(loom-daemon --version 2>/dev/null || echo '(version unavailable)')"
+    else
+        echo "  loom-daemon:   not on PATH"
+    fi
+
+    echo "Context"
+    echo "  cwd:           ${PWD}"
+    case "$LOOM_CTX_KIND" in
+        consumer-repo) echo "  repo:          consumer-repo (root: ${LOOM_CTX_ROOT})" ;;
+        git-worktree)  echo "  repo:          git-worktree (main checkout: ${LOOM_CTX_ROOT})" ;;
+        non-repo)      echo "  repo:          non-repo (no .loom/ found from cwd)" ;;
+    esac
+    if [[ -n "$LOOM_CTX_POOL" ]]; then
+        echo "  pool manager:  present — for the per-repo tmux pool run: ${LOOM_CTX_POOL} status"
+    else
+        echo "  pool manager:  none"
+    fi
+
+    # AC5: resolve config through the Phase 2 tier resolver, not by reading
+    # .loom/config.json directly. AC4-note: the jq-absent case must be explicit,
+    # not masqueraded as "no config".
+    echo "Config (resolved via the Phase 2 tier chain)"
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "  (jq not available — config tiers cannot be resolved on this host)"
+        return 0
+    fi
+    local resolver
+    if resolver="$(loom_checkout_scripts_dir "$checkout" 2>/dev/null)/lib/config-resolver.sh" \
+        && [[ -f "$resolver" ]]; then
+        # shellcheck source=/dev/null
+        source "$resolver"
+        local wf
+        wf="$(loom_config_get "${LOOM_CTX_ROOT:-$PWD}" "autonomous.workFinder.enabled" "(unset)")"
+        echo "  autonomous.workFinder.enabled = ${wf}   (repo_root: ${LOOM_CTX_ROOT:-<none>})"
+    else
+        echo "  (config resolver not found in checkout; cannot resolve tiers)"
+    fi
+}
+
+loom_print_help() {
+    cat <<EOF
+loom — machine-level Loom dispatcher (Epic #3835 Phase 3a/3b)
+
+USAGE:
+    loom <command> [options]
+
+COMMANDS:
+    start     Start the machine-level loom-daemon (delegates to loom-daemon-start.sh)
+    stop      Stop the machine-level loom-daemon  (delegates to loom-daemon-stop.sh)
+    restart   Restart the machine-level loom-daemon (supervised relaunch, NOT a drain;
+              falls back to stop+start)
+    status    Show machine-level + current-repo status (read-only)
+    sweep     Dispatch /loom:sweep <issue> for the current repo
+    migrate   Migrate a historical file-copy install in the current repo to the
+              machine-level daemon model (--dry-run for a plan; Epic #3835 Phase 6)
+    update    Thin delegate to loom-daemon-update.sh (no rebuild logic of its own)
+    help      Show this help
+    version   Show dispatcher version
+
+NOTE:
+    This is NOT ./.loom/bin/loom (the per-repo tmux agent-pool manager). For the
+    three overlapping verbs (start/stop/status) run inside a repo that has a pool
+    manager, use './.loom/bin/loom <verb>' for the tmux pool, or 'loom <verb>
+    --machine' to force the machine-level surface. See
+    defaults/docs/machine-dispatcher.md.
+
+ENVIRONMENT:
+    LOOM_HOME   Override the machine-level checkout (default: ~/.local/share/loom)
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+        start)               loom_cmd_start "$@" ;;
+        stop)                loom_cmd_stop "$@" ;;
+        restart)             loom_cmd_restart "$@" ;;
+        status)              loom_cmd_status "$@" ;;
+        sweep)               loom_cmd_sweep "$@" ;;
+        migrate)             loom_cmd_migrate "$@" ;;
+        update)              loom_cmd_update "$@" ;;
+        help|--help|-h)      loom_print_help ;;
+        version|--version|-v) echo "loom dispatcher v${DISPATCHER_VERSION} (machine-level)" ;;
+        *)
+            _err "unknown command '$cmd'"
+            _err "run 'loom help' for available commands"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,2717 @@
+//! Account health probe + ranking for the agent token pool.
+//!
+//! Native Rust port of `loom_tools.tokens.check` (issue #4094, epic #4081
+//! "eliminate Python from Loom", Phase 1). Probes each bootstrapped OAuth
+//! account with a minimal Anthropic `POST /v1/messages` request and parses
+//! rate-limit headers to derive session (5h) and weekly (7d) utilization plus
+//! the next 7d reset time, then writes `.loom/tokens/.ranking` atomically.
+//!
+//! # HTTP mechanism: curl, not a crate
+//!
+//! `loom-daemon` carries **zero** HTTP-client crates, and PR #4092 (issue
+//! #4082) set the house precedent of avoiding new dependencies for the token
+//! pool (it hand-rolled [`super::rng`] rather than take `rand`). Following that
+//! precedent — and matching `token_ranking_refresh.rs`, which already shells
+//! out via `Command::new` — the probe transport shells to **`curl`**. The
+//! probe surface is exercised in tests through the [`ProbeTransport`] trait so
+//! no test ever spawns `curl` or touches the network.
+//!
+//! # Header resilience
+//!
+//! Rate-limit headers are matched by **suffix**, case-insensitively
+//! (`-5h-utilization`, `-7d-utilization`, `-7d-reset`, `-5h-reset`), so any
+//! rename of the `anthropic-ratelimit-*` prefix segment still maps to our
+//! internal fields.
+//!
+//! # Byte-compatible `.ranking`
+//!
+//! `.ranking` is pipe-delimited `name|status|5h_util|limit_reset` (the last two
+//! fields optional, issues #4195 / #4874), one account per line, trailing
+//! newline (empty report yields an empty string), ordered by
+//! [`STATUS_RANK`] then `7d_reset` ascending with an absent-reset sentinel.
+//! **Every status but one** is written — no status is filtered at write time
+//! (see the curator correction on issue #4094: the read-side allowlist in
+//! [`super::select`] depends on `rate_limited` entries being present so a
+//! fully-rate-limited pool can still dispatch via the tier-1 fallback). The
+//! one exception is `"unsupported"` (design D6a, issue #5608): `.ranking`'s
+//! contract is "Claude accounts the selector may pick", and an account with
+//! no probe adapter is never selectable, so it is omitted there while still
+//! appearing in `--json` and the human table — see [`format_ranking_lines`].
+//! The file is written atomically (`<path>.tmp` + rename in the same directory).
+//!
+//! # Provider-dispatched probing (design D6a, issue #5608)
+//!
+//! [`discover_tokens`] resolves each discovered account's provider from
+//! `index.json` (a `.token` file with no manifest row is treated as `claude`,
+//! fail-open — see `docs/design/token-pool-provider-identity.md`). [`dispatch_probe`]
+//! then routes `claude` through the existing Anthropic probe
+//! ([`probe_account_with_blocking`]) byte-identically, and reports every other
+//! provider as `"unsupported"` with `error: Some("no_probe_adapter:<provider>")`
+//! and every utilization/reset field `None` — never a fabricated `exhausted`.
+//!
+//! # Overdue-reset re-probe (issue #7420)
+//!
+//! The selector's hard-exclusion statuses (`exhausted` / `blocked`, see
+//! `select::is_hard_excluded_status`) are *durable* refusals: it never readmits one
+//! without a successful re-probe (#5629). When the ranking is sourced from
+//! claude-monitor's `ranking.json` (the `auto`/`monitor` short-circuit in
+//! [`run_check`]) there is no probe at all, so a row that claude-monitor
+//! itself froze — because the upstream credential was **revoked** and its
+//! `usage.db` stopped refreshing — is copied forward verbatim, `exhausted`
+//! status and a reset instant days in the past included, forever.
+//!
+//! [`reset_is_overdue`] is the single predicate for that shape: a
+//! re-probe-gated status whose binding reset ([`limit_reset`]) has already
+//! passed. Under `--source auto` those rows — and only those rows — fall
+//! through to a targeted re-probe that replaces the frozen row with what the
+//! API actually says now; a `401` additionally records the account as
+//! `auth-dead` in `.bad_tokens` so it is permanently excluded (and surfaces
+//! in `tokens unblock`) instead of masquerading as quota exhaustion. The same
+//! predicate drives the `overdue` flag in [`format_table`] and the
+//! `reset_overdue` field in [`AccountResult::to_json`], so the human table,
+//! `--json`, and the re-probe decision can never drift apart.
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use chrono::{DateTime, Utc};
+
+use super::account_registry::AccountProvider;
+use super::round_summary::RoundTrace;
+
+// ---------------------------------------------------------------------------
+// Constants (mirror check.py)
+// ---------------------------------------------------------------------------
+
+/// Anthropic messages endpoint the probe posts to.
+pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+/// DELIBERATELY still `loom-tokens/...` after epic #4081 Phase 4 (#4557)
+/// retired the Python `loom-tokens` CLI. This is an outbound HTTP header value,
+/// not operator-facing advice: it is part of the byte-compatibility contract
+/// with `check.py`'s probe (identical request => identical rate-limit-header
+/// response), and changing it would alter what Anthropic's API sees for no
+/// benefit. Do not "fix" this to `loom-daemon`.
+const USER_AGENT: &str = "loom-tokens/0.1 (claude-code-compatible)";
+/// Default model used for the minimal probe request.
+pub const DEFAULT_PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
+/// Default probe prompt (`max_tokens=1` regardless of prompt).
+pub const DEFAULT_PROBE_PROMPT: &str = "hi";
+const DEFAULT_TIMEOUT_SECONDS: f64 = 15.0;
+/// 7d-utilization at or above which an account is `exhausted` (issue #3988).
+pub const EXHAUSTED_THRESHOLD: f64 = 0.99;
+
+const HEADER_SUFFIX_5H_UTIL: &str = "-5h-utilization";
+const HEADER_SUFFIX_7D_UTIL: &str = "-7d-utilization";
+const HEADER_SUFFIX_7D_RESET: &str = "-7d-reset";
+/// The 5h counterpart of `-7d-reset`. Anthropic does not currently send it on
+/// every response, so it is looked up opportunistically: when it is absent a
+/// `rate_limited` account reports **no** reset rather than borrowing the 7d
+/// one, which would claim a days-out return for an account that comes back
+/// within the hour (issue #4874).
+const HEADER_SUFFIX_5H_RESET: &str = "-5h-reset";
+const HEADER_SUFFIX_5H_STATUS: &str = "-5h-status";
+
+// ---------------------------------------------------------------------------
+// Data structures
+// ---------------------------------------------------------------------------
+
+/// Per-account probe result. Mirrors `check.AccountResult`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountResult {
+    pub name: String,
+    /// `available` | `exhausted` | `rate_limited` | `blocked` | `error` | `skipped`
+    /// | `unsupported` (design D6a, issue #5608 — a provider with no probe
+    /// adapter; omitted from `.ranking`, see [`format_ranking_lines`]).
+    pub status: String,
+    pub s5h_utilization: Option<f64>,
+    pub s7d_utilization: Option<f64>,
+    pub s7d_reset: Option<String>,
+    /// When the account's **5h** window rolls over. Populated by the
+    /// claude-monitor backend (`resets["5h"]`) and, when the API sends the
+    /// header, by the native probe. It is the reset that matters for a
+    /// `rate_limited` account — and for the 5h `usage_fraction` the dashboard
+    /// charts (issue #4874). See [`limit_reset`].
+    pub s5h_reset: Option<String>,
+    pub error: Option<String>,
+}
+
+impl AccountResult {
+    /// A result with only the identity fields set; every measurement is
+    /// "unknown" until a probe (or the monitor backend) fills it in.
+    #[must_use]
+    pub fn new(name: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: status.into(),
+            s5h_utilization: None,
+            s7d_utilization: None,
+            s7d_reset: None,
+            s5h_reset: None,
+            error: None,
+        }
+    }
+
+    /// [`limit_reset`] for this result — the instant the window currently
+    /// gating this account rolls over.
+    #[must_use]
+    pub fn limit_reset(&self) -> Option<&str> {
+        limit_reset(&self.status, self.s5h_reset.as_deref(), self.s7d_reset.as_deref())
+    }
+
+    /// [`reset_is_overdue`] for this result, at an injectable `now` (issue
+    /// #7420). Tests pass a fixed instant; production goes through
+    /// [`Self::reset_overdue`].
+    #[must_use]
+    pub fn reset_overdue_at(&self, now: DateTime<Utc>) -> bool {
+        reset_is_overdue(&self.status, self.limit_reset(), now)
+    }
+
+    /// [`Self::reset_overdue_at`] against the current wall clock.
+    #[must_use]
+    pub fn reset_overdue(&self) -> bool {
+        self.reset_overdue_at(Utc::now())
+    }
+
+    /// JSON shape matching `check.AccountResult.to_dict`, plus the
+    /// `reset_overdue` flag (issue #7420).
+    pub fn to_json(&self) -> serde_json::Value {
+        self.to_json_at(Utc::now())
+    }
+
+    /// [`Self::to_json`] with an injectable `now` for the `reset_overdue`
+    /// flag, so tests do not depend on the wall clock.
+    pub fn to_json_at(&self, now: DateTime<Utc>) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".into(), serde_json::Value::String(self.name.clone()));
+        obj.insert("status".into(), serde_json::Value::String(self.status.clone()));
+        obj.insert("5h_utilization".into(), float_or_null(self.s5h_utilization));
+        obj.insert("7d_utilization".into(), float_or_null(self.s7d_utilization));
+        obj.insert(
+            "7d_reset".into(),
+            self.s7d_reset
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+        obj.insert(
+            "5h_reset".into(),
+            self.s5h_reset
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+        // The window that is actually gating this account right now — the one
+        // `.ranking` carries and the dashboard counts down to (issue #4874).
+        obj.insert(
+            "limit_reset".into(),
+            self.limit_reset()
+                .map_or(serde_json::Value::Null, |r| serde_json::Value::String(r.to_string())),
+        );
+        // `limit_reset` alone cannot tell a downstream consumer whether the
+        // account is *resting* (reset ahead of us) or *stuck* (reset already
+        // behind us — the revoked-credential shape of issue #7420). This flag
+        // makes that distinction countable without re-implementing the
+        // status/window/clock rule at the consumer.
+        obj.insert("reset_overdue".into(), serde_json::Value::Bool(self.reset_overdue_at(now)));
+        if let Some(err) = &self.error {
+            obj.insert("error".into(), serde_json::Value::String(err.clone()));
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
+fn float_or_null(v: Option<f64>) -> serde_json::Value {
+    match v.and_then(serde_json::Number::from_f64) {
+        Some(n) => serde_json::Value::Number(n),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Aggregate probe report across all accounts. Mirrors `check.ProbeReport`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeReport {
+    pub ranked_at: String,
+    pub accounts: Vec<AccountResult>,
+}
+
+impl ProbeReport {
+    /// JSON shape matching `check.ProbeReport.to_dict`, plus the
+    /// `overdue_reset_accounts` roll-up (issue #7420).
+    pub fn to_json(&self) -> serde_json::Value {
+        self.to_json_at(Utc::now())
+    }
+
+    /// [`Self::to_json`] with an injectable `now` so the `reset_overdue`
+    /// flags do not depend on the wall clock in tests.
+    pub fn to_json_at(&self, now: DateTime<Utc>) -> serde_json::Value {
+        serde_json::json!({
+            "ranked_at": self.ranked_at,
+            "accounts": self.accounts.iter().map(|a| a.to_json_at(now)).collect::<Vec<_>>(),
+            // Pool-level roll-up so a fleet check can alert on "N accounts are
+            // out of rotation with a reset that already passed" without
+            // walking (and re-deriving the rule over) every account row.
+            "overdue_reset_accounts": self.overdue_reset_count_at(now),
+        })
+    }
+
+    /// How many accounts in this report carry an overdue reset
+    /// ([`reset_is_overdue`]) at `now`.
+    #[must_use]
+    pub fn overdue_reset_count_at(&self, now: DateTime<Utc>) -> usize {
+        self.accounts
+            .iter()
+            .filter(|a| a.reset_overdue_at(now))
+            .count()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP transport abstraction (curl in production, stub in tests)
+// ---------------------------------------------------------------------------
+
+/// A successful HTTP response (status + headers; the body is discarded — the
+/// probe only reads status and rate-limit headers).
+#[derive(Debug, Clone)]
+pub struct ProbeResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+/// A transport-level failure (never a 4xx/5xx — those are `ProbeResponse`s).
+#[derive(Debug, Clone)]
+pub enum ProbeError {
+    /// Request exceeded the timeout (curl exit 28). Mirrors `requests.Timeout`.
+    Timeout,
+    /// DNS/connect failure (curl exit 6/7). Mirrors `requests.ConnectionError`.
+    Connection(String),
+    /// Any other transport failure. Mirrors a generic `requests.RequestException`.
+    Request(String),
+}
+
+/// Injectable HTTP transport so the probe is testable without the network.
+pub trait ProbeTransport {
+    fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &str,
+        timeout_secs: f64,
+    ) -> Result<ProbeResponse, ProbeError>;
+}
+
+/// Render `headers` as curl's `-H @-` stdin format: one `name: value` pair
+/// per line, terminated with `\n`. Kept as a standalone, argv-free function
+/// so tests can assert on its output directly without spawning `curl`.
+fn header_lines(headers: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (name, value) in headers {
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the `curl` [`Command`] for one probe request (everything except
+/// stdio wiring). Deliberately takes **no headers** — they are never placed
+/// in argv (see [`CurlTransport::post`]'s header comment); they are written
+/// to the child's stdin instead. Split out from `post` as a separately
+/// testable seam so the regression test for issue #5982 can inspect argv
+/// without spawning a process.
+fn build_curl_command(url: &str, body: &str, timeout_secs: f64) -> Command {
+    let mut cmd = Command::new("curl");
+    cmd.arg("--silent")
+        .arg("--show-error")
+        .arg("--max-time")
+        .arg(format!("{timeout_secs}"))
+        .arg("-o")
+        .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .arg("-D")
+        .arg("-")
+        .arg("-w")
+        .arg("\nLOOM_HTTP_CODE:%{http_code}")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg("@-")
+        .arg("--data-binary")
+        .arg(body)
+        .arg(url);
+    cmd
+}
+
+/// Production transport: shells to `curl`.
+pub struct CurlTransport;
+
+impl ProbeTransport for CurlTransport {
+    fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &str,
+        timeout_secs: f64,
+    ) -> Result<ProbeResponse, ProbeError> {
+        // `-D -` dumps the response headers to stdout; `-o /dev/null` discards
+        // the body; `-w` appends a sentinel line carrying the numeric status
+        // code so we never have to parse the (HTTP/1 vs HTTP/2) status line.
+        //
+        // Request headers -- including the `authorization: Bearer <token>` /
+        // `x-api-key` credential -- are NEVER placed on curl's command line.
+        // On Linux, argv is world-readable via `/proc/<pid>/cmdline` (and
+        // shows up in `ps`, `systemctl status` cgroup listings, and
+        // potentially journald), so a bearer token passed as a `-H` argument
+        // is exposed to every local process for the life of the probe (issue
+        // #5982). Instead, `-H @-` tells curl to read the header set from
+        // its stdin, one "name: value" pair per line.
+        //
+        // The request body carries no credential material (it is just the
+        // fixed probe prompt/model), so it is passed as a normal
+        // `--data-binary` argument -- `Command` execs curl directly with no
+        // shell in between, so no shell-escaping is needed either way, and
+        // this frees stdin for exclusive use by `-H @-` (curl does not
+        // support reading two separate `@-` streams from the same stdin).
+        let mut cmd = build_curl_command(url, body, timeout_secs);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ProbeError::Request(format!("spawn curl: {e}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(header_lines(headers).as_bytes());
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| ProbeError::Request(format!("curl wait: {e}")))?;
+
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(match code {
+                28 => ProbeError::Timeout,
+                6 | 7 => ProbeError::Connection(if stderr.is_empty() {
+                    format!("curl exit {code}")
+                } else {
+                    stderr
+                }),
+                _ => ProbeError::Request(if stderr.is_empty() {
+                    format!("curl exit {code}")
+                } else {
+                    stderr
+                }),
+            });
+        }
+
+        parse_curl_output(&String::from_utf8_lossy(&output.stdout))
+            .ok_or_else(|| ProbeError::Request("could not parse curl output".into()))
+    }
+}
+
+/// Parse the combined `-D -` header dump + `-w LOOM_HTTP_CODE:` trailer.
+fn parse_curl_output(raw: &str) -> Option<ProbeResponse> {
+    let mut status: Option<u16> = None;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("LOOM_HTTP_CODE:") {
+            status = rest.trim().parse::<u16>().ok();
+            continue;
+        }
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with("HTTP/") {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    status.map(|status| ProbeResponse { status, headers })
+}
+
+// ---------------------------------------------------------------------------
+// Token discovery
+// ---------------------------------------------------------------------------
+
+/// Resolve every manifest row's provider by account name, from `index.json`
+/// (design D6a). A name absent from the manifest — including when
+/// `index.json` itself is missing/unreadable — is treated as `claude`
+/// (fail-open, so a hand-provisioned pool with no manifest at all behaves
+/// exactly as it did before this dispatch existed).
+fn provider_by_name(tokens_dir: &Path) -> HashMap<String, AccountProvider> {
+    super::bootstrap::read_manifest_rows(&tokens_dir.join("index.json"))
+        .into_iter()
+        .map(|row| (row.name, row.provider))
+        .collect()
+}
+
+/// Return `[(account_name, token, provider), ...]` for bootstrapped accounts.
+///
+/// Reads every `*.token` file in `tokens_dir` (sorted by filename) and skips
+/// entries listed in `.bad_tokens`, surfacing them with an **empty** token so
+/// callers can still emit them as `status: blocked`. Each entry's provider is
+/// resolved from `index.json` via [`provider_by_name`] — a `.token` file with
+/// no manifest row is treated as `claude` (design D6a, issue #5608). Mirrors
+/// `check.discover_tokens`.
+///
+/// Bad-ness is decided by [`super::bad_tokens::blocking_entry_in_dir`] — the
+/// same authoritative, cooldown-aware per-field parser `select.rs`'s
+/// `is_bad` uses — not a naive whole-line-equality set (issue #6030). A
+/// bare-name-only line (`"agent-bad\n"`, no timestamp/reason) still matches:
+/// `blocking_entry_in_dir` treats a missing/unparseable timestamp as a
+/// permanent (fail-closed) block. What it fixes is the realistic production
+/// shape written by `mark_bad` / `claude-wrapper.sh`'s rotation helpers —
+/// `"<ISO8601 ts> <name> <reason...>"` — which the old whole-line compare
+/// never matched (the line is never equal to the bare account name), so a
+/// genuinely bad-marked account with a real reason string was silently
+/// probed with its live token instead of being reported `blocked`.
+pub fn discover_tokens(tokens_dir: &Path) -> Vec<(String, String, AccountProvider)> {
+    if !tokens_dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut token_files: Vec<PathBuf> = match std::fs::read_dir(tokens_dir) {
+        Ok(rd) => rd
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("token"))
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    token_files.sort();
+
+    let providers = provider_by_name(tokens_dir);
+
+    let mut tokens = Vec::new();
+    for path in token_files {
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let provider = providers
+            .get(&name)
+            .copied()
+            .unwrap_or(AccountProvider::Claude);
+        if let Some(entry) = super::bad_tokens::blocking_entry_in_dir(tokens_dir, &name) {
+            // #7522/#7538: an **exhaustion** entry (session-limit-worded or
+            // ambiguous) is a blocking class whose expiry the probe itself
+            // can be the authority on, so it is still probed with its live
+            // token. Skipping it made the check self-blinding:
+            // `probe_account_with_blocking` reports an empty-token account
+            // `blocked` with no utilization and no reset instant, `.ranking`
+            // records a bare `<name>|blocked` row, and that row then carries
+            // no evidence for `bad_tokens::session_window_has_reset` (or, for
+            // an ambiguous reason, the two-signal
+            // `bad_tokens::ambiguous_exhaustion_has_reset` check, #7538) to
+            // act on — so the entry could only ever clear on its TTL, and the
+            // `.ranking` row stayed `blocked` until a human ran `tokens
+            // unblock`. That is exactly the host-to-host divergence #7522
+            // reports (a Mac that never marked the account read it
+            // `available` with 5h util ~0 while the workers read it
+            // `blocked`).
+            //
+            // Probing costs one `max_tokens: 1` request and is
+            // self-correcting in both directions: if the window really has
+            // reset the account comes back `available` with a real 5h/7d
+            // utilization, and if it has not, the 429/200 response carries
+            // the live utilization + reset instants that let the entry expire
+            // no earlier than the evidence actually supports. This only adds
+            // a cheap, harmless probe request — it does not by itself change
+            // how long an entry is held; that is still decided read-side by
+            // `bad_tokens::blocking_entry_in_dir` (#7538). Only
+            // [`super::bad_tokens::BadReasonClass::Auth`] and
+            // `MalformedTimestamp` entries are still reported `blocked`
+            // without a network call, carrying their real class + reason
+            // (#6030) — auth/malformed entries never self-heal, so probing
+            // them would be wasted.
+            let probe_anyway = entry.class == super::bad_tokens::BadReasonClass::Exhaustion;
+            if !probe_anyway {
+                tokens.push((name, String::new(), provider)); // known-bad: do not probe
+                continue;
+            }
+        }
+        let token = match std::fs::read_to_string(&path) {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => continue,
+        };
+        if !token.is_empty() {
+            tokens.push((name, token, provider));
+        }
+    }
+    tokens
+}
+
+// ---------------------------------------------------------------------------
+// Header parsing
+// ---------------------------------------------------------------------------
+
+fn find_header_by_suffix(headers: &[(String, String)], suffix: &str) -> Option<String> {
+    let suffix_lower = suffix.to_ascii_lowercase();
+    headers
+        .iter()
+        .find(|(name, _)| name.to_ascii_lowercase().ends_with(&suffix_lower))
+        .map(|(_, value)| value.clone())
+}
+
+fn parse_float(raw: Option<&str>) -> Option<f64> {
+    raw.and_then(|r| r.trim().parse::<f64>().ok())
+}
+
+/// Convert an integer-seconds reset timestamp to ISO-8601 UTC. An unparseable
+/// value passes through verbatim (mirrors `check._epoch_to_iso`).
+fn epoch_to_iso(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let ts = match raw.parse::<f64>() {
+        Ok(t) if t.is_finite() => t,
+        // Already ISO-8601, non-finite, or unparseable — pass through.
+        _ => return Some(raw.to_string()),
+    };
+    match chrono::DateTime::<chrono::Utc>::from_timestamp(ts.floor() as i64, 0) {
+        Some(dt) => Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        None => Some(raw.to_string()),
+    }
+}
+
+/// Extracted rate-limit fields.
+struct RateLimitFields {
+    s5h_utilization: Option<f64>,
+    s7d_utilization: Option<f64>,
+    s7d_reset: Option<String>,
+    s5h_reset: Option<String>,
+    #[allow(dead_code)]
+    s5h_status: Option<String>,
+}
+
+fn parse_rate_limit_headers(headers: &[(String, String)]) -> RateLimitFields {
+    RateLimitFields {
+        s5h_utilization: parse_float(
+            find_header_by_suffix(headers, HEADER_SUFFIX_5H_UTIL).as_deref(),
+        ),
+        s7d_utilization: parse_float(
+            find_header_by_suffix(headers, HEADER_SUFFIX_7D_UTIL).as_deref(),
+        ),
+        s7d_reset: epoch_to_iso(find_header_by_suffix(headers, HEADER_SUFFIX_7D_RESET).as_deref()),
+        s5h_reset: epoch_to_iso(find_header_by_suffix(headers, HEADER_SUFFIX_5H_RESET).as_deref()),
+        s5h_status: find_header_by_suffix(headers, HEADER_SUFFIX_5H_STATUS),
+    }
+}
+
+/// The instant this account's **binding** limit window resets — i.e. the answer
+/// to "when can I dispatch to it again?" (issue #4874).
+///
+/// The pool tracks two independent windows, and which one is holding an
+/// account back depends on its status:
+///
+/// - `exhausted` is derived from **7d** utilization clearing
+///   [`EXHAUSTED_THRESHOLD`], so the 5h window rolling over changes nothing —
+///   the 7d reset is the release.
+/// - `rate_limited` is a 429 whose 7d utilization is *below* the threshold, so
+///   the **5h** window is what tripped and the 5h reset is the release. Naming
+///   the 7d reset here would be actively misleading: on a live host a
+///   `rate_limited` account had a 5h reset ~1.6h out and a 7d reset **six days**
+///   out, and the dashboard would have counted down to the wrong one.
+/// - Anything else (`available`, `blocked`, `error`, …) is not gated by a
+///   window at all. Report the 5h reset, which is the rollover the reported
+///   `5h_utilization` — the `usage_fraction` the dashboard charts and forecasts
+///   against — is actually racing.
+///
+/// Returns `None` when the relevant instant is unknown. It is never
+/// substituted with the other window's: an absent countdown reads as "unknown",
+/// a wrong one reads as a fact.
+///
+/// Takes the three values rather than an [`AccountResult`] so the
+/// claude-monitor writer — which has its own account struct — picks the window
+/// through this same function instead of re-deriving the rule.
+#[must_use]
+pub fn limit_reset<'a>(
+    status: &str,
+    reset_5h: Option<&'a str>,
+    reset_7d: Option<&'a str>,
+) -> Option<&'a str> {
+    match status {
+        "exhausted" => reset_7d,
+        _ => reset_5h,
+    }
+}
+
+/// The statuses `super::select::is_hard_excluded_status` refuses at **any**
+/// ranking age and never readmits via the fail-safe (#5629) — durable,
+/// account-scoped refusals rather than transient load signals.
+///
+/// Kept as its own predicate (rather than inlined) because it is exactly the
+/// set for which an already-passed reset is *pathological*: any other status
+/// is either healthy or self-clearing, so a stale reset on it costs nothing
+/// but a slightly old countdown. This is a deliberate copy of `select`'s
+/// private predicate, not a shared import: `select` is the read side of
+/// `.ranking` and must keep owning its own exclusion vocabulary (#5629), and
+/// this module must not be able to widen it by accident.
+#[must_use]
+pub fn is_reprobe_gated_status(status: &str) -> bool {
+    status == "exhausted" || status == "blocked"
+}
+
+/// True when this account is in a re-probe-gated status ([`is_reprobe_gated_status`])
+/// **and** the window that is supposedly gating it ([`limit_reset`]) already
+/// rolled over before `now` (issue #7420).
+///
+/// That combination is not a normal state: the account claims to be resting
+/// until an instant that has passed, and nothing in the selector will ever
+/// readmit it on its own. In practice it means the ranking row is frozen —
+/// on the incident host, claude-monitor's `usage.db` stopped refreshing two
+/// accounts on the day their reset names, because the upstream credentials
+/// had been **revoked**, and Loom's monitor-sourced `.ranking` then copied
+/// `exhausted` + that eight-day-old reset forward indefinitely.
+///
+/// Deliberately narrow on both axes:
+///
+/// - **Missing reset is never overdue.** An account with no `limit_reset` at
+///   all reads as "unknown", never coerced into a claim about the past — the
+///   same convention `parse_util`/`limit_reset` already follow (issues
+///   #4874 / #5629). A `blocked` account with no reset is the *expected*
+///   steady state after this fix marks one `auth-dead`, and must not
+///   re-trigger forever.
+/// - **`rate_limited` is out of scope.** Its 5h window rolls over routinely,
+///   it is only an *advisory* exclusion (the fail-safe already readmits it),
+///   and a monitor file a few minutes behind would flag every such row. The
+///   trap this predicate exists for is specifically the never-readmitted set.
+#[must_use]
+pub fn reset_is_overdue(status: &str, limit_reset: Option<&str>, now: DateTime<Utc>) -> bool {
+    if !is_reprobe_gated_status(status) {
+        return false;
+    }
+    let Some(raw) = limit_reset else {
+        return false;
+    };
+    super::monitor::parse_iso8601(Some(raw)).is_some_and(|reset| reset <= now)
+}
+
+// ---------------------------------------------------------------------------
+// Probe
+// ---------------------------------------------------------------------------
+
+fn build_headers(token: &str) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+        ("content-type".to_string(), "application/json".to_string()),
+        ("user-agent".to_string(), USER_AGENT.to_string()),
+    ];
+    if token.starts_with("sk-ant-oat") {
+        headers.push(("authorization".to_string(), format!("Bearer {token}")));
+        headers.push(("anthropic-beta".to_string(), ANTHROPIC_OAUTH_BETA.to_string()));
+    } else {
+        headers.push(("x-api-key".to_string(), token.to_string()));
+    }
+    headers
+}
+
+/// Return `"exhausted"` when `s7d_util` clears the threshold, else `default`.
+/// Applied on both the 2xx and 429 branches (issue #3988).
+fn status_from_utilization(s7d_util: Option<f64>, default: &str) -> String {
+    if s7d_util.is_some_and(|u| u >= EXHAUSTED_THRESHOLD) {
+        "exhausted".to_string()
+    } else {
+        default.to_string()
+    }
+}
+
+/// Probe a single account. Transport failures map to `status="error"`; they
+/// never propagate as `Err`. Mirrors `check.probe_account`.
+pub fn probe_account(
+    name: &str,
+    token: &str,
+    model: &str,
+    probe_prompt: &str,
+    timeout_secs: f64,
+    transport: &dyn ProbeTransport,
+) -> AccountResult {
+    probe_account_with_blocking(name, token, model, probe_prompt, timeout_secs, transport, None)
+}
+
+/// [`probe_account`], additionally accepting the `.bad_tokens` entry (if any)
+/// already known to be blocking this account (issue #6030).
+///
+/// A `.bad_tokens`-listed account is never actually probed (`discover_tokens`
+/// hands it an empty token), so before this the operator-facing `error` field
+/// on its `AccountResult` was the opaque `"bad_token_listed"` — giving no way
+/// to tell an auth-dead account (needs `claude login` / a fresh OAuth token)
+/// apart from a still-cooling-down exhaustion entry from `tokens check`'s
+/// table/JSON output alone. Passing the [`super::bad_tokens::BlockingEntry`]
+/// through lets the `error` field carry the real class + reason instead.
+pub fn probe_account_with_blocking(
+    name: &str,
+    token: &str,
+    model: &str,
+    probe_prompt: &str,
+    timeout_secs: f64,
+    transport: &dyn ProbeTransport,
+    blocking: Option<&super::bad_tokens::BlockingEntry>,
+) -> AccountResult {
+    if token.is_empty() {
+        let mut r = AccountResult::new(name, "blocked");
+        r.error = Some(match blocking {
+            Some(entry) => format!("{}: {}", entry.class.label(), entry.reason),
+            None => "bad_token_listed".to_string(),
+        });
+        return r;
+    }
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": probe_prompt}],
+    })
+    .to_string();
+    let headers = build_headers(token);
+
+    let resp = match transport.post(ANTHROPIC_MESSAGES_URL, &headers, &body, timeout_secs) {
+        Ok(r) => r,
+        Err(ProbeError::Timeout) => {
+            let mut r = AccountResult::new(name, "error");
+            r.error = Some("timeout".to_string());
+            return r;
+        }
+        Err(ProbeError::Connection(msg)) => {
+            let mut r = AccountResult::new(name, "error");
+            r.error = Some(format!("connection: {msg}"));
+            return r;
+        }
+        Err(ProbeError::Request(msg)) => {
+            let mut r = AccountResult::new(name, "error");
+            r.error = Some(msg);
+            return r;
+        }
+    };
+
+    let code = resp.status;
+
+    if code == 401 {
+        let mut r = AccountResult::new(name, "blocked");
+        r.error = Some("auth_401".to_string());
+        return r;
+    }
+
+    if code == 429 {
+        let parsed = parse_rate_limit_headers(&resp.headers);
+        let status = status_from_utilization(parsed.s7d_utilization, "rate_limited");
+        return AccountResult {
+            name: name.to_string(),
+            status,
+            s5h_utilization: parsed.s5h_utilization,
+            s7d_utilization: parsed.s7d_utilization,
+            s7d_reset: parsed.s7d_reset,
+            s5h_reset: parsed.s5h_reset,
+            error: None,
+        };
+    }
+
+    if code >= 400 {
+        // 5xx and non-401/429 4xx — bad payload/upstream. Treat as error.
+        let mut r = AccountResult::new(name, "error");
+        r.error = Some(format!("http_{code}"));
+        return r;
+    }
+
+    // 2xx — successful probe.
+    let parsed = parse_rate_limit_headers(&resp.headers);
+    let status = status_from_utilization(parsed.s7d_utilization, "available");
+    AccountResult {
+        name: name.to_string(),
+        status,
+        s5h_utilization: parsed.s5h_utilization,
+        s7d_utilization: parsed.s7d_utilization,
+        s7d_reset: parsed.s7d_reset,
+        s5h_reset: parsed.s5h_reset,
+        error: None,
+    }
+}
+
+/// Dispatch a discovered account to its provider's probe (design D6a, issue
+/// #5608).
+///
+/// `claude` reuses [`probe_account_with_blocking`] byte-identically — this
+/// function never changes that probe's own logic, only decides whether to
+/// call it. A non-empty token that does not have the shape of a Claude
+/// credential ([`super::bootstrap::has_claude_credential_shape`], design D7)
+/// short-circuits to `"blocked"` / `error: "shape_mismatch"` *before* any
+/// network call — a legacy mis-bound file (e.g. a JWT saved under a `.token`
+/// filename) previously reached Anthropic and came back `auth_401`, a far
+/// less diagnostic error for the identical root cause. An empty token (a
+/// `.bad_tokens`-listed account) is unaffected by the shape check — that case
+/// is [`probe_account_with_blocking`]'s own responsibility, unchanged.
+///
+/// Any other provider (no probe adapter implemented yet) reports
+/// `"unsupported"` with `error: Some("no_probe_adapter:<provider>")` and every
+/// utilization/reset field `None`. It must never report `exhausted`, and never
+/// carries a fabricated number — there was no request to derive one from.
+#[allow(clippy::too_many_arguments)] // mirrors probe_account_with_blocking's existing 7 args + provider
+fn dispatch_probe(
+    name: &str,
+    token: &str,
+    provider: AccountProvider,
+    model: &str,
+    probe_prompt: &str,
+    timeout_secs: f64,
+    transport: &dyn ProbeTransport,
+    blocking: Option<&super::bad_tokens::BlockingEntry>,
+) -> AccountResult {
+    match provider {
+        AccountProvider::Claude => {
+            if !token.is_empty() && !super::bootstrap::has_claude_credential_shape(token) {
+                let mut r = AccountResult::new(name, "blocked");
+                r.error = Some("shape_mismatch".to_string());
+                return r;
+            }
+            probe_account_with_blocking(
+                name,
+                token,
+                model,
+                probe_prompt,
+                timeout_secs,
+                transport,
+                blocking,
+            )
+        }
+        other => {
+            let mut r = AccountResult::new(name, "unsupported");
+            // `AccountProvider`'s lowercase `Display` (`claude` / `codex`).
+            r.error = Some(format!("no_probe_adapter:{other}"));
+            r
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ranking + atomic write
+// ---------------------------------------------------------------------------
+
+/// The shared status-severity ordering, owned by [`super::status_order`] since
+/// issue #8539. Re-exported so `check::status_rank` stays the path every
+/// existing caller (and this module's own [`sort_key`]) already uses.
+pub use super::status_order::status_rank;
+
+/// Absent-reset sentinel so accounts without a 7d reset sort last in-bucket.
+const RESET_SENTINEL: &str = "9999-12-31T23:59:59Z";
+
+fn sort_key(a: &AccountResult) -> (i32, String) {
+    let reset = a
+        .s7d_reset
+        .clone()
+        .unwrap_or_else(|| RESET_SENTINEL.to_string());
+    (status_rank(&a.status), reset)
+}
+
+/// Build a sorted report from probe results (stable sort). Mirrors
+/// `check.build_report`.
+#[must_use]
+pub fn build_report(mut results: Vec<AccountResult>) -> ProbeReport {
+    let ranked_at = now_iso();
+    results.sort_by_key(sort_key);
+    ProbeReport {
+        ranked_at,
+        accounts: results,
+    }
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Format one `.ranking` line, emitting the optional 5h-utilization (issue
+/// #4195) and binding-limit-reset (issue #4874) fields:
+/// `name|status|5h_util|limit_reset`, truncated to the shortest form that
+/// carries every known value — `name|status` when neither is known,
+/// `name|status|util` when only the utilization is. A row that knows its reset
+/// but not its utilization writes an **empty** third field
+/// (`name|status||limit_reset`) so the reset stays in position 4; the reader
+/// parses an empty utilization back to `None` rather than a fabricated `0.0`.
+/// The float is fixed at 2 decimals so the probe and monitor writers stay
+/// byte-identical.
+///
+/// `limit_reset` is whichever window is actually gating the account — see
+/// [`limit_reset`], which both writers call to pick it. It is written verbatim
+/// minus surrounding whitespace, and is **dropped** if it contains a `|` or `#`
+/// — either would make the line unparseable (field split / comment strip), and
+/// a silently mangled row is worse than an absent reset.
+pub(crate) fn ranking_line(
+    name: &str,
+    status: &str,
+    util_5h: Option<f64>,
+    limit_reset: Option<&str>,
+) -> String {
+    let reset = limit_reset
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && !r.contains('|') && !r.contains('#'));
+    match (util_5h, reset) {
+        (Some(u), Some(r)) => format!("{name}|{status}|{u:.2}|{r}"),
+        (Some(u), None) => format!("{name}|{status}|{u:.2}"),
+        (None, Some(r)) => format!("{name}|{status}||{r}"),
+        (None, None) => format!("{name}|{status}"),
+    }
+}
+
+/// Serialize a report to the selector's `name|status|5h_util|limit_reset`
+/// format (trailing newline, empty report -> empty string). The 5h utilization
+/// (issue #4195) and the binding-window reset instant (issue #4874) are
+/// optional trailing fields, emitted when known.
+///
+/// `"unsupported"` rows (design D6a, issue #5608) are **omitted** — `.ranking`'s
+/// contract is "Claude accounts the selector may pick" (read by
+/// `select::try_ranking` and the daemon's healthy-count reader), and an
+/// account with no probe adapter is never selectable. They still appear in
+/// the in-memory [`ProbeReport`] (so `--json` and [`format_table`] show them —
+/// the operator-visible signal the pool lacked before this issue), and every
+/// other status is written exactly as before.
+#[must_use]
+pub fn format_ranking_lines(report: &ProbeReport) -> String {
+    let mut out = String::new();
+    for a in &report.accounts {
+        if a.status == "unsupported" {
+            continue;
+        }
+        out.push_str(&ranking_line(&a.name, &a.status, a.s5h_utilization, a.limit_reset()));
+        out.push('\n');
+    }
+    out
+}
+
+/// Write `report` to `ranking_path` atomically (`<path>.tmp` + rename in the
+/// same directory). Mirrors `check.write_ranking_atomic`.
+pub fn write_ranking_atomic(report: &ProbeReport, ranking_path: &Path) -> std::io::Result<()> {
+    super::monitor::write_ranking_text(&format_ranking_lines(report), ranking_path)
+}
+
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
+/// Where the ranking comes from (`--source`, #3697).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Auto,
+    Monitor,
+    Probe,
+}
+
+impl Source {
+    /// Parse a `--source` / `$LOOM_RANKING_SOURCE` value.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "monitor" => Some(Self::Monitor),
+            "probe" => Some(Self::Probe),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the ranking source: flag > `$LOOM_RANKING_SOURCE` > `auto`.
+/// An invalid env value is ignored (treated as unset). Mirrors
+/// `cli._resolve_ranking_source`.
+#[must_use]
+pub fn resolve_source(flag: Option<Source>) -> Source {
+    if let Some(s) = flag {
+        return s;
+    }
+    if let Ok(env) = std::env::var("LOOM_RANKING_SOURCE") {
+        if let Some(s) = Source::parse(&env) {
+            return s;
+        }
+        if !env.trim().is_empty() {
+            eprintln!(
+                "WARNING Ignoring invalid LOOM_RANKING_SOURCE={env:?}; \
+                 expected one of auto, monitor, probe."
+            );
+        }
+    }
+    Source::Auto
+}
+
+/// Options for [`run_check`].
+pub struct CheckOptions<'a> {
+    pub source: Source,
+    pub write_ranking: bool,
+    pub probe_prompt: &'a str,
+    pub model: &'a str,
+    pub stagger: bool,
+}
+
+impl Default for CheckOptions<'_> {
+    fn default() -> Self {
+        Self {
+            source: Source::Probe,
+            write_ranking: false,
+            probe_prompt: DEFAULT_PROBE_PROMPT,
+            model: DEFAULT_PROBE_MODEL,
+            stagger: true,
+        }
+    }
+}
+
+/// Reason recorded in `.bad_tokens` when an overdue-reset re-probe comes back
+/// `401` (issue #7420).
+///
+/// Matches the `"auth-dead: ..."` shape `claude-wrapper.sh` already writes for
+/// the same condition, so [`super::bad_tokens::BadReasonClass`] classifies it
+/// as `auth` (permanent, needs `tokens unblock` + a re-auth) rather than as a
+/// TTL'd exhaustion entry, and `tokens check`'s own table renders the same
+/// text on every host.
+///
+/// Deliberately free of `#` and `|`: `.bad_tokens` and `.ranking` readers both
+/// treat those as structural (comment strip / field split), and a reason that
+/// could be truncated by one of them is worse than a shorter one.
+pub const REPROBE_AUTH_DEAD_REASON: &str = "auth-dead: 401 on overdue-reset re-probe";
+
+/// The targeted re-probe [`run_check`] hands to
+/// [`super::monitor::run_monitor_check_with_reprobe`].
+///
+/// Token discovery is deferred behind a [`std::cell::OnceCell`] so the common
+/// case — a `ranking.json` with no overdue rows at all — never walks the
+/// tokens directory, keeping the monitor short-circuit as cheap as it was
+/// before issue #7420.
+struct OverdueReprobe<'a> {
+    tokens_dir: &'a Path,
+    opts: &'a CheckOptions<'a>,
+    transport: &'a dyn ProbeTransport,
+    discovered: std::cell::OnceCell<HashMap<String, (String, AccountProvider)>>,
+    trace: &'a RoundTrace,
+}
+
+impl OverdueReprobe<'_> {
+    fn probe(&self, name: &str) -> AccountResult {
+        let map = self.discovered.get_or_init(|| {
+            discover_tokens(self.tokens_dir)
+                .into_iter()
+                .map(|(n, token, provider)| (n, (token, provider)))
+                .collect()
+        });
+        let Some((token, provider)) = map.get(name) else {
+            // The monitor knows this account but the pool has no `.token`
+            // file for it — nothing to probe with, so nothing is concluded.
+            // `error` is the caller's "leave the row alone" signal.
+            let mut r = AccountResult::new(name, "error");
+            r.error = Some("no_token_file".to_string());
+            return r;
+        };
+        // Same bad-token courtesy as the full probe loop (#6030): a
+        // `.bad_tokens`-listed account is handed an empty token by
+        // `discover_tokens` and never reaches the network, so look up why it
+        // is blocked to give the row a real reason instead of
+        // "bad_token_listed".
+        let blocking = if token.is_empty() {
+            super::bad_tokens::blocking_entry_in_dir(self.tokens_dir, name)
+        } else {
+            None
+        };
+        self.trace.record(name, token, *provider);
+        let result = dispatch_probe(
+            name,
+            token,
+            *provider,
+            self.opts.model,
+            self.opts.probe_prompt,
+            DEFAULT_TIMEOUT_SECONDS,
+            self.transport,
+            blocking.as_ref(),
+        );
+        self.trace.record_result(name, &result.status);
+        // A 401 here is the whole point of the re-probe: the account was
+        // never quota-exhausted, its credential was revoked. Record it so the
+        // knowledge outlives this process — `.ranking` is rewritten every 10
+        // minutes from a `ranking.json` that will keep saying `exhausted`,
+        // whereas `.bad_tokens` is durable, is what `select` consults on every
+        // spawn, and is what `tokens unblock` clears after a re-auth.
+        //
+        // Gated on `write_ranking` so only the invocations that are already
+        // *authoritative* about pool state persist it — `tokens check
+        // --ranking` and the daemon's periodic refresh, exactly the two paths
+        // acceptance criterion 1 names. `loom-daemon status`'s token snapshot
+        // and a bare `tokens check` are read-only diagnostics: they still
+        // re-probe and still report the truth, they just do not mutate
+        // `.bad_tokens` behind the operator's back.
+        if self.opts.write_ranking && result.error.as_deref() == Some("auth_401") {
+            if let Err(e) =
+                super::bad_tokens::mark_bad_in_dir(self.tokens_dir, name, REPROBE_AUTH_DEAD_REASON)
+            {
+                eprintln!("WARNING failed to record {name} as auth-dead in .bad_tokens: {e}");
+            }
+        }
+        result
+    }
+}
+
+/// Probe all accounts (or consume claude-monitor data) and optionally write
+/// `.ranking`. Mirrors `check.run_check`.
+pub fn run_check(
+    tokens_dir: &Path,
+    opts: &CheckOptions,
+    transport: &dyn ProbeTransport,
+) -> ProbeReport {
+    run_check_traced(tokens_dir, opts, transport, &RoundTrace::default())
+}
+
+/// [`run_check`], recording into `trace` which accounts were probed and
+/// whether claude-monitor served the ranking (issue #10744, see
+/// [`super::round_summary`]).
+pub fn run_check_traced(
+    tokens_dir: &Path,
+    opts: &CheckOptions,
+    transport: &dyn ProbeTransport,
+    trace: &RoundTrace,
+) -> ProbeReport {
+    if matches!(opts.source, Source::Auto | Source::Monitor) {
+        // Issue #7420: under `auto` (the default, and what the daemon's
+        // periodic `tokens check --ranking` refresh runs), a monitor row
+        // frozen in a never-readmitted status past its own reset instant is
+        // re-probed rather than copied forward. `--source monitor` keeps its
+        // documented "no probe, ever" contract — an operator who asked for
+        // the file-only source gets the file, plus the `overdue` flag in the
+        // table/JSON so the frozen row is at least visible.
+        let reprobe = OverdueReprobe {
+            tokens_dir,
+            opts,
+            transport,
+            discovered: std::cell::OnceCell::new(),
+            trace,
+        };
+        let reprobe_fn = |name: &str| reprobe.probe(name);
+        let hook: Option<&dyn Fn(&str) -> AccountResult> = if opts.source == Source::Auto {
+            Some(&reprobe_fn)
+        } else {
+            None
+        };
+        if let Some(report) = super::monitor::run_monitor_check_with_reprobe(
+            tokens_dir,
+            opts.write_ranking,
+            now_iso,
+            Utc::now(),
+            hook,
+        ) {
+            trace.mark_monitor_served();
+            return report;
+        }
+        if opts.source == Source::Monitor {
+            // monitor-only: no probe fallback. Empty report, leave `.ranking`.
+            eprintln!(
+                "WARNING check --source monitor: no fresh claude-monitor ranking.json; \
+                 nothing to rank (not probing)."
+            );
+            return build_report(Vec::new());
+        }
+        // Auto: fall through to probing.
+    }
+
+    let pairs = discover_tokens(tokens_dir);
+    if pairs.is_empty() {
+        eprintln!("WARNING no tokens found in {}", tokens_dir.display());
+    }
+
+    let mut results = Vec::with_capacity(pairs.len());
+    for (i, (name, token, provider)) in pairs.iter().enumerate() {
+        if i > 0 && opts.stagger && !token.is_empty() {
+            let mut rng = super::rng::Rng::from_entropy();
+            // 0.5..1.5s jitter (lean-genius pattern).
+            let millis = 500 + (rng.next_u64() % 1000);
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+        }
+        // A bad-marked account is never actually probed (empty token) — look
+        // up why it's blocked so the result carries the real class/reason
+        // instead of the opaque "bad_token_listed" (#6030).
+        let blocking = if token.is_empty() {
+            super::bad_tokens::blocking_entry_in_dir(tokens_dir, name)
+        } else {
+            None
+        };
+        trace.record(name, token, *provider);
+        let result = dispatch_probe(
+            name,
+            token,
+            *provider,
+            opts.model,
+            opts.probe_prompt,
+            DEFAULT_TIMEOUT_SECONDS,
+            transport,
+            blocking.as_ref(),
+        );
+        trace.record_result(name, &result.status);
+        results.push(result);
+    }
+
+    let report = build_report(results);
+
+    if opts.write_ranking {
+        let ranking_path = tokens_dir.join(".ranking");
+        if let Err(e) = write_ranking_atomic(&report, &ranking_path) {
+            eprintln!("WARNING failed to write {}: {e}", ranking_path.display());
+        }
+    }
+
+    report
+}
+
+/// Human-readable status table (best accounts first).
+///
+/// The reset column reports the **binding** window ([`limit_reset`]) and names
+/// which one it is, e.g. `2026-08-02T03:00:00Z (7d)`. It was labelled
+/// `7d resets` and fed from `s7d_reset` alone until issue #4874, which was
+/// wrong twice over: on the claude-monitor backend it was never populated at
+/// all (a permanent `-`), and on the probe backend a `rate_limited` account
+/// showed its 7d reset — days away — when the 5h window was the one holding it.
+///
+/// A reset instant that has **already passed** on a never-readmitted status is
+/// rendered as `overdue since <instant> (<window>)`, never as a bare instant
+/// (issue #7420) — printing the raw timestamp made a revoked account read as
+/// "resting until <date>" to anyone who did not check the date against today,
+/// and the pool looked healthier than it was. The flag is derived from
+/// [`reset_is_overdue`], the same predicate that decides whether to re-probe
+/// the row and the same one `--json`'s `reset_overdue` reports, so the three
+/// cannot disagree.
+#[must_use]
+pub fn format_table(report: &ProbeReport) -> String {
+    format_table_at(report, Utc::now())
+}
+
+/// [`format_table`] with an injectable `now` for the overdue-reset flag.
+#[must_use]
+pub fn format_table_at(report: &ProbeReport, now: DateTime<Utc>) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Token pool ranking (probed at {})", report.ranked_at));
+    lines.push("=".repeat(84));
+    lines.push(format!(
+        "{:<28} {:>9} {:>9} {:<13} {:<25}",
+        "Account", "5h util", "7d util", "Status", "Resets at"
+    ));
+    lines.push("-".repeat(84));
+    for a in &report.accounts {
+        let s5 = a
+            .s5h_utilization
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        let s7 = a
+            .s7d_utilization
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        let window = if a.status == "exhausted" { "7d" } else { "5h" };
+        let overdue = a.reset_overdue_at(now);
+        let reset = a.limit_reset().map_or_else(
+            || "-".to_string(),
+            |r| {
+                if overdue {
+                    format!("overdue since {r} ({window})")
+                } else {
+                    format!("{r} ({window})")
+                }
+            },
+        );
+        let mut row = format!("{:<28} {:>9} {:>9} {:<13} {:<25}", a.name, s5, s7, a.status, reset);
+        // Surface WHY a blocked/errored account is out of rotation (#6030) —
+        // in particular, whether it needs `tokens unblock` (auth-dead,
+        // permanent) or will clear itself (exhaustion, TTL) rather than just
+        // "blocked" with no explanation.
+        if let Some(err) = &a.error {
+            row.push_str(&format!("  ({err})"));
+        }
+        lines.push(row);
+    }
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for a in &report.accounts {
+        *counts.entry(a.status.clone()).or_insert(0) += 1;
+    }
+    let summary = counts
+        .iter()
+        .map(|(s, n)| format!("{n} {s}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(String::new());
+    lines.push(format!("Total {}: {summary}", report.accounts.len()));
+    let overdue = report.overdue_reset_count_at(now);
+    if overdue > 0 {
+        lines.push(format!(
+            "WARNING {overdue} account{} out of rotation with a reset that has already passed \
+             — likely a revoked credential, not quota exhaustion. Re-probe with \
+             `loom-daemon tokens check --ranking --source probe`; clear a confirmed-dead \
+             account with `loom-daemon tokens unblock <name>` after re-authenticating.",
+            if overdue == 1 { " is" } else { "s are" },
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tokens_pool::monitor_dir::test_env::MonitorDirEnvGuard;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::fs;
+
+    /// Stub transport driven by a queue of canned responses (or errors).
+    struct StubTransport {
+        responses: RefCell<Vec<Result<ProbeResponse, ProbeError>>>,
+    }
+
+    impl StubTransport {
+        fn new(responses: Vec<Result<ProbeResponse, ProbeError>>) -> Self {
+            Self {
+                responses: RefCell::new(responses),
+            }
+        }
+    }
+
+    impl ProbeTransport for StubTransport {
+        fn post(
+            &self,
+            _url: &str,
+            _headers: &[(String, String)],
+            _body: &str,
+            _timeout: f64,
+        ) -> Result<ProbeResponse, ProbeError> {
+            self.responses
+                .borrow_mut()
+                .drain(..1)
+                .next()
+                .unwrap_or_else(|| Err(ProbeError::Request("stub exhausted".into())))
+        }
+    }
+
+    fn resp(status: u16, headers: &[(&str, &str)]) -> Result<ProbeResponse, ProbeError> {
+        Ok(ProbeResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        })
+    }
+
+    fn good_headers(s7d: f64, s5h: f64) -> Vec<(String, String)> {
+        vec![
+            ("anthropic-ratelimit-tokens-5h-utilization".into(), format!("{s5h}")),
+            ("anthropic-ratelimit-tokens-7d-utilization".into(), format!("{s7d}")),
+            ("anthropic-ratelimit-tokens-7d-reset".into(), "1762070400".into()),
+        ]
+    }
+
+    // ---- header parsing ------------------------------------------------
+
+    #[test]
+    fn suffix_match_canonical() {
+        let headers = good_headers(0.10, 0.42);
+        let parsed = parse_rate_limit_headers(&headers);
+        assert!((parsed.s5h_utilization.unwrap() - 0.42).abs() < 1e-9);
+        assert!((parsed.s7d_utilization.unwrap() - 0.10).abs() < 1e-9);
+        assert_eq!(parsed.s7d_reset.as_deref(), Some("2025-11-02T08:00:00Z"));
+    }
+
+    #[test]
+    fn suffix_match_after_prefix_rename() {
+        let headers = vec![
+            (
+                "anthropic-ratelimit-input-tokens-7d-utilization".to_string(),
+                "0.91".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-input-tokens-5h-utilization".to_string(),
+                "0.55".to_string(),
+            ),
+        ];
+        let parsed = parse_rate_limit_headers(&headers);
+        assert!((parsed.s7d_utilization.unwrap() - 0.91).abs() < 1e-9);
+        assert!((parsed.s5h_utilization.unwrap() - 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn suffix_match_case_insensitive() {
+        let headers =
+            vec![("Anthropic-RateLimit-Tokens-5H-Utilization".to_string(), "0.30".to_string())];
+        let parsed = parse_rate_limit_headers(&headers);
+        assert!((parsed.s5h_utilization.unwrap() - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_headers_return_none() {
+        let parsed = parse_rate_limit_headers(&[("x-request-id".into(), "abc".into())]);
+        assert!(parsed.s5h_utilization.is_none());
+        assert!(parsed.s7d_utilization.is_none());
+        assert!(parsed.s7d_reset.is_none());
+    }
+
+    #[test]
+    fn unparseable_float_is_none() {
+        assert!(parse_float(Some("not-a-number")).is_none());
+    }
+
+    #[test]
+    fn epoch_conversions() {
+        assert_eq!(epoch_to_iso(Some("0")).as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(epoch_to_iso(Some("1762070400")).as_deref(), Some("2025-11-02T08:00:00Z"));
+        // ISO already / unparseable -> passthrough.
+        assert_eq!(
+            epoch_to_iso(Some("2026-05-09T00:00:00Z")).as_deref(),
+            Some("2026-05-09T00:00:00Z")
+        );
+        assert!(epoch_to_iso(Some("")).is_none());
+        assert!(epoch_to_iso(None).is_none());
+    }
+
+    // ---- auth header selection ----------------------------------------
+
+    #[test]
+    fn oauth_token_uses_bearer() {
+        let h = build_headers("sk-ant-oat01-abc123");
+        assert!(h
+            .iter()
+            .any(|(k, v)| k == "authorization" && v == "Bearer sk-ant-oat01-abc123"));
+        assert!(h
+            .iter()
+            .any(|(k, v)| k == "anthropic-beta" && v == ANTHROPIC_OAUTH_BETA));
+        assert!(!h.iter().any(|(k, _)| k == "x-api-key"));
+    }
+
+    #[test]
+    fn api_key_uses_x_api_key() {
+        let h = build_headers("sk-ant-api03-xyz");
+        assert!(h
+            .iter()
+            .any(|(k, v)| k == "x-api-key" && v == "sk-ant-api03-xyz"));
+        assert!(!h.iter().any(|(k, _)| k == "authorization"));
+        assert!(!h.iter().any(|(k, _)| k == "anthropic-beta"));
+    }
+
+    // ---- status determination -----------------------------------------
+
+    fn probe_with(response: Result<ProbeResponse, ProbeError>) -> AccountResult {
+        let t = StubTransport::new(vec![response]);
+        probe_account("agent-1", "sk-ant-oat01-x", DEFAULT_PROBE_MODEL, "hi", 15.0, &t)
+    }
+
+    #[test]
+    fn status_200_available() {
+        let r = probe_with(resp(
+            200,
+            &[
+                ("anthropic-ratelimit-tokens-7d-utilization", "0.30"),
+                ("anthropic-ratelimit-tokens-7d-reset", "1762070400"),
+            ],
+        ));
+        assert_eq!(r.status, "available");
+        assert!((r.s7d_utilization.unwrap() - 0.30).abs() < 1e-9);
+        assert_eq!(r.s7d_reset.as_deref(), Some("2025-11-02T08:00:00Z"));
+    }
+
+    #[test]
+    fn status_200_exhausted_above_threshold() {
+        let r = probe_with(resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.995")]));
+        assert_eq!(r.status, "exhausted");
+    }
+
+    #[test]
+    fn status_200_exhausted_at_threshold() {
+        let r = probe_with(resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.99")]));
+        assert_eq!(r.status, "exhausted");
+    }
+
+    #[test]
+    fn status_401_blocked() {
+        let r = probe_with(resp(401, &[]));
+        assert_eq!(r.status, "blocked");
+        assert_eq!(r.error.as_deref(), Some("auth_401"));
+    }
+
+    #[test]
+    fn status_429_rate_limited_below_threshold() {
+        let r = probe_with(resp(429, &[("anthropic-ratelimit-tokens-7d-utilization", "0.20")]));
+        assert_eq!(r.status, "rate_limited");
+        assert!((r.s7d_utilization.unwrap() - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn status_429_promoted_to_exhausted_above_threshold() {
+        let r = probe_with(resp(429, &[("anthropic-ratelimit-tokens-7d-utilization", "0.995")]));
+        assert_eq!(r.status, "exhausted");
+    }
+
+    #[test]
+    fn status_429_without_headers_stays_rate_limited() {
+        let r = probe_with(resp(429, &[]));
+        assert_eq!(r.status, "rate_limited");
+        assert!(r.s7d_utilization.is_none());
+    }
+
+    #[test]
+    fn status_500_error() {
+        let r = probe_with(resp(503, &[]));
+        assert_eq!(r.status, "error");
+        assert_eq!(r.error.as_deref(), Some("http_503"));
+    }
+
+    #[test]
+    fn status_400_error() {
+        let r = probe_with(resp(400, &[]));
+        assert_eq!(r.status, "error");
+        assert_eq!(r.error.as_deref(), Some("http_400"));
+    }
+
+    #[test]
+    fn status_timeout_error() {
+        let r = probe_with(Err(ProbeError::Timeout));
+        assert_eq!(r.status, "error");
+        assert_eq!(r.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn status_connection_error() {
+        let r = probe_with(Err(ProbeError::Connection("dns failure".into())));
+        assert_eq!(r.status, "error");
+        assert!(r.error.as_deref().unwrap().contains("connection"));
+    }
+
+    #[test]
+    fn empty_token_blocked_not_probed() {
+        let t = StubTransport::new(vec![]);
+        let r = probe_account("agent-bad", "", DEFAULT_PROBE_MODEL, "hi", 15.0, &t);
+        assert_eq!(r.status, "blocked");
+        assert_eq!(r.error.as_deref(), Some("bad_token_listed"));
+    }
+
+    // ---- provider dispatch (design D6a, issue #5608) -------------------
+
+    #[test]
+    fn dispatch_probe_claude_reaches_the_network_probe() {
+        // `claude` must still go through the byte-identical Anthropic probe.
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.10")],
+        )]);
+        let r = dispatch_probe(
+            "agent-1",
+            "sk-ant-oat01-x",
+            AccountProvider::Claude,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "available");
+    }
+
+    #[test]
+    fn dispatch_probe_non_claude_is_unsupported_never_exhausted() {
+        // No probe adapter exists for codex yet. The transport must never be
+        // consulted, and every utilization/reset field stays None — never a
+        // fabricated number, and never "exhausted".
+        let t = StubTransport::new(vec![]);
+        let r = dispatch_probe(
+            "agent-codex",
+            "some-codex-secret",
+            AccountProvider::Codex,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "unsupported");
+        assert_ne!(r.status, "exhausted");
+        assert_eq!(r.error.as_deref(), Some("no_probe_adapter:codex"));
+        assert_eq!(r.s5h_utilization, None);
+        assert_eq!(r.s7d_utilization, None);
+        assert_eq!(r.s7d_reset, None);
+        assert_eq!(r.s5h_reset, None);
+    }
+
+    #[test]
+    fn dispatch_probe_shape_mismatch_never_hits_the_network() {
+        // A JWT (or any non-`sk-ant-`-shaped secret) saved under a claude
+        // `.token` file is a legacy mis-binding. Reporting it as `blocked` /
+        // `shape_mismatch` up front is far more diagnostic than letting it
+        // reach Anthropic and come back a bare `auth_401` — and the stub
+        // transport having zero queued responses proves the network was
+        // never actually consulted (a real call would hit "stub exhausted").
+        let t = StubTransport::new(vec![]);
+        let r = dispatch_probe(
+            "agent-jwt",
+            "eyJhbGciOiJSUzI1NiJ9.not-a-claude-token",
+            AccountProvider::Claude,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "blocked");
+        assert_eq!(r.error.as_deref(), Some("shape_mismatch"));
+    }
+
+    #[test]
+    fn dispatch_probe_empty_token_is_unaffected_by_shape_check() {
+        // An empty token (`.bad_tokens`-listed account) must still go through
+        // `probe_account_with_blocking`'s own empty-token handling, not be
+        // misreported as `shape_mismatch`.
+        let t = StubTransport::new(vec![]);
+        let r = dispatch_probe(
+            "agent-bad",
+            "",
+            AccountProvider::Claude,
+            DEFAULT_PROBE_MODEL,
+            "hi",
+            15.0,
+            &t,
+            None,
+        );
+        assert_eq!(r.status, "blocked");
+        assert_eq!(r.error.as_deref(), Some("bad_token_listed"));
+    }
+
+    #[test]
+    fn status_rank_unsupported_is_worse_than_skipped() {
+        assert!(status_rank("unsupported") > status_rank("skipped"));
+    }
+
+    // ---- ordering + write ---------------------------------------------
+
+    #[test]
+    fn ranking_order_status_then_reset() {
+        let results = vec![
+            {
+                let mut a = AccountResult::new("exhausted-1", "exhausted");
+                a.s7d_reset = Some("2026-05-09T00:00:00Z".into());
+                a
+            },
+            {
+                let mut a = AccountResult::new("fresh", "available");
+                a.s7d_reset = Some("2026-05-08T00:00:00Z".into());
+                a
+            },
+            {
+                let mut a = AccountResult::new("older", "available");
+                a.s7d_reset = Some("2026-05-05T00:00:00Z".into());
+                a
+            },
+            AccountResult::new("blocked-1", "blocked"),
+            {
+                let mut a = AccountResult::new("rl-1", "rate_limited");
+                a.s7d_reset = Some("2026-05-07T00:00:00Z".into());
+                a
+            },
+        ];
+        let report = build_report(results);
+        let ordered: Vec<&str> = report.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(ordered, ["older", "fresh", "rl-1", "exhausted-1", "blocked-1"]);
+    }
+
+    #[test]
+    fn format_ranking_lines_pipe_format() {
+        let report = ProbeReport {
+            ranked_at: "2026-05-03T00:00:00Z".into(),
+            accounts: vec![AccountResult::new("a-1", "available")],
+        };
+        assert_eq!(format_ranking_lines(&report), "a-1|available\n");
+    }
+
+    #[test]
+    fn format_ranking_lines_emits_5h_util_third_field() {
+        // The 5h utilization is the optional third field (issue #4195), fixed
+        // at 2 decimals; an absent value keeps the legacy 2-field form.
+        let mut loaded = AccountResult::new("a-1", "available");
+        loaded.s5h_utilization = Some(0.42);
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![loaded, AccountResult::new("b-2", "available")],
+        };
+        assert_eq!(format_ranking_lines(&report), "a-1|available|0.42\nb-2|available\n");
+    }
+
+    #[test]
+    fn format_ranking_lines_emits_the_binding_reset_fourth_field() {
+        // Issue #4874: the probe already parses `anthropic-ratelimit-...-
+        // 7d-reset`; it now survives into `.ranking` as the optional fourth
+        // field instead of being discarded at the writer.
+        let mut a = AccountResult::new("a-1", "exhausted");
+        a.s5h_utilization = Some(0.0);
+        a.s7d_reset = Some("2026-08-02T03:00:00Z".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![a],
+        };
+        assert_eq!(format_ranking_lines(&report), "a-1|exhausted|0.00|2026-08-02T03:00:00Z\n");
+    }
+
+    #[test]
+    fn limit_reset_picks_the_window_that_is_actually_gating() {
+        // `exhausted` is derived from 7d utilization, so the 7d reset is the
+        // release; `rate_limited` is the 5h window tripping with 7d still
+        // healthy, so the 5h reset is. Reporting the 7d reset for a
+        // rate_limited account would claim a days-out return for an account
+        // that is back within the hour.
+        let five = Some("2026-08-01T07:00:00Z");
+        let seven = Some("2026-08-07T01:00:00Z");
+        assert_eq!(limit_reset("exhausted", five, seven), seven);
+        assert_eq!(limit_reset("rate_limited", five, seven), five);
+        // Not gated by a window at all: report the rollover the 5h
+        // `usage_fraction` is racing, which is what the dashboard charts.
+        assert_eq!(limit_reset("available", five, seven), five);
+        assert_eq!(limit_reset("blocked", five, seven), five);
+    }
+
+    #[test]
+    fn limit_reset_never_substitutes_the_other_window() {
+        // An unknown binding reset stays unknown. Falling back to the window
+        // that *is* known would turn "I do not know" into a confident wrong
+        // answer — the failure mode this whole field exists to avoid.
+        assert_eq!(limit_reset("exhausted", Some("2026-08-01T07:00:00Z"), None), None);
+        assert_eq!(limit_reset("rate_limited", None, Some("2026-08-07T01:00:00Z")), None);
+    }
+
+    #[test]
+    fn format_ranking_lines_writes_the_5h_reset_for_a_rate_limited_account() {
+        // The writer must go through `limit_reset`, not reach for `s7d_reset`.
+        let mut a = AccountResult::new("b-2", "rate_limited");
+        a.s5h_utilization = Some(1.0);
+        a.s7d_reset = Some("2026-08-07T01:00:00Z".into());
+        a.s5h_reset = Some("2026-08-01T07:00:00Z".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![a],
+        };
+        assert_eq!(format_ranking_lines(&report), "b-2|rate_limited|1.00|2026-08-01T07:00:00Z\n");
+    }
+
+    #[test]
+    fn probe_parses_the_5h_reset_header_when_the_api_sends_one() {
+        // The API does not always send a 5h reset header. When it does, the
+        // probe backend picks it up by the same suffix match as every other
+        // rate-limit header; when it does not, the account simply has no 5h
+        // reset (and a rate_limited row carries no countdown at all).
+        let headers = vec![
+            ("anthropic-ratelimit-unified-5h-utilization".to_string(), "1.0".to_string()),
+            ("anthropic-ratelimit-unified-7d-utilization".to_string(), "0.6".to_string()),
+            ("anthropic-ratelimit-unified-7d-reset".to_string(), "1786000000".to_string()),
+            ("anthropic-ratelimit-unified-5h-reset".to_string(), "1785567600".to_string()),
+        ];
+        let parsed = parse_rate_limit_headers(&headers);
+        assert_eq!(parsed.s5h_reset.as_deref(), Some("2026-08-01T07:00:00Z"));
+        assert!(parsed.s7d_reset.is_some());
+
+        let without = parse_rate_limit_headers(&headers[..3]);
+        assert_eq!(without.s5h_reset, None, "an absent header is unknown, not borrowed from 7d");
+    }
+
+    #[test]
+    fn table_names_which_window_the_reset_belongs_to() {
+        // A bare instant in the reset column is ambiguous between the two
+        // windows, and the operator's next action differs a lot depending on
+        // which it is. The column says so explicitly.
+        let mut exhausted = AccountResult::new("a-1", "exhausted");
+        exhausted.s7d_reset = Some("2026-08-02T03:00:00Z".into());
+        exhausted.s5h_reset = Some("2026-08-01T05:20:00Z".into());
+        let mut limited = AccountResult::new("b-2", "rate_limited");
+        limited.s7d_reset = Some("2026-08-07T01:00:00Z".into());
+        limited.s5h_reset = Some("2026-08-01T07:00:00Z".into());
+        let unknown = AccountResult::new("c-3", "error");
+        let table = format_table(&ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![exhausted, limited, unknown],
+        });
+        assert!(table.contains("Resets at"), "{table}");
+        assert!(table.contains("2026-08-02T03:00:00Z (7d)"), "{table}");
+        assert!(table.contains("2026-08-01T07:00:00Z (5h)"), "{table}");
+        assert!(
+            !table.contains("2026-08-07T01:00:00Z"),
+            "the 7d reset of a 5h-limited account must not be shown: {table}"
+        );
+        let unknown_row = table.lines().find(|l| l.starts_with("c-3")).unwrap();
+        assert!(
+            unknown_row.trim_end().ends_with('-'),
+            "unknown renders as a dash: {unknown_row:?}"
+        );
+    }
+
+    #[test]
+    fn ranking_line_reset_without_util_keeps_field_position() {
+        // A row that knows its reset but not its utilization must write an
+        // empty third field so the reset stays in position 4 — otherwise the
+        // reader would read the reset as the utilization.
+        assert_eq!(
+            ranking_line("a-1", "exhausted", None, Some("2026-08-02T03:00:00Z")),
+            "a-1|exhausted||2026-08-02T03:00:00Z"
+        );
+    }
+
+    #[test]
+    fn ranking_line_drops_reset_containing_delimiters() {
+        // A `|` or `#` in the reset text would make the line unparseable
+        // (field split / comment strip). Dropping the reset degrades to
+        // "unknown"; writing it would silently mangle the whole row.
+        assert_eq!(
+            ranking_line("a-1", "exhausted", Some(0.5), Some("2026|08")),
+            "a-1|exhausted|0.50"
+        );
+        assert_eq!(
+            ranking_line("a-1", "exhausted", Some(0.5), Some("2026#08")),
+            "a-1|exhausted|0.50"
+        );
+        // Whitespace-only is "unknown", not an empty trailing field.
+        assert_eq!(ranking_line("a-1", "exhausted", Some(0.5), Some("   ")), "a-1|exhausted|0.50");
+    }
+
+    #[test]
+    fn format_ranking_lines_empty_is_empty_string() {
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![],
+        };
+        assert_eq!(format_ranking_lines(&report), "");
+    }
+
+    #[test]
+    fn format_ranking_lines_omits_unsupported_rows() {
+        // `.ranking`'s contract is "Claude accounts the selector may pick" —
+        // an `unsupported` row (no probe adapter) must never appear there,
+        // even though it belongs in the in-memory report (`--json`/table).
+        let mut unsupported = AccountResult::new("agent-codex", "unsupported");
+        unsupported.error = Some("no_probe_adapter:codex".to_string());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("agent-claude", "available"), unsupported],
+        };
+        let written = format_ranking_lines(&report);
+        assert_eq!(written, "agent-claude|available\n");
+        assert!(!written.contains("agent-codex"));
+        // But the in-memory report still carries it (table/--json surface).
+        assert!(report
+            .accounts
+            .iter()
+            .any(|a| a.name == "agent-codex" && a.status == "unsupported"));
+    }
+
+    #[test]
+    fn format_ranking_lines_all_unsupported_is_empty_string() {
+        let mut unsupported = AccountResult::new("agent-codex", "unsupported");
+        unsupported.error = Some("no_probe_adapter:codex".to_string());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![unsupported],
+        };
+        assert_eq!(format_ranking_lines(&report), "");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("new", "available")],
+        };
+        fs::write(&target, "old contents").unwrap();
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new|available\n");
+        assert!(!target.with_extension("ranking.tmp").exists());
+    }
+
+    // ---- discover_tokens ----------------------------------------------
+
+    #[test]
+    fn discover_surfaces_bad_token_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-aaa\n").unwrap();
+        fs::write(tmp.path().join("agent-2.token"), "sk-ant-oat01-bbb\n").unwrap();
+        fs::write(tmp.path().join(".bad_tokens"), "# comment\nagent-2\n\n").unwrap();
+        let got = discover_tokens(tmp.path());
+        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, ["agent-1", "agent-2"]);
+        assert_eq!(got.iter().find(|(n, _, _)| n == "agent-2").unwrap().1, "");
+    }
+
+    /// #7522: a **session-limit** exhaustion entry must NOT blind the probe —
+    /// the account is handed its live token so the probe can learn whether its
+    /// 5h window has actually reset (and, if it has not, record the real
+    /// `s5h_reset` that lets the entry expire exactly when it does). Without
+    /// this the `.ranking` row for the account is a bare `<name>|blocked`
+    /// carrying no evidence at all, and the entry can only ever clear on its
+    /// TTL.
+    #[test]
+    fn discover_still_probes_a_session_limit_blocked_account_with_its_live_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-aaa\n").unwrap();
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{marked} agent-1 exhausted: hit your session limit\n"),
+        )
+        .unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(
+            got.iter().find(|(n, _, _)| n == "agent-1").unwrap().1,
+            "sk-ant-oat01-aaa",
+            "a session-limit entry must still be probed with its live token"
+        );
+    }
+
+    /// #7522/#7538: an `Auth`-class blocking entry keeps the unchanged
+    /// "surface as empty, never probe" behavior — a broken credential never
+    /// self-heals, so probing it would be wasted. (A weekly-limit-worded
+    /// `Exhaustion` entry, by contrast, is now probed too — see
+    /// `discover_probes_an_ambiguous_exhaustion_entry_too` — #7538 widened
+    /// probe-eligibility from "session-limit match" to "any `Exhaustion`
+    /// entry" so an ambiguous reason can accumulate the `.ranking` evidence
+    /// its own two-signal release check needs.)
+    #[test]
+    fn discover_does_not_probe_auth_blocked_accounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-auth.token"), "sk-ant-oat01-bbb\n").unwrap();
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{marked} agent-auth 401 unauthorized\n"),
+        )
+        .unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(got.iter().find(|(n, _, _)| n == "agent-auth").unwrap().1, "");
+    }
+
+    /// #7538: an ambiguous-reason `Exhaustion` entry (does not match
+    /// `is_session_limit_reason`) is now probed with its live token too —
+    /// exactly like a session-limit-worded entry — so it can accumulate real
+    /// `.ranking` evidence for `bad_tokens::ambiguous_exhaustion_has_reset` to
+    /// act on. Probing alone does not change how long the entry is held; that
+    /// is still decided read-side by `blocking_entry_in_dir`.
+    #[test]
+    fn discover_probes_an_ambiguous_exhaustion_entry_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-weekly.token"), "sk-ant-oat01-aaa\n").unwrap();
+        let marked = (chrono::Utc::now() - chrono::Duration::seconds(600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{marked} agent-weekly exhausted: used 100% of your weekly limit\n"),
+        )
+        .unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(
+            got.iter().find(|(n, _, _)| n == "agent-weekly").unwrap().1,
+            "sk-ant-oat01-aaa",
+            "an ambiguous exhaustion entry must still be probed with its live token"
+        );
+    }
+
+    #[test]
+    fn discover_skips_empty_token_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-empty.token"), "\n").unwrap();
+        fs::write(tmp.path().join("agent-real.token"), "sk-ant-oat01-x\n").unwrap();
+        let got = discover_tokens(tmp.path());
+        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, ["agent-real"]);
+    }
+
+    #[test]
+    fn discover_missing_dir_is_empty() {
+        assert!(discover_tokens(&PathBuf::from("/nonexistent-xyz-123")).is_empty());
+    }
+
+    // ---- discover_tokens provider resolution (design D6a, issue #5608) ----
+
+    #[test]
+    fn discover_treats_a_manifest_less_token_file_as_claude() {
+        // No index.json at all: fail-open to `claude`, so a hand-provisioned
+        // pool (bootstrap never ran, or a pool predating provider tracking)
+        // behaves exactly as it did before this dispatch existed.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-aaa\n").unwrap();
+        let got = discover_tokens(tmp.path());
+        assert_eq!(
+            got,
+            [("agent-1".to_string(), "sk-ant-oat01-aaa".to_string(), AccountProvider::Claude)]
+        );
+    }
+
+    #[test]
+    fn discover_resolves_provider_from_index_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-claude.token"), "sk-ant-oat01-aaa\n").unwrap();
+        fs::write(tmp.path().join("agent-claude-codex.token"), "some-codex-secret\n").unwrap();
+        fs::write(
+            tmp.path().join("index.json"),
+            serde_json::json!({
+                "version": 3,
+                "accounts": [
+                    {"env_index": 1, "name": "agent-claude", "provider": "claude", "upstream_id": "email:a@x.com", "email": "a@x.com", "file": "agent-claude.token", "source": "repo", "materialized": true},
+                    {"env_index": 2, "name": "agent-claude-codex", "provider": "codex", "upstream_id": "monitor-pk:9", "email": "a@x.com", "file": null, "source": "monitor-db", "materialized": false},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let got = discover_tokens(tmp.path());
+        let by_name: HashMap<&str, AccountProvider> =
+            got.iter().map(|(n, _, p)| (n.as_str(), *p)).collect();
+        assert_eq!(by_name["agent-claude"], AccountProvider::Claude);
+        assert_eq!(by_name["agent-claude-codex"], AccountProvider::Codex);
+    }
+
+    // ---- run_check ----------------------------------------------------
+
+    #[test]
+    fn run_check_writes_ranking_with_bad_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-good").unwrap();
+        fs::write(tmp.path().join("agent-bad.token"), "sk-ant-oat01-bad").unwrap();
+        fs::write(tmp.path().join(".bad_tokens"), "agent-bad\n").unwrap();
+
+        // Only agent-1 is probed (agent-bad has empty token -> blocked).
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.20")],
+        )]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+        let by_name: std::collections::HashMap<&str, &str> = report
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.status.as_str()))
+            .collect();
+        assert_eq!(by_name["agent-1"], "available");
+        assert_eq!(by_name["agent-bad"], "blocked");
+
+        let ranking = fs::read_to_string(tmp.path().join(".ranking")).unwrap();
+        let names: HashSet<&str> = ranking
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('|').next().unwrap())
+            .collect();
+        assert_eq!(names, HashSet::from(["agent-1", "agent-bad"]));
+    }
+
+    /// #6030: a bad-marked account's `error` field names the real class and
+    /// reason (e.g. `"auth: auth-dead: 401 Invalid bearer token"`) instead of
+    /// the opaque `"bad_token_listed"` — so `tokens check`'s table/JSON output
+    /// (the operator-visible list) can tell an auth-dead account apart from a
+    /// still-cooling-down exhaustion entry without a separate `unblock`-dry-run.
+    #[test]
+    fn run_check_surfaces_the_blocking_reason_for_a_bad_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-1.token"), "sk-ant-oat01-good").unwrap();
+        fs::write(tmp.path().join("agent-auth.token"), "sk-ant-oat01-dead").unwrap();
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        fs::write(
+            tmp.path().join(".bad_tokens"),
+            format!("{ts} agent-auth auth-dead: 401 Invalid bearer token\n"),
+        )
+        .unwrap();
+
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.20")],
+        )]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+        let by_name: std::collections::HashMap<&str, &AccountResult> = report
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a))
+            .collect();
+        assert_eq!(by_name["agent-auth"].status, "blocked");
+        assert_eq!(
+            by_name["agent-auth"].error.as_deref(),
+            Some("auth: auth-dead: 401 Invalid bearer token")
+        );
+
+        let table = format_table(&report);
+        assert!(
+            table.contains("auth: auth-dead: 401 Invalid bearer token"),
+            "table does not surface the blocking reason: {table}"
+        );
+    }
+
+    #[test]
+    fn run_check_one_failure_does_not_kill_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a-good.token"), "sk-ant-oat01-good").unwrap();
+        fs::write(tmp.path().join("z-bad.token"), "sk-ant-oat01-times-out").unwrap();
+
+        // Probed in sorted-name order: a-good (ok), then z-bad (timeout).
+        let t = StubTransport::new(vec![
+            resp(200, &[("anthropic-ratelimit-tokens-7d-utilization", "0.10")]),
+            Err(ProbeError::Timeout),
+        ]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+        let by_name: std::collections::HashMap<&str, &str> = report
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a.status.as_str()))
+            .collect();
+        assert_eq!(by_name["a-good"], "available");
+        assert_eq!(by_name["z-bad"], "error");
+    }
+
+    #[test]
+    fn run_check_empty_pool_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+        assert!(report.accounts.is_empty());
+    }
+
+    // ---- end-to-end mixed-provider pool (design D6a, issue #5608) ------
+
+    #[test]
+    fn run_check_mixed_pool_reports_unsupported_and_omits_it_from_ranking() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-claude.token"), "sk-ant-oat01-good").unwrap();
+        // Synthetic: a `.token` file for a manifest row recorded as a
+        // non-claude provider. D4 never materializes non-claude credentials
+        // in practice, but the dispatch must handle it defensively rather
+        // than assume the invariant always holds.
+        fs::write(tmp.path().join("agent-codex.token"), "some-codex-secret").unwrap();
+        fs::write(
+            tmp.path().join("index.json"),
+            serde_json::json!({
+                "version": 3,
+                "accounts": [
+                    {"env_index": 1, "name": "agent-claude", "provider": "claude", "upstream_id": "email:a@x.com", "email": "a@x.com", "file": "agent-claude.token", "source": "repo", "materialized": true},
+                    {"env_index": 2, "name": "agent-codex", "provider": "codex", "upstream_id": "monitor-pk:9", "email": "b@x.com", "file": "agent-codex.token", "source": "monitor-db", "materialized": false},
+                ],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Only agent-claude reaches the network (sorted-name order: agent-claude first).
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.10")],
+        )]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+
+        let by_name: std::collections::HashMap<&str, &AccountResult> = report
+            .accounts
+            .iter()
+            .map(|a| (a.name.as_str(), a))
+            .collect();
+        assert_eq!(by_name["agent-claude"].status, "available");
+        assert_eq!(by_name["agent-codex"].status, "unsupported");
+        assert_ne!(by_name["agent-codex"].status, "exhausted");
+        assert_eq!(by_name["agent-codex"].error.as_deref(), Some("no_probe_adapter:codex"));
+        assert_eq!(by_name["agent-codex"].s5h_utilization, None);
+        assert_eq!(by_name["agent-codex"].s7d_utilization, None);
+
+        // .ranking must carry the claude account only.
+        let ranking = fs::read_to_string(tmp.path().join(".ranking")).unwrap();
+        assert!(ranking.contains("agent-claude|available"));
+        assert!(!ranking.contains("agent-codex"));
+
+        // But the table (operator-visible) still shows it.
+        let table = format_table(&report);
+        assert!(table.contains("agent-codex"), "{table}");
+        assert!(table.contains("unsupported"), "{table}");
+    }
+
+    #[test]
+    fn run_check_legacy_mis_bound_file_reports_shape_mismatch_not_auth_401() {
+        // A JWT saved under a claude `.token` filename (issue #5608's D7
+        // discovery-time check) must be caught before any network call —
+        // the stub transport has zero queued responses, so a real probe
+        // attempt would surface as "stub exhausted", not "shape_mismatch".
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("agent-jwt.token"), "eyJhbGciOiJSUzI1NiJ9.legacy-mis-bound-jwt")
+            .unwrap();
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Probe,
+            stagger: false,
+            ..Default::default()
+        };
+        let report = run_check(tmp.path(), &opts, &t);
+        assert_eq!(report.accounts.len(), 1);
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(report.accounts[0].error.as_deref(), Some("shape_mismatch"));
+    }
+
+    // ---- curl output parsing ------------------------------------------
+
+    #[test]
+    fn parse_curl_output_extracts_status_and_headers() {
+        let raw = "HTTP/2 200\r\n\
+                   anthropic-ratelimit-tokens-7d-utilization: 0.42\r\n\
+                   content-type: application/json\r\n\
+                   \r\n\
+                   \nLOOM_HTTP_CODE:200";
+        let parsed = parse_curl_output(raw).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert!(parsed
+            .headers
+            .iter()
+            .any(|(k, v)| k == "anthropic-ratelimit-tokens-7d-utilization" && v == "0.42"));
+    }
+
+    #[test]
+    fn parse_curl_output_handles_429() {
+        let raw = "HTTP/1.1 429 Too Many Requests\nretry-after: 5\nLOOM_HTTP_CODE:429";
+        let parsed = parse_curl_output(raw).unwrap();
+        assert_eq!(parsed.status, 429);
+    }
+
+    // ---- curl argv never carries credential material (issue #5982) ----
+
+    #[test]
+    fn header_lines_formats_one_header_per_line() {
+        let headers = vec![
+            ("authorization".to_string(), "Bearer sk-ant-oat01-x".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        assert_eq!(
+            header_lines(&headers),
+            "authorization: Bearer sk-ant-oat01-x\ncontent-type: application/json\n"
+        );
+    }
+
+    #[test]
+    fn header_lines_empty_headers_is_empty_string() {
+        assert_eq!(header_lines(&[]), "");
+    }
+
+    #[test]
+    fn curl_command_argv_never_contains_the_bearer_token() {
+        // Regression test for issue #5982: `loom-daemon tokens check` shelled
+        // out to curl with the OAuth bearer token as a `-H "authorization:
+        // Bearer <token>"` *argument*, which is world-readable for the life
+        // of the process via /proc/<pid>/cmdline, `ps`, `systemctl status`
+        // cgroup listings, and potentially journald. Headers -- including
+        // the bearer token -- must be delivered exclusively via curl's
+        // stdin (`-H @-`), never as command-line arguments.
+        let token = "sk-ant-oat01-super-secret-value-should-never-leak-into-argv";
+        let headers = build_headers(token);
+        // Sanity check: this test would be a false negative if the token
+        // never actually reached a header in the first place.
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && v.contains(token)),
+            "test setup did not produce a bearer header"
+        );
+
+        let cmd = build_curl_command(ANTHROPIC_MESSAGES_URL, "{}", 15.0);
+        let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+        let joined = argv.join(" ");
+
+        assert!(!joined.contains(token), "bearer token leaked into curl argv: {joined}");
+        assert!(
+            !joined.contains("Bearer"),
+            "Authorization header leaked into curl argv: {joined}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("authorization:")),
+            "headers must never be passed as literal curl -H arguments: {argv:?}"
+        );
+        // The only `-H` argument allowed is `-H @-`, which tells curl to
+        // read the header set from stdin instead of argv.
+        let h_positions: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-H")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(h_positions.len(), 1, "expected exactly one -H flag: {argv:?}");
+        assert_eq!(
+            argv.get(h_positions[0] + 1).map(String::as_str),
+            Some("@-"),
+            "expected `-H @-` (read headers from stdin), not a literal header argument: {argv:?}"
+        );
+    }
+
+    // ---- source resolution --------------------------------------------
+
+    #[test]
+    fn source_parse_valid_and_invalid() {
+        assert_eq!(Source::parse("auto"), Some(Source::Auto));
+        assert_eq!(Source::parse(" MONITOR "), Some(Source::Monitor));
+        assert_eq!(Source::parse("probe"), Some(Source::Probe));
+        assert_eq!(Source::parse("bogus"), None);
+    }
+
+    // ---- overdue reset detection (issue #7420) -------------------------
+
+    fn at(offset_days: i64) -> String {
+        (Utc::now() + chrono::Duration::days(offset_days))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    #[test]
+    fn reset_is_overdue_only_for_a_past_reset_on_a_never_readmitted_status() {
+        let now = Utc::now();
+        let past = at(-8);
+        let future = at(3);
+
+        // The #7420 shape: hard-excluded, reset already behind us.
+        assert!(reset_is_overdue("exhausted", Some(&past), now));
+        assert!(reset_is_overdue("blocked", Some(&past), now));
+
+        // Genuinely resting — the normal, overwhelmingly common case.
+        assert!(!reset_is_overdue("exhausted", Some(&future), now));
+        assert!(!reset_is_overdue("blocked", Some(&future), now));
+
+        // Missing reset is "unknown", never coerced into a claim about the
+        // past — and `blocked` with no reset is the steady state this fix
+        // itself produces, which must not re-trigger forever.
+        assert!(!reset_is_overdue("exhausted", None, now));
+        assert!(!reset_is_overdue("blocked", None, now));
+
+        // Statuses the selector already readmits on its own are out of scope:
+        // `rate_limited`'s 5h window rolls over routinely and the fail-safe
+        // drops the exclusion anyway, so flagging it would be pure noise.
+        assert!(!reset_is_overdue("rate_limited", Some(&past), now));
+        assert!(!reset_is_overdue("available", Some(&past), now));
+        assert!(!reset_is_overdue("error", Some(&past), now));
+        assert!(!reset_is_overdue("unsupported", Some(&past), now));
+
+        // Unparseable text is not evidence of anything either.
+        assert!(!reset_is_overdue("exhausted", Some("not-a-timestamp"), now));
+        assert!(!reset_is_overdue("exhausted", Some(""), now));
+    }
+
+    #[test]
+    fn reset_is_overdue_uses_the_binding_window_not_whichever_is_set() {
+        // `limit_reset` picks 7d for `exhausted` and 5h otherwise. An
+        // exhausted account whose 5h reset is ancient but whose 7d reset is
+        // days out is *resting*, and must not be re-probed on the strength of
+        // the non-binding window.
+        let now = Utc::now();
+        let mut a = AccountResult::new("acct", "exhausted");
+        a.s5h_reset = Some(at(-8));
+        a.s7d_reset = Some(at(3));
+        assert!(!a.reset_overdue_at(now));
+
+        a.s7d_reset = Some(at(-1));
+        assert!(a.reset_overdue_at(now));
+    }
+
+    #[test]
+    fn json_carries_the_overdue_flag_and_a_pool_level_rollup() {
+        // AC3: a downstream consumer must be able to count revoked accounts
+        // separately from quota-exhausted ones without re-deriving the rule.
+        let now = Utc::now();
+        let mut stuck = AccountResult::new("acct-dead", "exhausted");
+        stuck.s7d_reset = Some(at(-8));
+        let mut resting = AccountResult::new("acct-resting", "exhausted");
+        resting.s7d_reset = Some(at(3));
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("acct-ok", "available"), stuck, resting],
+        };
+
+        let json = report.to_json_at(now);
+        let by_name: HashMap<&str, &serde_json::Value> = json["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["name"].as_str().unwrap(), a))
+            .collect();
+        assert_eq!(by_name["acct-dead"]["reset_overdue"], serde_json::json!(true));
+        assert_eq!(by_name["acct-resting"]["reset_overdue"], serde_json::json!(false));
+        assert_eq!(by_name["acct-ok"]["reset_overdue"], serde_json::json!(false));
+        // Both exhausted rows still report `limit_reset` verbatim — the flag
+        // adds a distinction, it does not withhold the instant.
+        assert_eq!(by_name["acct-dead"]["status"], serde_json::json!("exhausted"));
+        assert!(by_name["acct-dead"]["limit_reset"].is_string());
+        assert_eq!(json["overdue_reset_accounts"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn table_never_prints_a_past_reset_as_current_state() {
+        // AC2: the row must be visibly not "resting".
+        let now = Utc::now();
+        let past = at(-8);
+        let future = at(3);
+        let mut stuck = AccountResult::new("acct-dead", "exhausted");
+        stuck.s7d_reset = Some(past.clone());
+        let mut resting = AccountResult::new("acct-resting", "exhausted");
+        resting.s7d_reset = Some(future.clone());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![stuck, resting],
+        };
+
+        let table = format_table_at(&report, now);
+        assert!(table.contains(&format!("overdue since {past} (7d)")), "{table}");
+        // The genuinely-resting row is untouched — no new noise on the
+        // overwhelmingly common case.
+        assert!(table.contains(&format!("{future} (7d)")), "{table}");
+        assert!(!table.contains(&format!("overdue since {future}")), "{table}");
+        // And the footer says what to do about it.
+        assert!(table.contains("1 account is out of rotation with a reset that has already passed"));
+        assert!(table.contains("tokens unblock"), "{table}");
+
+        // No overdue rows -> no footer at all.
+        let clean = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("acct-ok", "available")],
+        };
+        assert!(!format_table_at(&clean, now).contains("already passed"));
+    }
+
+    // ---- overdue-reset re-probe, end to end (issue #7420) --------------
+
+    /// Point `run_check`'s monitor backend at a fixture `ranking.json` naming
+    /// one `exhausted` account whose 7d reset is `reset_days` from now, plus a
+    /// real `.token` file for it so the re-probe has something to probe with.
+    fn write_monitor_source_fixture(root: &Path, reset_days: i64) -> (PathBuf, PathBuf) {
+        let tokens_dir = root.join("tokens");
+        let monitor_dir = root.join("monitor");
+        fs::create_dir_all(&tokens_dir).unwrap();
+        fs::write(tokens_dir.join("acct-dead.token"), "sk-ant-oat01-revoked\n").unwrap();
+        fs::write(
+            tokens_dir.join("index.json"),
+            serde_json::json!({
+                "version": 2,
+                "accounts": [{"name": "acct-dead", "email": "dead@example.com"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(&monitor_dir).unwrap();
+        fs::write(
+            monitor_dir.join("ranking.json"),
+            serde_json::json!({
+                "schema": 1,
+                "generated_at": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "accounts": [{
+                    "email": "dead@example.com",
+                    "status": "exhausted",
+                    "utilization": {"5h": 0.0, "7d": 1.0},
+                    "resets": {"7d": at(reset_days)},
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (tokens_dir, monitor_dir)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_reprobes_an_overdue_row_and_records_a_401_as_auth_dead() {
+        // AC1, end to end: `tokens check --ranking` (source auto) must reach
+        // the probe for a monitor row frozen past its own reset, and a 401
+        // must be written through to `.bad_tokens` as `auth-dead` — the
+        // durable surface `select` consults on every spawn and `tokens
+        // unblock` clears, rather than a status that `ranking.json` will
+        // overwrite with `exhausted` again in ten minutes.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![resp(401, &[])]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        drop(env_guard);
+
+        assert_eq!(report.accounts.len(), 1);
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(report.accounts[0].error.as_deref(), Some("auth_401"));
+        assert!(!report.accounts[0].reset_overdue());
+
+        let bad = fs::read_to_string(tokens_dir.join(".bad_tokens")).unwrap();
+        assert!(bad.contains("acct-dead"), "unexpected .bad_tokens: {bad:?}");
+        assert!(bad.contains("auth-dead"), "unexpected .bad_tokens: {bad:?}");
+        // `auth-dead` must classify as the permanent (auth) class, not as a
+        // TTL'd exhaustion entry that silently expires itself.
+        let entry = super::super::bad_tokens::blocking_entry_in_dir(&tokens_dir, "acct-dead")
+            .expect("the recorded entry blocks selection");
+        assert_eq!(entry.class, super::super::bad_tokens::BadReasonClass::Auth);
+
+        let ranking = fs::read_to_string(tokens_dir.join(".ranking")).unwrap();
+        assert_eq!(ranking, "acct-dead|blocked\n");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn auto_leaves_a_future_reset_alone() {
+        // The stub has zero queued responses, so any probe attempt at all
+        // would surface as a transport error rather than a clean pass-through.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), 3);
+
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        drop(env_guard);
+
+        assert_eq!(report.accounts[0].status, "exhausted");
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn source_monitor_keeps_its_no_probe_contract_but_still_flags_the_row() {
+        // `--source monitor` is documented as "no probe fallback". #7420 does
+        // not change that: the frozen row is reported as-is, but flagged so it
+        // no longer reads as a resting account.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Monitor,
+            write_ranking: false,
+            stagger: false,
+            ..Default::default()
+        };
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        drop(env_guard);
+
+        assert_eq!(report.accounts[0].status, "exhausted");
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+        assert!(report.accounts[0].reset_overdue());
+        assert!(format_table(&report).contains("overdue since"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_recovered_account_is_readmitted_by_the_reprobe() {
+        // The other half of AC1: the account may simply have been genuinely
+        // resting while claude-monitor's own db went stale. A 200 must clear
+        // the hard exclusion outright — no `.bad_tokens` entry, `available`
+        // in `.ranking`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![resp(
+            200,
+            &[("anthropic-ratelimit-tokens-7d-utilization", "0.10")],
+        )]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        drop(env_guard);
+
+        assert_eq!(report.accounts[0].status, "available");
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+        assert_eq!(
+            fs::read_to_string(tokens_dir.join(".ranking")).unwrap(),
+            "acct-dead|available\n"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_already_bad_marked_account_is_not_re_appended_on_every_run() {
+        // Idempotence: once marked, `discover_tokens` hands the account an
+        // empty token, so the re-probe short-circuits to `blocked` WITHOUT a
+        // network call and without an `auth_401` error — so `.bad_tokens`
+        // gains no second line on the next (and every subsequent) run.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+        // Written through the same constant the fix records, so this is a
+        // real round-trip of the entry `auto_reprobes_…` produces.
+        fs::write(
+            tokens_dir.join(".bad_tokens"),
+            format!("2026-09-01T00:00:00Z acct-dead {REPROBE_AUTH_DEAD_REASON}\n"),
+        )
+        .unwrap();
+
+        let t = StubTransport::new(vec![]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: true,
+            stagger: false,
+            ..Default::default()
+        };
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        drop(env_guard);
+
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(
+            report.accounts[0].error.as_deref(),
+            Some(&format!("auth: {REPROBE_AUTH_DEAD_REASON}")[..]),
+            "the existing blocking reason is surfaced (#6030), not re-derived"
+        );
+        let bad = fs::read_to_string(tokens_dir.join(".bad_tokens")).unwrap();
+        assert_eq!(bad.lines().filter(|l| l.contains("acct-dead")).count(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_read_only_check_reports_the_401_without_mutating_bad_tokens() {
+        // `loom-daemon status`'s token snapshot and a bare `tokens check`
+        // (both `write_ranking: false`) are diagnostics: they must show the
+        // truth about a revoked account but must not persist a block the
+        // operator did not ask for. Only `--ranking` / the daemon refresh
+        // writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let (tokens_dir, monitor_dir) = write_monitor_source_fixture(tmp.path(), -8);
+
+        let t = StubTransport::new(vec![resp(401, &[])]);
+        let opts = CheckOptions {
+            source: Source::Auto,
+            write_ranking: false,
+            stagger: false,
+            ..Default::default()
+        };
+        let env_guard = MonitorDirEnvGuard::legacy(&monitor_dir);
+        let report = run_check(&tokens_dir, &opts, &t);
+        drop(env_guard);
+
+        assert_eq!(report.accounts[0].status, "blocked");
+        assert_eq!(report.accounts[0].error.as_deref(), Some("auth_401"));
+        assert!(!tokens_dir.join(".bad_tokens").exists());
+        assert!(!tokens_dir.join(".ranking").exists());
+    }
+}
