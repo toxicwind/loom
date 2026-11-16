@@ -4975,7 +4975,7 @@ resolve_stash_cwd() {
             # space/tab INSIDE a quoted span with a non-whitespace
             # placeholder before the plain `/[ \t]+/` split runs, so a
             # quoted `cd` argument containing a literal space (e.g. `cd
-            # "/Users/me/Real Estate CRM/wt"`) yields exactly ONE token
+            # "/Users/me/Real Pens CRM/wt"`) yields exactly ONE token
             # instead of truncating at the first embedded space and being
             # misclassified as relative (which fed a bogus cwd join and a
             # spurious cd-unresolved ask). unmask_ws() restores the real

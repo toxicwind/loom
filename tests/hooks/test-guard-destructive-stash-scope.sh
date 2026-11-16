@@ -637,7 +637,7 @@ echo -e "${YELLOW}--- Stash-stack scope: quoted cd argument with an embedded spa
 #
 # Fixture mirrors the issue's own two-repo repro: a REAL linked worktree
 # whose full path contains a literal space (a parent directory segment, e.g.
-# ".../Real Estate CRM/.loom/worktrees/issue-1"), so the bug reproduces on
+# ".../Real Pens CRM/.loom/worktrees/issue-1"), so the bug reproduces on
 # the very first embedded space rather than requiring a specially-crafted
 # worktree name.
 

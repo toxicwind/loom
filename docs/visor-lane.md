@@ -2,7 +2,7 @@
 
 **Status:** product mapping, 2026-11-02 (arc: loom-visor-advisor)
 
-`toxicwind/loom` is an estate fork of `rjwalters/loom` — the label-driven
+`toxicwind/loom` is an Pens fork of `rjwalters/loom` — the label-driven
 AI orchestration tool (Curator → Builder → Judge → Doctor → Merge, worktrees,
 `loom-daemon` DispatchSweep, 30 MCP tools). **This fork IS the first-class
 Loom product**; the scaffolding attempt of a competing `barn/products/loom`
@@ -21,7 +21,7 @@ README was reverted in favor of this upstream (adopted verbatim).
 
 Loom's role system (`/loom:curator`, `/loom:judge`, `/loom:doctor`,
 `/loom:auditor`) IS a visor pattern — a trusted reviewer layer over agent
-writes. tauvisor/kappavisor are the estate-native equivalents on the
+writes. tauvisor/kappavisor are the Pens-native equivalents on the
 olympus side; Loom's roles are the forge-native ones. Do not duplicate:
 - Use Loom roles for forge-coordinated sweeps.
 - Use tauvisor/kappavisor for transcript-level advisor review.
@@ -29,6 +29,6 @@ olympus side; Loom's roles are the forge-native ones. Do not duplicate:
 
 ## Fork ownership
 
-Upstream: `rjwalters/loom` (MIT © 2025 Robb Walters). Estate fork:
+Upstream: `rjwalters/loom` (MIT © 2025 Robb Walters). Pens fork:
 `toxicwind/loom`. Future visor-lane work (kappavisor scaffold, tauvisor
 wiring) lands here + in `pens/olympus/products/tau`, never a third checkout.

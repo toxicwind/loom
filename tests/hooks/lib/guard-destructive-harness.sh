@@ -572,7 +572,7 @@ make_wt_repo_linked_spacepath() {
     local base dir
     base=$(mktemp -d 2>/dev/null)
     base=$(cd "$base" && pwd -P)
-    dir="$base/Real Estate CRM"
+    dir="$base/Real Pens CRM"
     mkdir -p "$dir"
     git -C "$dir" init -q >/dev/null 2>&1
     git -C "$dir" -c user.email=loom@test -c user.name=loom \

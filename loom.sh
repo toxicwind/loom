@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Convenience wrapper to start the Loom daemon from your repository root.
 #
-# ── VISOR LANE (estate banner) ───────────────────────────────────────────────
+# ── VISOR LANE (Pens banner) ───────────────────────────────────────────────
 #   tauvisor   — tau's live advisor role (~/.tau/agent/TAUVISOR.yml):
 #                read-only sandbox by default, main-aware via the async
 #                git-state hook, enforcement in the runtime (anomaly #73).
