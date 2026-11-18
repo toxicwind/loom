@@ -252,3 +252,21 @@ Thumbs.db
 # EPHEMERAL_PATTERNS in loom-daemon/src/init/post_init.rs, not from this file.
 # It now lives in that list (and therefore in the block above), with the
 # rationale for ignoring it recorded alongside the pattern there.
+# pensctl audit-gitignore --fix (standard pollution)
+.venv/
+# pensctl audit-gitignore --fix (standard pollution)
+venv/
+# pensctl audit-gitignore --fix (standard pollution)
+__pycache__/
+# pensctl audit-gitignore --fix (standard pollution)
+build/
+# pensctl audit-gitignore --fix (standard pollution)
+.cache/
+# pensctl audit-gitignore --fix (standard pollution)
+blobs/
+# pensctl audit-gitignore --fix (standard pollution)
+sessions/
+# pensctl audit-gitignore --fix (standard pollution)
+.next/
+# pensctl audit-gitignore --fix (standard pollution)
+.turbo/

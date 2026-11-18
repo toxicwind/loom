@@ -20,3 +20,19 @@ target/
 # OS files
 .DS_Store
 Thumbs.db
+# pensctl audit-gitignore --fix (standard pollution)
+.venv/
+# pensctl audit-gitignore --fix (standard pollution)
+venv/
+# pensctl audit-gitignore --fix (standard pollution)
+__pycache__/
+# pensctl audit-gitignore --fix (standard pollution)
+.cache/
+# pensctl audit-gitignore --fix (standard pollution)
+blobs/
+# pensctl audit-gitignore --fix (standard pollution)
+sessions/
+# pensctl audit-gitignore --fix (standard pollution)
+.next/
+# pensctl audit-gitignore --fix (standard pollution)
+.turbo/
